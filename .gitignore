@@ -1,0 +1,11 @@
+# data and outputs never go to git
+*.xlsx
+*.xls
+*.csv
+*.pkl
+output/
+audit/
+__pycache__/
+*.pyc
+~$*
+_history/
