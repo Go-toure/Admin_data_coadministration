@@ -68,6 +68,7 @@ BEFORE = "Response"
 KEY = ["Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Response"]
 COMBINED = "nOPV2 & bOPV"
 CV_HIGH = 1.5
+CV_EXTREME = 5.0   # coverage above this is not credible even when CVPolio is also above CV_HIGH
 
 A_NONE = "Not co-administered"
 A_COMBINED = "Combined record (as reported)"
@@ -208,7 +209,10 @@ def main():
         with np.errstate(divide="ignore", invalid="ignore"):
             cv_now = out_total / pop.where(pop > 0)
             implied = (out_total / cvp.where(cvp > 0)).round()
-        pop_fixed = (cv_now > CV_HIGH) & (cvp > 0) & (cvp <= CV_HIGH) & implied.notna() & (implied > 0) & ~drop
+        cond1 = (cv_now > CV_HIGH) & (cvp > 0) & (cvp <= CV_HIGH)
+        # extreme coverage while CVPolio is less than half of it: the stored CVPolio used a much better population
+        cond2 = (cv_now > CV_EXTREME) & (cvp > 0) & (cvp < cv_now / 2)
+        pop_fixed = (cond1 | cond2) & implied.notna() & (implied > 0) & ~drop
         pop_new[pop_fixed] = implied[pop_fixed]
         pop_reason[pop_fixed] = "Population implied by CVPolio (vaccinated / CVPolio)"
         # populations are counts of children: whole numbers only
