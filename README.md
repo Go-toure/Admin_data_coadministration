@@ -4,10 +4,10 @@ Adds the co-administration columns to `AFRO_admin_data.xlsx` (nOPV2 + bOPV campa
 feedback from Valentina Bigoni (WHO AFRO). Run it every time a new version of the admin data is built.
 
 ```
-python add_coadmin_columns.py INPUT.xlsx OUTPUT.xlsx --audit AUDIT.xlsx [--fix-poppolio]
+python add_coadmin_columns.py INPUT.xlsx OUTPUT.xlsx --audit AUDIT.xlsx [--fix-poppolio [--model-poppolio]]
 ```
 
-Needs Python 3, `pandas` and `openpyxl`. Re-running it on its own output (without `--fix-poppolio`) gives the same file.
+Needs Python 3, `pandas` and `openpyxl` (`scikit-learn` for `--model-poppolio`). Re-running it on its own output (without `--fix-poppolio`) gives the same file.
 
 ## What it does
 
@@ -43,3 +43,14 @@ Population fixes, all logged in the audit sheet `PopPolio_corrected`:
    year, only if that gives a coverage between 0.5 and 1.5.
 
 Whatever is still above 1.5 is listed in the audit sheet `CV_still_above_1.5` for the focal points.
+
+## `--model-poppolio` (optional, needs `--fix-poppolio`)
+
+For the records still above 1.5, `PopPolio` is estimated with a gradient boosting model trained on the
+district's own history: the other campaigns of the same district (more than 0.3 years apart) with a
+credible coverage give the nearest, median, previous and next population, the vaccinated history, the
+median coverage, the date and the country. The model is validated with 5-fold cross-validation grouped by
+district; the results are in the audit sheet `Model_backtest` (on the 26 Oct 2026 data: median error 10%,
+70% of estimates within 20%). An estimate is applied only when it gives a coverage between 0.5 and 1.5.
+Districts without at least 2 credible campaigns are left unchanged. These are estimates, not reported
+data, and each one is listed in `PopPolio_corrected` with its reason.
