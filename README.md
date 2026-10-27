@@ -4,7 +4,7 @@ Adds the co-administration columns to `AFRO_admin_data.xlsx` (nOPV2 + bOPV campa
 feedback from Valentina Bigoni (WHO AFRO). Run it every time a new version of the admin data is built.
 
 ```
-python add_coadmin_columns.py INPUT.xlsx OUTPUT.xlsx --audit AUDIT.xlsx [--fix-poppolio [--model-poppolio]]
+python add_coadmin_columns.py INPUT.xlsx OUTPUT.xlsx --audit AUDIT.xlsx [--fix-poppolio [--model-poppolio]] [--feedback FEEDBACK.xlsx]
 ```
 
 Needs Python 3, `pandas` and `openpyxl` (`scikit-learn` for `--model-poppolio`). Re-running it on its own output (without `--fix-poppolio`) gives the same file.
@@ -55,3 +55,15 @@ district; the results are in the audit sheet `Model_backtest` (on the 26 Oct 202
 70% of estimates within 20%). An estimate is applied only when it gives a coverage between 0.5 and 1.5.
 Districts without at least 2 credible campaigns are left unchanged. These are estimates, not reported
 data, and each one is listed in `PopPolio_corrected` with its reason.
+
+## `--feedback FILE.xlsx` (optional)
+
+Writes a workbook to send to the countries / focal points, with one sheet per question and empty yellow
+columns for their answer:
+
+| Sheet | Content |
+|---|---|
+| `By_country` | counts per country for each sheet below |
+| `To_correct` | records still above 1.5 coverage (more children vaccinated than the target population) |
+| `Estimates_to_confirm` | populations that were estimated (district median or model) and need confirmation |
+| `Combined_to_validate` | combined "nOPV2 & bOPV" records where nOPV2 and bOPV were given the same total by default; the country gives the real nOPV2 and bOPV totals |
