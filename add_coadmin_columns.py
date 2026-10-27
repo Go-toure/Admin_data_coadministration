@@ -67,6 +67,7 @@ BLOCK = ["Tot_Vacc_nOPV2", "CV_nOPV2", "Total_Vacc_bOPV", "CV_bOPV",
 BEFORE = "Response"
 KEY = ["Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Response"]
 COMBINED = "nOPV2 & bOPV"
+CV_HIGH = 1.5
 
 A_NONE = "Not co-administered"
 A_COMBINED = "Combined record (as reported)"
@@ -84,6 +85,11 @@ def main():
     ap.add_argument("src")
     ap.add_argument("dst")
     ap.add_argument("--audit", help="write an audit workbook here")
+    ap.add_argument("--fix-poppolio", action="store_true",
+                    help="correct PopPolio where it is clearly wrong: when vaccinated/PopPolio is above %.1f "
+                         "but the stored CVPolio is plausible (<= %.1f), PopPolio is replaced by "
+                         "TotalNbrVaccPolio / CVPolio, rounded to a whole number; any other decimal PopPolio is "
+                         "rounded to a whole number too" % (CV_HIGH, CV_HIGH))
     a = ap.parse_args()
 
     print("loading", a.src, flush=True)
@@ -190,6 +196,25 @@ def main():
         drop[other] = True
         merged_log.append((df.at[base, "_row"], df.at[other, "_row"]))
 
+    # optional correction of clearly wrong target populations (see --fix-poppolio)
+    pop_fixed = pd.Series(False, index=df.index)
+    pop_new = pop.copy()
+    if a.fix_poppolio:
+        cvp = num(df["CVPolio"])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cv_now = out_total / pop.where(pop > 0)
+            implied = (out_total / cvp.where(cvp > 0)).round()
+        pop_fixed = (cv_now > CV_HIGH) & (cvp > 0) & (cvp <= CV_HIGH) & implied.notna() & (implied > 0) & ~drop
+        pop_new[pop_fixed] = implied[pop_fixed]
+        # populations are counts of children: whole numbers only
+        frac = pop_new.notna() & ((pop_new % 1) != 0)
+        pop_new[frac] = np.floor(pop_new[frac] + 0.5)
+        pop_fixed = pop_fixed | frac
+        print("PopPolio corrected on", int(pop_fixed.sum()), "records (of which", int(frac.sum()),
+              "had decimals)", flush=True)
+    pop_before = pop
+    pop = pop_new
+
     with np.errstate(divide="ignore", invalid="ignore"):
         pop_ok = pop.where(pop > 0)
         out_cvn = out_tn / pop_ok
@@ -263,6 +288,10 @@ def main():
                         c.number_format = "0.00"
             else:
                 oc = row_cells[header.index(h)]
+                if h == "PopPolio" and bool(pop_fixed.iat[i]):
+                    c = ws_new.cell(row=r_out, column=j + 1, value=int(pop.iat[i]))
+                    c._style = copy(oc._style)
+                    continue
                 if oc.value is None:
                     continue
                 c = ws_new.cell(row=r_out, column=j + 1, value=oc.value)
@@ -305,7 +334,7 @@ def main():
     # ----------------------------------------------------------------- audit
     if a.audit:
         write_audit(a.audit, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
-                    drop, merged_log, keep, paired)
+                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, num(df["CVPolio"]))
 
     # ------------------------------------------------------------- self-check
     chk = pd.read_excel(a.dst, sheet_name=SHEET)
@@ -322,7 +351,7 @@ def main():
 
 
 def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
-                drop, merged_log, keep, paired):
+                drop, merged_log, keep, paired, pop_fixed=None, pop_before=None, pop_after=None, cvp=None):
     cols = ["_row", "Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Response", "SIA_date"]
     a = df[cols].copy()
     a.rename(columns={"_row": "Original_row"}, inplace=True)
@@ -345,6 +374,15 @@ def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_tota
         review.to_excel(xw, sheet_name="To_review", index=False)
         vtfix.to_excel(xw, sheet_name="Vaccine_type_fixes", index=False)
         changed.to_excel(xw, sheet_name="All_co-admin_records", index=False)
+        if pop_fixed is not None and pop_fixed.any():
+            pf = df.loc[pop_fixed, ["_row", "Country", "Province", "District", "Year", "Round_Add", "Response"]].copy()
+            pf.rename(columns={"_row": "Original_row"}, inplace=True)
+            pf["Vaccine_type"] = out_vt[pop_fixed]
+            pf["TotalNbrVaccPolio"] = out_total[pop_fixed]
+            pf["CVPolio"] = cvp[pop_fixed]
+            pf["PopPolio_before"] = pop_before[pop_fixed]
+            pf["PopPolio_after"] = pop_after[pop_fixed].astype("int64")
+            pf.sort_values(["Country", "Province", "District"]).to_excel(xw, sheet_name="PopPolio_corrected", index=False)
     print("audit written:", path)
 
 
