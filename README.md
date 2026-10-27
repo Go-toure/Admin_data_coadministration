@@ -67,3 +67,14 @@ columns for their answer:
 | `To_correct` | records still above 1.5 coverage (more children vaccinated than the target population) |
 | `Estimates_to_confirm` | populations that were estimated (district median or model) and need confirmation |
 | `Combined_to_validate` | combined "nOPV2 & bOPV" records where nOPV2 and bOPV were given the same total by default; the country gives the real nOPV2 and bOPV totals |
+
+## Data dictionary
+
+`build_data_dictionary.py` builds `AFRO_admin_data_dictionary.xlsx`, to upload to SharePoint next to the admin
+data. Completeness, ranges and examples are computed from the data file, the descriptions are in the script.
+
+```
+python build_data_dictionary.py AFRO_admin_data.xlsx AFRO_admin_data_dictionary.xlsx
+```
+
+If a column is added to the admin data, the script stops and asks for its description.
