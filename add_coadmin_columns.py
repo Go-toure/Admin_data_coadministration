@@ -86,6 +86,8 @@ def main():
     ap.add_argument("src")
     ap.add_argument("dst")
     ap.add_argument("--audit", help="write an audit workbook here")
+    ap.add_argument("--feedback", help="write the suspicious records (coverage above %.1f) and the estimated "
+                                       "populations to this workbook, to send to the focal points" % CV_HIGH)
     ap.add_argument("--model-poppolio", action="store_true",
                     help="after --fix-poppolio: estimate PopPolio of the records still above %.1f with a model "
                          "trained on the district's own history (needs scikit-learn)" % CV_HIGH)
@@ -370,6 +372,11 @@ def main():
     print("saving", a.dst, flush=True)
     wb.save(a.dst)
 
+    # -------------------------------------------------------------- feedback
+    if a.feedback:
+        write_feedback(a.feedback, df, keep, out_vt, out_total, pop, pop_before, pop_fixed, pop_reason,
+                       out_cvn, out_cvb, num(df["CVPolio"]), approach, out_tn, out_tb)
+
     # ----------------------------------------------------------------- audit
     if a.audit:
         write_audit(a.audit, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
@@ -478,6 +485,115 @@ def model_poppolio(df, out_total, out_vt, pop_new, pop_reason, pop_fixed, drop):
     print("PopPolio model: %d estimates applied, %d records left (backtest median error %.0f%%)" % (
         int(ok.sum()), int(high.sum() - ok.sum()), 100 * err.median()), flush=True)
     return info
+
+
+def write_feedback(path, df, keep, out_vt, out_total, pop, pop_before, pop_fixed, pop_reason, cv_n, cv_b, cvp,
+                   approach=None, out_tn=None, out_tb=None):
+    """Workbook for the focal points: records that still look wrong, populations that were estimated, and the
+    combined records whose nOPV2 and bOPV totals were assumed equal."""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter as L
+
+    mx = pd.concat([cv_n, cv_b], axis=1).max(axis=1)
+    ident = ["Country", "Province", "District", "Year", "Round_Add", "Response"]
+
+    def base(mask):
+        d = df.loc[mask, ident].copy()
+        d.insert(0, "Row_in_original_file", df.loc[mask, "_row"])
+        d["Vaccine_type"] = out_vt[mask]
+        d["Children_vaccinated (TotalNbrVaccPolio)"] = out_total[mask]
+        return d
+
+    sus = base((mx > CV_HIGH) & keep)
+    sus["Target_population (PopPolio)"] = pop[sus.index]
+    sus["Coverage (vaccinated / population)"] = mx[sus.index].round(2)
+    sus["CVPolio_in_data"] = cvp[sus.index].round(2)
+    sus["Level"] = pd.cut(mx[sus.index], [CV_HIGH, 2, 3, 5, np.inf],
+                          labels=["1.5 - 2", "2 - 3", "3 - 5", "above 5"]).astype(str)
+    sus["Why it looks wrong"] = ("More children vaccinated than the target population: the population is probably "
+                                 "too low, or the vaccinated count includes other areas or rounds.")
+    sus["Correct target population"] = None
+    sus["Correct children vaccinated"] = None
+    sus["Comment"] = None
+    sus = sus.sort_values(["Country", "Coverage (vaccinated / population)"], ascending=[True, False])
+
+    est_mask = pop_fixed & keep & (pop_reason.str.startswith("Model") | pop_reason.str.startswith("District median"))
+    est = base(est_mask)
+    est["Population_in_source"] = pop_before[est.index]
+    est["Estimated_population"] = pop[est.index]
+    est["Coverage_in_source"] = (out_total[est.index] / pop_before[est.index].where(pop_before[est.index] > 0)).round(2)
+    est["Coverage_with_estimate"] = (out_total[est.index] / pop[est.index].where(pop[est.index] > 0)).round(2)
+    est["How it was estimated"] = pop_reason[est.index]
+    est["Confirmed population"] = None
+    est["Comment"] = None
+    est = est.sort_values(["Country", "Province", "District", "Year"])
+
+    comb = None
+    if approach is not None:
+        cm = approach.isin([A_COMBINED, A_RESP]) & keep & (out_tn == out_tb)
+        comb = base(cm)
+        comb["Tot_Vacc_nOPV2 (assumed = total)"] = out_tn[comb.index]
+        comb["Total_Vacc_bOPV (assumed = total)"] = out_tb[comb.index]
+        comb["How it was reported"] = approach[comb.index]
+        comb["Correct Tot_Vacc_nOPV2"] = None
+        comb["Correct Total_Vacc_bOPV"] = None
+        comb["Comment"] = None
+        comb = comb.sort_values(["Country", "Year", "Round_Add", "Province", "District"])
+
+    cnt = sus.groupby("Country").agg(Records=("Level", "size"),
+                                     Above_5=("Level", lambda x: int((x == "above 5").sum())),
+                                     Highest_coverage=("Coverage (vaccinated / population)", "max"))
+    cnt["Estimated_populations_to_confirm"] = est.groupby("Country").size()
+    if comb is not None:
+        cnt["Combined_records_to_validate"] = comb.groupby("Country").size()
+    cnt = cnt.fillna(0).reset_index()
+    for c_ in cnt.columns:
+        if c_ not in ("Country", "Highest_coverage"):
+            cnt[c_] = cnt[c_].astype(int)
+    cnt = cnt.sort_values("Records", ascending=False)
+    how = pd.DataFrame({"Read me": [
+        "Sheet To_correct: records where more children were vaccinated than the target population (coverage above %.1f)." % CV_HIGH,
+        "Please give the correct target population (and the correct number vaccinated if that is what is wrong).",
+        "Sheet Estimates_to_confirm: populations that were not reported correctly and were estimated (from the stored "
+        "CVPolio, the district's other rounds, or a model on the district's history). Please confirm or correct.",
+        "Sheet Combined_to_validate: records reported as one combined nOPV2 & bOPV record. By default nOPV2 and bOPV "
+        "were given the same number of children (the reported total). If the two vaccines reached different "
+        "numbers of children, please give the correct nOPV2 and bOPV totals.",
+        "Row_in_original_file is the row number in AFRO_admin_data.xlsx before the co-administration merge.",
+    ]})
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        cnt.to_excel(xw, sheet_name="By_country", index=False)
+        sus.to_excel(xw, sheet_name="To_correct", index=False)
+        est.to_excel(xw, sheet_name="Estimates_to_confirm", index=False)
+        if comb is not None:
+            comb.to_excel(xw, sheet_name="Combined_to_validate", index=False)
+        how.to_excel(xw, sheet_name="Read_me", index=False)
+        for name, ws in xw.sheets.items():
+            ws.freeze_panes = "A2" if name != "To_correct" else "D2"
+            for c in ws[1]:
+                c.font = Font(bold=True, color="FFFFFF")
+                c.fill = PatternFill("solid", fgColor="005C97")
+                c.alignment = Alignment(wrap_text=True, vertical="center")
+            for j, col in enumerate(ws.iter_cols(min_row=1, max_row=min(ws.max_row, 200)), start=1):
+                w = max(len(str(c.value)) if c.value is not None else 0 for c in col)
+                ws.column_dimensions[L(j)].width = min(max(w + 2, 10), 45)
+            if name in ("To_correct", "Estimates_to_confirm", "By_country", "Combined_to_validate"):
+                ws.auto_filter.ref = ws.dimensions
+        for name in ("To_correct", "Estimates_to_confirm", "Combined_to_validate"):
+            if name not in xw.sheets:
+                continue
+            ws = xw.sheets[name]
+            hdr = [c.value for c in ws[1]]
+            for j, h in enumerate(hdr, start=1):
+                if h and ("population" in str(h).lower() or "vaccinated" in str(h).lower()) and "Coverage" not in str(h):
+                    for r in range(2, ws.max_row + 1):
+                        ws.cell(r, j).number_format = "#,##0"
+                if h in ("Correct target population", "Correct children vaccinated", "Confirmed population", "Comment",
+                         "Correct Tot_Vacc_nOPV2", "Correct Total_Vacc_bOPV"):
+                    for r in range(2, ws.max_row + 1):
+                        ws.cell(r, j).fill = PatternFill("solid", fgColor="FFF8E1")
+    print("feedback file written:", path, "| to correct:", len(sus), "| estimates to confirm:", len(est),
+          "| combined to validate:", 0 if comb is None else len(comb), flush=True)
 
 
 def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
