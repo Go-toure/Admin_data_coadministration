@@ -85,6 +85,9 @@ def main():
     ap.add_argument("src")
     ap.add_argument("dst")
     ap.add_argument("--audit", help="write an audit workbook here")
+    ap.add_argument("--model-poppolio", action="store_true",
+                    help="after --fix-poppolio: estimate PopPolio of the records still above %.1f with a model "
+                         "trained on the district's own history (needs scikit-learn)" % CV_HIGH)
     ap.add_argument("--fix-poppolio", action="store_true",
                     help="correct PopPolio where it is clearly wrong: when vaccinated/PopPolio is above %.1f "
                          "but the stored CVPolio is plausible (<= %.1f), PopPolio is replaced by "
@@ -239,6 +242,11 @@ def main():
                 n_med += 1
         print("PopPolio corrected on", int(pop_fixed.sum()), "records (decimals:", int(frac.sum()),
               "| district median:", n_med, ")", flush=True)
+    model_info = None
+    if a.model_poppolio:
+        if not a.fix_poppolio:
+            sys.exit("--model-poppolio needs --fix-poppolio")
+        model_info = model_poppolio(df, out_total, out_vt, pop_new, pop_reason, pop_fixed, drop)
     pop_before = pop
     pop = pop_new
 
@@ -361,7 +369,7 @@ def main():
     # ----------------------------------------------------------------- audit
     if a.audit:
         write_audit(a.audit, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
-                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, num(df["CVPolio"]), pop_reason, out_cvn, out_cvb)
+                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, num(df["CVPolio"]), pop_reason, out_cvn, out_cvb, model_info)
 
     # ------------------------------------------------------------- self-check
     chk = pd.read_excel(a.dst, sheet_name=SHEET)
@@ -377,9 +385,100 @@ def main():
     print(approach.value_counts().to_string())
 
 
+def model_poppolio(df, out_total, out_vt, pop_new, pop_reason, pop_fixed, drop):
+    """Estimate PopPolio for records whose coverage is still above CV_HIGH.
+
+    Gradient boosting on the district's own history: for every record the other campaigns of the same
+    district (more than 0.3 years apart) with a credible coverage (0.5 - CV_HIGH) give the features
+    (nearest / median / previous / next population, vaccinated history, median coverage, time, country).
+    The model is validated with 5-fold cross-validation grouped by district (a district is never in
+    training and test at the same time). A prediction is applied only when it gives a coverage between
+    0.5 and CV_HIGH. Records without enough history are left unchanged.
+    """
+    try:
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        from sklearn.model_selection import GroupKFold
+    except ImportError:
+        sys.exit("--model-poppolio needs scikit-learn (pip install scikit-learn)")
+
+    low = out_vt.map(lambda x: x.lower() if isinstance(x, str) else "")
+    polio = low.str.contains("opv") & ~drop
+    t = pd.to_datetime(df["SIA_date"], errors="coerce")
+    tt = t.dt.year + t.dt.dayofyear / 365.25
+    dk = pd.Series(["|".join(str(v) for v in r) for r in df[["Country", "Province", "District"]].itertuples(index=False)],
+                   index=df.index)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cv = out_total / pop_new.where(pop_new > 0)
+    median_fixed = pop_reason.str.startswith("District median")
+    cred = polio & cv.between(0.5, CV_HIGH) & tt.notna() & ~median_fixed
+    high = polio & (cv > CV_HIGH) & tt.notna() & ~pop_fixed
+    country = df["Country"].astype("category").cat.codes
+
+    hist = {}
+    for k, g in df.index[cred].to_series().groupby(dk[cred]):
+        hist[k] = np.column_stack([g.values, tt[g.values], pop_new[g.values], out_total[g.values]]).astype(float)
+
+    rows, idx = [], []
+    for i in df.index[cred | high]:
+        g = hist.get(dk[i])
+        if g is None:
+            continue
+        o = g[(g[:, 0] != i) & (np.abs(g[:, 1] - tt[i]) > 0.3)]
+        if len(o) < 2:
+            continue
+        near = o[np.argsort(np.abs(o[:, 1] - tt[i]))[:2]]
+        prior, post = o[o[:, 1] < tt[i]], o[o[:, 1] >= tt[i]]
+        rows.append(dict(
+            n_hist=len(o), near_pop=np.log(near[:, 2].mean()), med_pop=np.log(np.median(o[:, 2])),
+            last_pop=np.log(prior[np.argmax(prior[:, 1]), 2]) if len(prior) else np.nan,
+            next_pop=np.log(post[np.argmin(post[:, 1]), 2]) if len(post) else np.nan,
+            near_vacc=np.log(near[:, 3].mean()), med_vacc=np.log(np.median(o[:, 3])),
+            med_cv=np.median(o[:, 3] / o[:, 2]), dt_near=np.abs(o[:, 1] - tt[i]).min(), t=tt[i], country=country[i]))
+        idx.append(i)
+    X = pd.DataFrame(rows, index=idx)
+    feat = list(X.columns)
+    y = np.log(pop_new[idx].where(pop_new[idx] > 0))
+    is_cred = cred[idx].values
+    tr, hi = X[is_cred], X[~is_cred & high[idx].values]
+
+    def make():
+        return HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, max_leaf_nodes=15,
+                                             random_state=0, loss="absolute_error")
+
+    oof = pd.Series(np.nan, index=tr.index)
+    groups = dk[tr.index]
+    for a_, b_ in GroupKFold(5).split(tr, groups=groups):
+        oof.iloc[b_] = make().fit(tr.iloc[a_], y[tr.index].iloc[a_]).predict(tr.iloc[b_])
+    err = (np.exp(oof) - np.exp(y[tr.index])).abs() / np.exp(y[tr.index])
+    model = make().fit(tr, y[tr.index])
+    pred = pd.Series(np.exp(model.predict(hi)), index=hi.index).round()
+    new_cv = out_total[hi.index] / pred
+    ok = new_cv.between(0.5, CV_HIGH)
+    for i in pred.index[ok]:
+        pop_new.at[i] = pred[i]
+        pop_reason.at[i] = "Model estimate from the district's history (typical error about %d%%)" % round(100 * err.median())
+        pop_fixed.at[i] = True
+    info = {
+        "Method": "Gradient boosting on the district's own history, validated by 5-fold CV grouped by district",
+        "Records used for training (credible coverage)": int(len(tr)),
+        "Records above %.1f with enough history" % CV_HIGH: int(len(hi)),
+        "Estimates applied (coverage 0.5 - %.1f after correction)" % CV_HIGH: int(ok.sum()),
+        "Left unchanged (prediction not plausible)": int((~ok).sum()),
+        "Left unchanged (district without enough history)": int(high.sum() - len(hi)),
+        "Backtest: median absolute error": "%.1f%%" % (100 * err.median()),
+        "Backtest: mean absolute error": "%.1f%%" % (100 * err.mean()),
+        "Backtest: share within +/-20%": "%.0f%%" % (100 * (err <= 0.2).mean()),
+        "Backtest: 80th percentile of the error": "%.1f%%" % (100 * err.quantile(0.8)),
+        "Note": "Estimates, not reported data. Each corrected record is listed in PopPolio_corrected.",
+    }
+    print("PopPolio model: %d estimates applied, %d records left (backtest median error %.0f%%)" % (
+        int(ok.sum()), int(high.sum() - ok.sum()), 100 * err.median()), flush=True)
+    return info
+
+
 def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
                 drop, merged_log, keep, paired, pop_fixed=None, pop_before=None, pop_after=None, cvp=None,
-                pop_reason=None, cv_n=None, cv_b=None):
+                pop_reason=None, cv_n=None, cv_b=None, model_info=None):
     cols = ["_row", "Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Response", "SIA_date"]
     a = df[cols].copy()
     a.rename(columns={"_row": "Original_row"}, inplace=True)
@@ -412,6 +511,9 @@ def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_tota
             pf["PopPolio_after"] = pop_after[pop_fixed].astype("int64")
             pf["Reason"] = pop_reason[pop_fixed]
             pf.sort_values(["Country", "Province", "District"]).to_excel(xw, sheet_name="PopPolio_corrected", index=False)
+        if model_info is not None:
+            pd.DataFrame({"Measure": list(model_info.keys()), "Value": list(model_info.values())}).to_excel(
+                xw, sheet_name="Model_backtest", index=False)
         if cv_n is not None:
             mx = pd.concat([cv_n, cv_b], axis=1).max(axis=1)
             rem = df.loc[(mx > CV_HIGH) & keep, ["_row", "Country", "Province", "District", "Year", "Round_Add", "Response"]].copy()
