@@ -142,7 +142,10 @@ def main():
     paired = cand & pk.isin(paired_keys)
     # response+round groups that show the "separate records" practice
     grp = pd.Series(["|".join(str(v) for v in t) for t in df[["Response", "Year", "Round_Add"]].itertuples(index=False)], index=df.index)
-    sep_groups = set(grp[paired])
+    # (on a re-run the pairs are already merged: a combined record with two different
+    #  vaccine totals is the trace of an earlier merge)
+    prev_merged = vt_both & ex_n.notna() & ex_b.notna() & (ex_n != ex_b)
+    sep_groups = set(grp[paired]) | set(grp[prev_merged])
     unpaired = cand & ~paired
     kept_single = unpaired & grp.isin(sep_groups)
     resp_single = unpaired & ~grp.isin(sep_groups)
