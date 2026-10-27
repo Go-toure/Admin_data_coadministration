@@ -198,6 +198,7 @@ def main():
 
     # optional correction of clearly wrong target populations (see --fix-poppolio)
     pop_fixed = pd.Series(False, index=df.index)
+    pop_reason = pd.Series("", index=df.index, dtype=object)
     pop_new = pop.copy()
     if a.fix_poppolio:
         cvp = num(df["CVPolio"])
@@ -206,12 +207,38 @@ def main():
             implied = (out_total / cvp.where(cvp > 0)).round()
         pop_fixed = (cv_now > CV_HIGH) & (cvp > 0) & (cvp <= CV_HIGH) & implied.notna() & (implied > 0) & ~drop
         pop_new[pop_fixed] = implied[pop_fixed]
+        pop_reason[pop_fixed] = "Population implied by CVPolio (vaccinated / CVPolio)"
         # populations are counts of children: whole numbers only
         frac = pop_new.notna() & ((pop_new % 1) != 0)
         pop_new[frac] = np.floor(pop_new[frac] + 0.5)
+        pop_reason[frac & ~pop_fixed] = "Decimal population rounded to a whole number"
         pop_fixed = pop_fixed | frac
-        print("PopPolio corrected on", int(pop_fixed.sum()), "records (of which", int(frac.sum()),
-              "had decimals)", flush=True)
+        # coverage still above CV_HIGH: more children vaccinated than the target population, so the
+        # population is too low. Use the median PopPolio of the SAME district's other polio records in
+        # the same year, only when that gives a plausible coverage (0.5 - CV_HIGH).
+        low = out_vt.map(lambda x: x.lower() if isinstance(x, str) else "")
+        polio_row = low.str.contains("opv")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cv2 = out_total / pop_new.where(pop_new > 0)
+        todo = (cv2 > CV_HIGH) & polio_row & ~drop & (out_total > 0)
+        dkey = pd.Series(["|".join(str(v) for v in t) for t in df[["Country", "Province", "District", "Year"]].itertuples(index=False)], index=df.index)
+        pop_base = pop_new.copy()  # snapshot: medians never depend on the order of the corrections
+        groups = {}
+        for i in df.index[polio_row & ~drop & (pop_base > 0)]:
+            groups.setdefault(dkey.iat[i], []).append(i)
+        n_med = 0
+        for i in df.index[todo]:
+            others = [pop_base.iat[j] for j in groups.get(dkey.iat[i], []) if j != i]
+            if not others:
+                continue
+            med = float(np.floor(np.median(others) + 0.5))
+            if med > 0 and 0.5 <= out_total.iat[i] / med <= CV_HIGH:
+                pop_new.iat[i] = med
+                pop_reason.iat[i] = "District median of the same year (coverage was above %.1f)" % CV_HIGH
+                pop_fixed.iat[i] = True
+                n_med += 1
+        print("PopPolio corrected on", int(pop_fixed.sum()), "records (decimals:", int(frac.sum()),
+              "| district median:", n_med, ")", flush=True)
     pop_before = pop
     pop = pop_new
 
@@ -334,7 +361,7 @@ def main():
     # ----------------------------------------------------------------- audit
     if a.audit:
         write_audit(a.audit, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
-                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, num(df["CVPolio"]))
+                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, num(df["CVPolio"]), pop_reason, out_cvn, out_cvb)
 
     # ------------------------------------------------------------- self-check
     chk = pd.read_excel(a.dst, sheet_name=SHEET)
@@ -351,7 +378,8 @@ def main():
 
 
 def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
-                drop, merged_log, keep, paired, pop_fixed=None, pop_before=None, pop_after=None, cvp=None):
+                drop, merged_log, keep, paired, pop_fixed=None, pop_before=None, pop_after=None, cvp=None,
+                pop_reason=None, cv_n=None, cv_b=None):
     cols = ["_row", "Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Response", "SIA_date"]
     a = df[cols].copy()
     a.rename(columns={"_row": "Original_row"}, inplace=True)
@@ -382,7 +410,20 @@ def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_tota
             pf["CVPolio"] = cvp[pop_fixed]
             pf["PopPolio_before"] = pop_before[pop_fixed]
             pf["PopPolio_after"] = pop_after[pop_fixed].astype("int64")
+            pf["Reason"] = pop_reason[pop_fixed]
             pf.sort_values(["Country", "Province", "District"]).to_excel(xw, sheet_name="PopPolio_corrected", index=False)
+        if cv_n is not None:
+            mx = pd.concat([cv_n, cv_b], axis=1).max(axis=1)
+            rem = df.loc[(mx > CV_HIGH) & keep, ["_row", "Country", "Province", "District", "Year", "Round_Add", "Response"]].copy()
+            rem.rename(columns={"_row": "Original_row"}, inplace=True)
+            rem["Vaccine_type"] = out_vt[rem.index]
+            rem["TotalNbrVaccPolio"] = out_total[rem.index]
+            rem["PopPolio"] = pop_after[rem.index]
+            rem["CV_nOPV2"] = cv_n[rem.index]
+            rem["CV_bOPV"] = cv_b[rem.index]
+            rem["CVPolio"] = cvp[rem.index]
+            rem.sort_values(["Country", "Province", "District", "Year"]).to_excel(
+                xw, sheet_name="CV_still_above_1.5", index=False)
     print("audit written:", path)
 
 
