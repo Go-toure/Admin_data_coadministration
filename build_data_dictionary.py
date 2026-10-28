@@ -67,7 +67,7 @@ add("Prop_0dosesPolio", "polio", "Proportion of the vaccinated children who were
 add("Total_Nbr_1dose_Plus_vaccPolio_0_59M", "polio", "Children with 1 or more previous doses vaccinated, 0-59 months (sum of the two age groups).")
 add("TotalNbrVaccPolio", "polio", "Total number of children vaccinated with polio vaccine in the district and round, as reported. For a co-administered record (Vaccine_type 'nOPV2 & bOPV') it is the larger of Tot_Vacc_nOPV2 and Total_Vacc_bOPV, so a child vaccinated with both vaccines is counted once.",
     "Reported value; about 60% of records equal zero-dose + one-or-more-dose children. Not the sum of the two vaccines. Placed just before Response.")
-add("CVPolio", "polio", "Polio vaccination coverage as stored in the source (ratio: 1.00 = 100%).", "Not always equal to TotalNbrVaccPolio / PopPolio. Used to correct PopPolio where it was clearly wrong. Some values are above 1.5.")
+add("CVPolio", "polio", "Polio vaccination coverage as stored in the source (ratio: 1.00 = 100%).", "Not always equal to TotalNbrVaccPolio / PopPolio. Used to correct PopPolio where it was clearly wrong (coverage above 1.5 or below 0.5). Some values are above 1.5.")
 add("Doses.UsedPolio", "polio", "Polio vaccine doses used.", "Almost always empty.")
 add("WastRPolio", "polio", "Polio vaccine wastage rate.", "Mostly empty.")
 add("NbrVacMeasles", "other", "Children vaccinated against measles during the campaign.")
@@ -172,6 +172,7 @@ COADMIN = [
 QUALITY = [
     ("Coverage above 1.5", "More children vaccinated than the target population: the population is probably too low. Records are listed for the countries to correct."),
     ("PopPolio from CVPolio", "Where vaccinated / PopPolio is above 1.5 and the stored CVPolio is plausible, PopPolio = vaccinated / CVPolio (whole number). Also when the coverage is above 5 and CVPolio is less than half of it."),
+    ("PopPolio from CVPolio (coverage below 0.5)", "Where vaccinated / PopPolio is below 0.5 and the stored CVPolio is plausible (0.5 to 1.5), PopPolio = vaccinated / CVPolio (whole number). In these records PopPolio was usually the total population or a province figure repeated in every district."),
     ("PopPolio from the district's other rounds", "Where coverage is still above 1.5, PopPolio = median of the same district's other polio records in the same year, when this gives a coverage between 0.5 and 1.5."),
     ("PopPolio from a model", "Where it is still above 1.5, PopPolio is estimated by a model trained on the district's own history (typical error about 10%), when this gives a coverage between 0.5 and 1.5. These are estimates, not reported data; countries are asked to confirm them."),
     ("Whole numbers", "PopPolio is always a whole number of children."),
