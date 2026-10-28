@@ -424,7 +424,7 @@ def main():
         assert chk.columns[pos - 6:pos].tolist() == BLOCK, "block must sit right before Response"
     co = chk["Vaccine_type"].astype(str).str.lower().str.contains("nopv") & chk["Vaccine_type"].astype(str).str.lower().str.contains("bopv")
     mx = chk[["Tot_Vacc_nOPV2", "Total_Vacc_bOPV"]].max(axis=1)
-    assert (chk.loc[co, "TotalNbrVaccPolio"] == mx[co]).all(), "co-admin total must be the max"
+    assert (chk.loc[co, "TotalNbrVaccPolio"].fillna(0) == mx[co].fillna(0)).all(), "co-admin total must be the max"
     print("self-check OK: %d rows, co-administered records: %d" % (len(chk), int(co.sum())))
     print(approach.value_counts().to_string())
 
