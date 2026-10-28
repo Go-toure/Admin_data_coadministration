@@ -113,6 +113,9 @@ def main():
                          "district median, decimals)" % (CV_HIGH, CV_LOW))
     ap.add_argument("--no-model-poppolio", action="store_true",
                     help="do not estimate the PopPolio that is still above %.1f with the district-history model" % CV_HIGH)
+    ap.add_argument("--force-model-poppolio", action="store_true",
+                    help="run the population model even when the input was already processed "
+                         "(not recommended: the model would use its own earlier estimates as history)")
     ap.add_argument("--no-dictionary", action="store_true", help="do not build the data dictionary")
     ap.add_argument("--no-audit", action="store_true", help="do not write the audit workbook")
     ap.add_argument("--no-feedback", action="store_true", help="do not write the feedback workbook")
@@ -149,6 +152,15 @@ def main():
     for need in ["Country", "Response", "Vaccine_type", "TotalNbrVaccPolio", "PopPolio", "Round_Add", "Year"]:
         if need not in header:
             sys.exit("missing column: " + need)
+    # a file that already has the co-administration columns was processed before: its populations include the
+    # earlier model estimates, so the model is not run again (it would use them as history)
+    already_processed = all(b in header for b in ("Tot_Vacc_nOPV2", "Total_Vacc_bOPV"))
+    if already_processed and a.model_poppolio and not a.force_model_poppolio:
+        print("The input already has the co-administration columns, so it was processed before: "
+              "the population model is skipped (use --force-model-poppolio to run it anyway). "
+              "The feedback workbook then lists only what is still wrong or new; the estimates of the earlier "
+              "run are not remembered, keep the workbook from that run.", flush=True)
+        a.model_poppolio = False
     if a.fix_poppolio and "CVPolio" not in header:
         sys.exit("The input has no CVPolio column, which the population corrections need. "
                  "Use a file that has it, or run with --no-fix-poppolio.")
