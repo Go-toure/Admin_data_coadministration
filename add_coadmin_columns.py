@@ -190,6 +190,9 @@ def main():
     out_tn[comb] = ex_n[comb].where(ex_n[comb].notna(), total[comb])
     out_tb[comb] = ex_b[comb].where(ex_b[comb].notna(), total[comb])
     out_total[comb] = pd.concat([out_tn[comb], out_tb[comb]], axis=1).max(axis=1)
+    # a combined record with no vaccinated total yet (target only) keeps its total empty, not 0
+    nodata = comb & total.isna() & (out_tn.fillna(0) == 0) & (out_tb.fillna(0) == 0)
+    out_total[nodata] = np.nan
     out_vt[approach == A_RESP] = COMBINED
 
     merged_log = []
@@ -204,7 +207,7 @@ def main():
         other = i_b if base == i_n else i_n
         out_tn[base] = t_n
         out_tb[base] = t_b
-        out_total[base] = np.nanmax([t_n, t_b])
+        out_total[base] = np.nanmax([t_n, t_b]) if not (np.isnan(t_n) and np.isnan(t_b)) else np.nan
         out_vt[base] = COMBINED
         drop[other] = True
         merged_log.append((df.at[base, "_row"], df.at[other, "_row"]))
@@ -276,6 +279,10 @@ def main():
         pop_ok = pop.where(pop > 0)
         out_cvn = out_tn / pop_ok
         out_cvb = out_tb / pop_ok
+    # no vaccinated total yet (target only): no coverage either
+    no_total = out_total.isna() & (out_tn.fillna(0) == 0) & (out_tb.fillna(0) == 0)
+    out_cvn[no_total] = np.nan
+    out_cvb[no_total] = np.nan
 
     keep = ~drop
     print("pairs merged:", int(drop.sum()), "-> rows out:", int(keep.sum()), flush=True)
