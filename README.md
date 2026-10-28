@@ -39,8 +39,12 @@ Population fixes, all logged in the audit sheet `PopPolio_corrected`:
 
 1. Vaccinated / `PopPolio` above 1.5 while `CVPolio` is plausible (up to 1.5), or above 5 while `CVPolio` is less
    than half of it: `PopPolio` = vaccinated / `CVPolio`, rounded to a whole number.
-2. Decimal populations are rounded to whole numbers.
-3. Coverage still above 1.5: `PopPolio` = median of the same district's other polio records in the same
+2. Vaccinated / `PopPolio` below 0.5 while `CVPolio` is plausible (0.5 to 1.5): `PopPolio` = vaccinated /
+   `CVPolio`, rounded to a whole number. In these records `PopPolio` is usually the total population, or
+   a province figure repeated in every district, and not the target population. (Where both coverages are
+   already between 0.5 and 1.5 `PopPolio` is left as reported.)
+3. Decimal populations are rounded to whole numbers.
+4. Coverage still above 1.5: `PopPolio` = median of the same district's other polio records in the same
    year, only if that gives a coverage between 0.5 and 1.5.
 
 Whatever is still above 1.5 is listed in the audit sheet `CV_still_above_1.5` for the focal points.
