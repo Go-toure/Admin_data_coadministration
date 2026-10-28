@@ -1,13 +1,32 @@
-# Admin data co-administration
+# Admin data update (co-administration, population corrections, data dictionary)
 
-Adds the co-administration columns to `AFRO_admin_data.xlsx` (nOPV2 + bOPV campaigns), following the
-feedback from Valentina Bigoni (WHO AFRO). Run it every time a new version of the admin data is built.
+One script, `add_coadmin_columns.py`, does the whole update of `AFRO_admin_data.xlsx` (nOPV2 + bOPV campaigns,
+following the feedback from Valentina Bigoni, WHO AFRO): the co-administration columns, the population
+corrections, the data dictionary, the audit workbook and the feedback workbook for the countries.
 
 ```
-python add_coadmin_columns.py INPUT.xlsx OUTPUT.xlsx --audit AUDIT.xlsx [--fix-poppolio [--model-poppolio]] [--feedback FEEDBACK.xlsx]
+python add_coadmin_columns.py INPUT.xlsx [--out-dir DIR]
 ```
 
-Needs Python 3, `pandas` and `openpyxl` (`scikit-learn` for `--model-poppolio`). Re-running it on its own output (without `--fix-poppolio`) gives the same file.
+Everything is written under `DIR` (default `coadmin_output`):
+
+| File | What it is |
+|---|---|
+| `upload_to_sharepoint/AFRO_admin_data.xlsx` | the admin data, `Sheet1` only |
+| `upload_to_sharepoint/AFRO_admin_data_dictionary.xlsx` | the data dictionary |
+| `review/AFRO_admin_data_coadmin_audit.xlsx` | every merge, relabel and correction, for checking |
+| `review/Feedback_suspicious_coverage.xlsx` | to send to the countries / focal points |
+
+Needs Python 3, `pandas`, `openpyxl` and `scikit-learn` (without it the population model step is skipped).
+Switches to leave a step out: `--no-fix-poppolio`, `--no-model-poppolio`, `--no-dictionary`, `--no-audit`,
+`--no-feedback`.
+
+After the run: open the admin data in Excel and save once (this stores the `check_dp` values), upload the
+admin data and the dictionary to SharePoint, send the feedback workbook, then run the SharePoint backup.
+
+Re-running on its own output is safe: merged records stay merged, and only populations that are still wrong
+are corrected (a few more district medians may change). The model step uses earlier estimates as history,
+so for regular updates of a file that was already processed use `--no-model-poppolio`.
 
 ## What it does
 
@@ -35,16 +54,14 @@ on the new column letters. The file is written with Sheet1 only; open it in Exce
 | Separate nOPV2 and bOPV records (same Response, round, district) | Merged into one record, `Vaccine_type` = "nOPV2 & bOPV". `TotalNbrVaccPolio` = the **maximum** of the two (same children, not a sum). |
 | nOPV2-only record in a co-administered Response where other districts report separate records | Kept as single vaccine, listed in the audit for review. |
 
-`CV_nOPV2` and `CV_bOPV` = vaccinated / `PopPolio`. The "Children Reached" sheet formulas are updated to
+`CV_nOPV2` and `CV_bOPV` = vaccinated / `PopPolio`. If the input has a "Children Reached" sheet, its formulas are updated to
 the new column positions. The audit workbook lists every merged, relabelled and flagged record.
 
 Vaccine_type clean-up: `Nopv2`, `nOPV3` ... `nOPV14` (drag-fill error) become `nOPV2`; `bopv` becomes `bOPV`.
 
-## `--fix-poppolio` (optional)
+## Population corrections (default; `--no-fix-poppolio` to skip)
 
-Run it once, on the raw file: the corrections are logged and a second pass could adjust a few more populations.
-
-Population fixes, all logged in the audit sheet `PopPolio_corrected`:
+All logged in the audit sheet `PopPolio_corrected`:
 
 1. Vaccinated / `PopPolio` above 1.5 while `CVPolio` is plausible (up to 1.5), or above 5 while `CVPolio` is less
    than half of it: `PopPolio` = vaccinated / `CVPolio`, rounded to a whole number.
@@ -58,7 +75,7 @@ Population fixes, all logged in the audit sheet `PopPolio_corrected`:
 
 Whatever is still above 1.5 is listed in the audit sheet `CV_still_above_1.5` for the focal points.
 
-## `--model-poppolio` (optional, needs `--fix-poppolio`)
+## Population model (default; `--no-model-poppolio` to skip)
 
 For the records still above 1.5, `PopPolio` is estimated with a gradient boosting model trained on the
 district's own history: the other campaigns of the same district (more than 0.3 years apart) with a
@@ -69,9 +86,9 @@ district; the results are in the audit sheet `Model_backtest` (on the 26 Oct 202
 Districts without at least 2 credible campaigns are left unchanged. These are estimates, not reported
 data, and each one is listed in `PopPolio_corrected` with its reason.
 
-## `--feedback FILE.xlsx` (optional)
+## Feedback workbook (`Feedback_suspicious_coverage.xlsx`)
 
-Writes a workbook to send to the countries / focal points, with one sheet per question and empty yellow
+A workbook to send to the countries / focal points, with one sheet per question and empty yellow
 columns for their answer:
 
 | Sheet | Content |
@@ -83,11 +100,7 @@ columns for their answer:
 
 ## Data dictionary
 
-`build_data_dictionary.py` builds `AFRO_admin_data_dictionary.xlsx`, to upload to SharePoint next to the admin
-data. Completeness, ranges and examples are computed from the data file, the descriptions are in the script.
-
-```
-python build_data_dictionary.py AFRO_admin_data.xlsx AFRO_admin_data_dictionary.xlsx
-```
-
-If a column is added to the admin data, the script stops and asks for its description.
+`AFRO_admin_data_dictionary.xlsx` is built at the end of the run from the finished data, so the completeness,
+ranges and examples always match the file. The descriptions are written in the script (`COLUMNS`). If a column is
+added to the admin data, the script stops at that point and asks for its description, so the dictionary never
+falls behind the data.
