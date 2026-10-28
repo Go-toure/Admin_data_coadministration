@@ -17,7 +17,14 @@ contains both "nOPV" and "bOPV".
 
 New columns, placed right before `Response`:
 
-`Tot_Vacc_nOPV2 | CV_nOPV2 | Total_Vacc_bOPV | CV_bOPV | Vaccine_type | TotalNbrVaccPolio`
+`Tot_Vacc_nOPV2 | CV_nOPV2 | Total_Vacc_bOPV | CV_bOPV | Vaccine_type | TotalNbrVaccPolio | CVPolio`
+
+`Vaccine_type` and `TotalNbrVaccPolio` move here from their old position. `CVPolio` (as stored in the source,
+never recalculated) follows `TotalNbrVaccPolio` so the vaccinated total and its coverage sit together; the
+dashboards read it by name. A vaccine that was not used has a total of 0 (not a blank) and no coverage.
+`check_dp` is rewritten as a live formula (Country, Province, District, SIA_date, TotalNbrVaccPolio, Response)
+on the new column letters. The file is written with Sheet1 only; open it in Excel and save once so the
+`check_dp` values are stored before it is uploaded.
 
 | Situation | Result |
 |---|---|
