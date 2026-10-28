@@ -13,7 +13,9 @@ Needs Python 3, `pandas` and `openpyxl` (`scikit-learn` for `--model-poppolio`).
 
 Co-administered campaigns are reported in different ways: separate nOPV2 and bOPV records, one combined
 "nOPV2 & bOPV" record, or both in different campaigns. A campaign is co-administered when its `Response`
-contains both "nOPV" and "bOPV".
+contains both "nOPV" and "bOPV", or when a district has an nOPV2 record and a bOPV record for the same
+`Response`, year and round. The second case covers countries that did not put both vaccines in the Response
+name (DRC and South Sudan, about 1,090 districts); their `Response` is left as reported.
 
 New columns, placed right before `Response`:
 
