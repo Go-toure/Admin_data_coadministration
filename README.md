@@ -30,6 +30,18 @@ are corrected (a few more district medians may change). The script recognises a 
 use its own earlier estimates as history. `--force-model-poppolio` overrides this. On such a file the feedback workbook lists only what is still wrong or
 new; the estimates of the first run are not remembered, so keep the workbook from that run.
 
+## Which files it accepts
+
+- The full regional admin data, raw or already processed (it recognises a processed file, see above).
+- An older or a country template: it only needs the columns `Country`, `Province`, `District`, `SIA_date`
+  (`SIA-date` is renamed), `Response`, `Vaccine_type`, `TotalNbrVaccPolio`, `PopPolio`, `Round_Add` and `Year`,
+  plus `CVPolio` for the population corrections. If one is missing it stops before writing anything and lists
+  them. Extra columns are kept; columns the dictionary does not know are marked "No description yet".
+- The sheet may have any name (the first sheet is used; the output sheet is `Sheet1`).
+- A header-only file stops with a message; with little history the population model is skipped by itself.
+- A file with fewer than 25 countries (a country file) is processed, but the script warns twice that the output
+  is not the regional file and must not be uploaded to SharePoint as `AFRO_admin_data.xlsx`.
+
 ## What it does
 
 Co-administered campaigns are reported in different ways: separate nOPV2 and bOPV records, one combined
