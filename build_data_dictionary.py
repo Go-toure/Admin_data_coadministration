@@ -142,7 +142,7 @@ add("CV_nOPV2", "coadmin", "nOPV2 coverage = Tot_Vacc_nOPV2 / PopPolio (ratio: 1
 add("Total_Vacc_bOPV", "coadmin", "Children vaccinated with bOPV in the district and round.", "0 when no bOPV was given. Combined records: same value as TotalNbrVaccPolio unless the country gave a separate figure.")
 add("CV_bOPV", "coadmin", "bOPV coverage = Total_Vacc_bOPV / PopPolio (ratio).", "Same caution as CV_nOPV2.")
 add("Vaccine_type", "coadmin", "Vaccine used: nOPV2, bOPV, mOPV2, MR, or 'nOPV2 & bOPV' when both were given in the same campaign (co-administration).", "See sheet Vaccine_type. Placed just before Response.")
-add("Response", "campaign", "Name of the response / campaign, e.g. GUI-2025-01-NID_bOPV-nOPV (country code, year, number, type, vaccine).", "Empty for about 1,900 older records. A campaign is co-administered when the name contains both 'nOPV' and 'bOPV'.")
+add("Response", "campaign", "Name of the response / campaign, e.g. GUI-2025-01-NID_bOPV-nOPV (country code, year, number, type, vaccine).", "Empty for about 1,900 older records. A campaign is co-administered when the name contains both 'nOPV' and 'bOPV', or when a district has an nOPV2 and a bOPV record for the same Response, year and round (some DRC and South Sudan responses do not name both vaccines).")
 add("Index", "tech", "Running record number inside the data-entry batch of a campaign (1 = first row).", "Internal; no analytical meaning.")
 add("SIAMTH", "tech", "Month of the SIA (1-12).", "Same as the month of SIA_date for 98% of records.")
 add("check_dp", "tech", "Helper key used to find duplicated records: formula joining Country, Province, District, SIA_date, TotalNbrVaccPolio and Response.", "Internal. A live formula in the admin data; it follows the columns, so keep it when columns are added.")
@@ -159,7 +159,7 @@ VACCINE_TYPES = [
 ]
 
 COADMIN = [
-    ("How to recognise a co-administered campaign", "The Response name contains both 'nOPV' and 'bOPV', or Vaccine_type already holds both vaccines."),
+    ("How to recognise a co-administered campaign", "The Response name contains both 'nOPV' and 'bOPV', or the district has an nOPV2 record and a bOPV record for the same Response, year and round, or Vaccine_type already holds both vaccines."),
     ("Reported as separate records", "An nOPV2 record and a bOPV record of the same district, round and Response are merged into one record: Tot_Vacc_nOPV2 and Total_Vacc_bOPV take the two totals, Vaccine_type = 'nOPV2 & bOPV'."),
     ("Reported as one combined record", "Tot_Vacc_nOPV2 = Total_Vacc_bOPV = TotalNbrVaccPolio by default (the countries are asked to confirm the real split)."),
     ("TotalNbrVaccPolio of a co-administered record", "The larger of Tot_Vacc_nOPV2 and Total_Vacc_bOPV (the same children are vaccinated with both, so the totals are not added)."),
