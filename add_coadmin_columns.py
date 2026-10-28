@@ -69,6 +69,7 @@ KEY = ["Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Respo
 COMBINED = "nOPV2 & bOPV"
 CV_HIGH = 1.5
 CV_EXTREME = 5.0   # coverage above this is not credible even when CVPolio is also above CV_HIGH
+CV_LOW = 0.5       # coverage below this is not credible when the stored CVPolio is plausible
 
 A_NONE = "Not co-administered"
 A_COMBINED = "Combined record (as reported)"
@@ -93,9 +94,10 @@ def main():
                          "trained on the district's own history (needs scikit-learn)" % CV_HIGH)
     ap.add_argument("--fix-poppolio", action="store_true",
                     help="correct PopPolio where it is clearly wrong: when vaccinated/PopPolio is above %.1f "
-                         "but the stored CVPolio is plausible (<= %.1f), PopPolio is replaced by "
+                         "but the stored CVPolio is plausible (<= %.1f), or when it is below %.1f while "
+                         "CVPolio is plausible (%.1f - %.1f), PopPolio is replaced by "
                          "TotalNbrVaccPolio / CVPolio, rounded to a whole number; any other decimal PopPolio is "
-                         "rounded to a whole number too" % (CV_HIGH, CV_HIGH))
+                         "rounded to a whole number too" % (CV_HIGH, CV_HIGH, CV_LOW, CV_LOW, CV_HIGH))
     a = ap.parse_args()
 
     print("loading", a.src, flush=True)
@@ -217,6 +219,15 @@ def main():
         pop_fixed = (cond1 | cond2) & implied.notna() & (implied > 0) & ~drop
         pop_new[pop_fixed] = implied[pop_fixed]
         pop_reason[pop_fixed] = "Population implied by CVPolio (vaccinated / CVPolio)"
+        # coverage far too LOW (below CV_LOW) while the stored CVPolio is plausible (CV_LOW - CV_HIGH): the
+        # stored PopPolio is too large (often the total population, or a province figure repeated in every
+        # district), so it is replaced by vaccinated / CVPolio as well
+        polio_early = out_vt.map(lambda x: isinstance(x, str) and "opv" in x.lower())
+        cond3 = ((cv_now > 0) & (cv_now < CV_LOW) & (cvp >= CV_LOW) & (cvp <= CV_HIGH)
+                 & polio_early & implied.notna() & (implied > 0) & ~drop & ~pop_fixed)
+        pop_new[cond3] = implied[cond3]
+        pop_reason[cond3] = "Population implied by CVPolio (coverage was below %.1f)" % CV_LOW
+        pop_fixed = pop_fixed | cond3
         # populations are counts of children: whole numbers only
         frac = pop_new.notna() & ((pop_new % 1) != 0)
         pop_new[frac] = np.floor(pop_new[frac] + 0.5)
