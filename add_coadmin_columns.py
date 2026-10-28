@@ -310,9 +310,10 @@ def main():
             ws_new.column_dimensions[get_column_letter(j)].width = w
     ws_new.freeze_panes = ws.freeze_panes
 
+    # a vaccine that was not used has a total of 0, not a blank (the convention now used in the SharePoint file)
     vals = {
-        "Tot_Vacc_nOPV2": out_tn, "CV_nOPV2": out_cvn,
-        "Total_Vacc_bOPV": out_tb, "CV_bOPV": out_cvb,
+        "Tot_Vacc_nOPV2": out_tn.fillna(0), "CV_nOPV2": out_cvn,
+        "Total_Vacc_bOPV": out_tb.fillna(0), "CV_bOPV": out_cvb,
         "Vaccine_type": out_vt, "TotalNbrVaccPolio": out_total,
     }
     total_style_src = tot_idx  # column index in original row tuples
