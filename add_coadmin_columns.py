@@ -13,7 +13,9 @@ Some co-administered SIAs (nOPV2 + bOPV) are reported in three different ways
   * mixed practices                    - both, in different campaigns / rounds
 
 A campaign is co-administered when its Response name contains both "nOPV" and
-"bOPV".  This script makes every record carry the same structure, so
+"bOPV", or when a district has an nOPV2 record and a bOPV record for the same
+Response, year and round (some countries, e.g. DRC and South Sudan, did not put
+both vaccines in the Response name).  This script makes every record carry the same structure, so
 co-administration can be reported correctly:
 
     ... Year | Round_Add | Tot_Vacc_nOPV2 | CV_nOPV2 | Total_Vacc_bOPV | CV_bOPV |
@@ -146,14 +148,17 @@ def main():
 
     key_str = pd.Series(["|".join(str(v) for v in t) for t in df[KEY].itertuples(index=False)], index=df.index)
     cand = (is_n | is_b) & resp_both & ~vt_both
+    # a district that has an nOPV2 record AND a bOPV record for the same Response, year and round is
+    # co-administered even when the Response name does not mention both vaccines (DRC, South Sudan)
+    cand_any = (is_n | is_b) & ~vt_both
     df["_key"] = key_str
     occ = pd.Series(0, index=df.index)
-    occ[cand] = df[cand].groupby(["_key", vt_norm[cand]]).cumcount()
+    occ[cand_any] = df[cand_any].groupby(["_key", vt_norm[cand_any]]).cumcount()
     pk = key_str + "#" + occ.astype(str)
 
-    n_set = set(pk[cand & is_n]); b_set = set(pk[cand & is_b])
+    n_set = set(pk[cand_any & is_n]); b_set = set(pk[cand_any & is_b])
     paired_keys = n_set & b_set
-    paired = cand & pk.isin(paired_keys)
+    paired = cand_any & pk.isin(paired_keys)
     # response+round groups that show the "separate records" practice
     grp = pd.Series(["|".join(str(v) for v in t) for t in df[["Response", "Year", "Round_Add"]].itertuples(index=False)], index=df.index)
     # (on a re-run the pairs are already merged: a combined record with two different
