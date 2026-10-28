@@ -141,17 +141,24 @@ def main():
 
     print("loading", a.src, flush=True)
     wb = openpyxl.load_workbook(a.src)
-    ws = wb[SHEET]
+    sheet_name = SHEET if SHEET in wb.sheetnames else wb.sheetnames[0]
+    if sheet_name != SHEET:
+        print("No sheet called %s: using the first sheet (%s). The output sheet is named %s." % (SHEET, sheet_name, SHEET), flush=True)
+        if SUMMARY_SHEET in wb.sheetnames:
+            del wb[SUMMARY_SHEET]  # its formulas point to the original sheet name
+    ws = wb[sheet_name]
     header = []
     for c in ws[1]:
         header.append(c.value)
     while header and header[-1] is None:
         header.pop()
+    header = ["SIA_date" if h == "SIA-date" and "SIA_date" not in header else h for h in header]  # same fix as the portal
     ncol = len(header)
     old_letter = {h: get_column_letter(i + 1) for i, h in enumerate(header)}
-    for need in ["Country", "Response", "Vaccine_type", "TotalNbrVaccPolio", "PopPolio", "Round_Add", "Year"]:
-        if need not in header:
-            sys.exit("missing column: " + need)
+    missing_req = [need for need in ["Country", "Province", "District", "SIA_date", "Response", "Vaccine_type",
+                                     "TotalNbrVaccPolio", "PopPolio", "Round_Add", "Year"] if need not in header]
+    if missing_req:
+        sys.exit("The input is not an admin data file: these columns are missing: " + ", ".join(missing_req))
     # a file that already has the co-administration columns was processed before: its populations include the
     # earlier model estimates, so the model is not run again (it would use them as history)
     already_processed = all(b in header for b in ("Tot_Vacc_nOPV2", "Total_Vacc_bOPV"))
@@ -171,6 +178,13 @@ def main():
     df = pd.DataFrame([[c.value for c in r] for r in cells], columns=header, dtype=object)
     df["_row"] = np.arange(2, n + 2)
     print("rows:", n, "cols:", ncol, flush=True)
+    if n == 0:
+        sys.exit("The file has no data rows (only the header): nothing to update.")
+    n_countries = int(df["Country"].nunique())
+    partial = n_countries < 25   # the regional file has about 38 countries
+    if partial:
+        print("WARNING: the file has only %d countries. It is not the full regional admin data: use the output "
+              "for checking only, do NOT upload it to SharePoint as AFRO_admin_data.xlsx." % n_countries, flush=True)
 
     # ------------------------------------------------------------------ logic
     vt_orig = df["Vaccine_type"].astype(object)
@@ -491,7 +505,10 @@ def main():
     print("\nDone. Files written under", a.out_dir)
     print("  upload_to_sharepoint/ : AFRO_admin_data.xlsx" + (" + the data dictionary" if a.dictionary else ""))
     print("  review/               : audit" + (" + feedback workbook" if a.feedback else ""))
-    print("Next: open AFRO_admin_data.xlsx in Excel and save once, then upload it to SharePoint.")
+    if partial:
+        print("WARNING: only %d countries in this file: do NOT upload the output as AFRO_admin_data.xlsx." % n_countries)
+    else:
+        print("Next: open AFRO_admin_data.xlsx in Excel and save once, then upload it to SharePoint.")
 
 
 def model_poppolio(df, out_total, out_vt, pop_new, pop_reason, pop_fixed, drop):
@@ -544,6 +561,9 @@ def model_poppolio(df, out_total, out_vt, pop_new, pop_reason, pop_fixed, drop):
             near_vacc=np.log(near[:, 3].mean()), med_vacc=np.log(np.median(o[:, 3])),
             med_cv=np.median(o[:, 3] / o[:, 2]), dt_near=np.abs(o[:, 1] - tt[i]).min(), t=tt[i], country=country[i]))
         idx.append(i)
+    if len(rows) < 50:
+        print("population model skipped: not enough district history in this file", flush=True)
+        return None
     X = pd.DataFrame(rows, index=idx)
     feat = list(X.columns)
     y = np.log(pop_new[idx].where(pop_new[idx] > 0))
@@ -556,6 +576,9 @@ def model_poppolio(df, out_total, out_vt, pop_new, pop_reason, pop_fixed, drop):
 
     oof = pd.Series(np.nan, index=tr.index)
     groups = dk[tr.index]
+    if len(tr) < 50 or groups.nunique() < 5 or len(hi) == 0:
+        print("population model skipped: not enough district history in this file", flush=True)
+        return None
     for a_, b_ in GroupKFold(5).split(tr, groups=groups):
         oof.iloc[b_] = make().fit(tr.iloc[a_], y[tr.index].iloc[a_]).predict(tr.iloc[b_])
     err = (np.exp(oof) - np.exp(y[tr.index])).abs() / np.exp(y[tr.index])
@@ -933,7 +956,10 @@ def build_dictionary(df, dst):
     print("building the data dictionary", flush=True)
     missing = [c for c in df.columns if c not in COLUMNS]
     if missing:
-        sys.exit("The data dictionary has no description for these columns, add them to COLUMNS in this script: " + ", ".join(missing))
+        print("note: no description yet for these columns (marked in the dictionary; add them to COLUMNS in this "
+              "script): " + ", ".join(missing))
+        for c in missing:
+            COLUMNS[c] = ("Other", "No description yet.", "Column not known to the script: description to be added.")
     extra = [c for c in COLUMNS if c not in df.columns]
     if extra:
         print("note: described but not in the data:", ", ".join(extra))
