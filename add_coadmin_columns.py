@@ -149,6 +149,9 @@ def main():
     for need in ["Country", "Response", "Vaccine_type", "TotalNbrVaccPolio", "PopPolio", "Round_Add", "Year"]:
         if need not in header:
             sys.exit("missing column: " + need)
+    if a.fix_poppolio and "CVPolio" not in header:
+        sys.exit("The input has no CVPolio column, which the population corrections need. "
+                 "Use a file that has it, or run with --no-fix-poppolio.")
 
     cells = list(ws.iter_rows(min_row=2, max_col=ncol))
     cells = [r for r in cells if any(c.value is not None for c in r)]
