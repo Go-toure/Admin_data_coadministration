@@ -25,8 +25,10 @@ After the run: open the admin data in Excel and save once (this stores the `chec
 admin data and the dictionary to SharePoint, send the feedback workbook, then run the SharePoint backup.
 
 Re-running on its own output is safe: merged records stay merged, and only populations that are still wrong
-are corrected (a few more district medians may change). The model step uses earlier estimates as history,
-so for regular updates of a file that was already processed use `--no-model-poppolio`.
+are corrected (a few more district medians may change). The script recognises a file that was already processed
+(it has the co-administration columns) and then skips the population model by itself, because the model would
+use its own earlier estimates as history. `--force-model-poppolio` overrides this. On such a file the feedback workbook lists only what is still wrong or
+new; the estimates of the first run are not remembered, so keep the workbook from that run.
 
 ## What it does
 
