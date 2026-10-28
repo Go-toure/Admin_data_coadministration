@@ -17,7 +17,7 @@ A campaign is co-administered when its Response name contains both "nOPV" and
 co-administration can be reported correctly:
 
     ... Year | Round_Add | Tot_Vacc_nOPV2 | CV_nOPV2 | Total_Vacc_bOPV | CV_bOPV |
-        Vaccine_type | TotalNbrVaccPolio | Response | ...
+        Vaccine_type | TotalNbrVaccPolio | CVPolio | Response | ...
 
 Rules
 -----
@@ -284,6 +284,10 @@ def main():
         new_header.append(h)
     if BEFORE not in base_cols:
         sys.exit("Response column not found")
+    # CVPolio (as stored) sits right after TotalNbrVaccPolio, so the vaccinated total and its coverage are together
+    if "CVPolio" in new_header:
+        new_header.remove("CVPolio")
+        new_header.insert(new_header.index("TotalNbrVaccPolio") + 1, "CVPolio")
     new_letter = {h: get_column_letter(i + 1) for i, h in enumerate(new_header)}
     ncol_new = len(new_header)
 
@@ -408,7 +412,11 @@ def main():
     assert list(chk.columns[:0]) == []
     assert chk.columns.tolist() == new_header, "column order"
     pos = chk.columns.get_loc(BEFORE)
-    assert chk.columns[pos - 6:pos].tolist() == BLOCK, "block must sit right before Response"
+    if "CVPolio" in chk.columns:
+        assert chk.columns[pos - 1] == "CVPolio" and chk.columns[pos - 7:pos - 1].tolist() == BLOCK, \
+            "block and CVPolio must sit right before Response"
+    else:
+        assert chk.columns[pos - 6:pos].tolist() == BLOCK, "block must sit right before Response"
     co = chk["Vaccine_type"].astype(str).str.lower().str.contains("nopv") & chk["Vaccine_type"].astype(str).str.lower().str.contains("bopv")
     mx = chk[["Tot_Vacc_nOPV2", "Total_Vacc_bOPV"]].max(axis=1)
     assert (chk.loc[co, "TotalNbrVaccPolio"] == mx[co]).all(), "co-admin total must be the max"
