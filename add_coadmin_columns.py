@@ -341,6 +341,14 @@ def main():
                         c.number_format = "0.00"
             else:
                 oc = row_cells[header.index(h)]
+                if h == "check_dp":
+                    # duplicate-check key kept as a live formula on the new column letters:
+                    # Country & Province & District & SIA_date & TotalNbrVaccPolio & Response
+                    parts = [new_letter[x] + str(r_out) for x in
+                             ("Country", "Province", "District", "SIA_date", "TotalNbrVaccPolio", "Response")]
+                    c = ws_new.cell(row=r_out, column=j + 1, value="=" + "&".join(parts))
+                    c._style = copy(oc._style)
+                    continue
                 if h == "PopPolio" and bool(pop_fixed.iat[i]):
                     c = ws_new.cell(row=r_out, column=j + 1, value=int(pop.iat[i]))
                     c._style = copy(oc._style)
