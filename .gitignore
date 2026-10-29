@@ -9,3 +9,6 @@ __pycache__/
 *.pyc
 ~$*
 _history/
+
+# the campaign lookup is kept in the repository
+!lookup.xlsx
