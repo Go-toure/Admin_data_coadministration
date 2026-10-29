@@ -166,11 +166,12 @@ A separate script puts the latest corrected file on SharePoint, in place of the 
    `upload_to_sharepoint` folder), or the file given with `--file`.
 2. It checks the file: `Sheet1` only, the key and co-administration columns, about 38 countries (not a country file), and
    that `check_dp` holds values (the file was opened and saved once in Excel).
-3. It downloads the live file and compares: no column lost, not more than 10% fewer records, not the same file.
+3. It downloads the live file and compares: no column lost, not more than 10% fewer records, not the same file. If the live file was modified **after** the file to publish was saved (someone else edited it), it stops (`--force` after you checked what changed), because publishing would overwrite their work.
 4. It backs up the live file with `SharePoint_version_backup` and checks the backup holds exactly that file (SHA-256).
    If not, it stops before touching SharePoint.
 5. It uploads the file as `AFRO_admin_data.xlsx` **into the existing SharePoint file** (same file, same link). SharePoint
-   refuses the upload if someone changed the file meanwhile or has it open. The upload is checked by size and SHA-256.
+   refuses the upload if someone changed the file meanwhile or has it open. The upload is checked by downloading it back
+   (SharePoint rewrites the document properties of an Office file, so the bytes can differ slightly; the sheet data must match).
 6. Storage: SharePoint keeps every overwrite as a full extra copy, so the script deletes the version history of that file
    (the local backup keeps the history) and tries to empty the deleted copies from the site recycle bin. If the recycle bin
    cannot be emptied with the app's permissions, it says so; then empty it in Site contents > Recycle bin > Second-stage
