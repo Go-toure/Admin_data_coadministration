@@ -130,6 +130,20 @@ def main():
     ap.add_argument("--keep-copied-rounds", action="store_true",
                     help="do not remove the rounds that the lookup does not have and that copy another round of the "
                          "same Response and date (they are removed by default and listed in the audit)")
+    ap.add_argument("--geo", help="geography reference (country, province, district) for the province / country check "
+                                  "(default: geo_reference.csv next to this script)")
+    ap.add_argument("--no-quality", action="store_true", help="do not run the quality checks (merged from the admin portal)")
+    ap.add_argument("--no-fix-province", action="store_true",
+                    help="do not correct a province that belongs to another country (it is then only reported)")
+    ap.add_argument("--check-only", action="store_true",
+                    help="only run the quality checks on the file as it is (no update, no changes) and write the report")
+    ap.add_argument("--country", help="with --check-only: limit the checks to this country")
+    ap.add_argument("--cv-ceiling", type=float, default=150.0,
+                    help="quality checks: coverage above this %% is flagged (default 150)")
+    ap.add_argument("--pop-factor", type=float, default=3.0,
+                    help="quality checks: target population this many times above / below the district median is flagged (default 3)")
+    ap.add_argument("--fail-on-error", action="store_true",
+                    help="exit with code 2 when the quality checks still find records with an Error")
     ap.add_argument("--no-dictionary", action="store_true", help="do not build the data dictionary")
     ap.add_argument("--no-audit", action="store_true", help="do not write the audit workbook")
     ap.add_argument("--no-feedback", action="store_true", help="do not write the feedback workbook")
@@ -143,6 +157,10 @@ def main():
     a.dictionary = None if a.no_dictionary else os.path.join(up_dir, "AFRO_admin_data_dictionary.xlsx")
     a.audit = None if a.no_audit else os.path.join(rev_dir, "AFRO_admin_data_coadmin_audit.xlsx")
     a.feedback = None if a.no_feedback else os.path.join(rev_dir, "Feedback_suspicious_coverage.xlsx")
+    a.quality = None if a.no_quality else os.path.join(rev_dir, "AFRO_admin_data_quality_report.xlsx")
+    if a.check_only:
+        run_check_only(a, rev_dir)
+        return
     a.fix_poppolio = not a.no_fix_poppolio
     a.model_poppolio = a.fix_poppolio and not a.no_model_poppolio
     if a.model_poppolio:
@@ -226,6 +244,33 @@ def main():
                 repl[(int(r["Excel row"]) - 2, r["Column"])] = r["Restored"]
             elif r["Restored"] and r["Column"] == "SIA_date":
                 repl[(int(r["Excel row"]) - 2, "SIA_date")] = pd.Timestamp(r["Restored"]).to_pydatetime()
+
+    # geography reference (country / province / district of the region): a province that belongs to ANOTHER country is
+    # a copy error too; it is corrected with the reference before anything else is built on it
+    geo = None
+    prov_log = []
+    if not a.no_quality:
+        gp = find_geo(a.geo, a.src)
+        if gp:
+            try:
+                geo = load_geo(gp)
+                print("geography reference: %s (%d districts)" % (gp, len(geo)), flush=True)
+            except Exception as e:
+                print("geography reference not used (%s): %s" % (gp, e), flush=True)
+        else:
+            print("geography reference: not found (geo_reference.csv): the province / country check is skipped", flush=True)
+    if geo is not None and not a.no_fix_province:
+        _, corr0, _ = qc_geo(qc_prepare(df), geo)
+        if corr0 is not None and len(corr0):
+            for r in corr0[corr0["certain"]].itertuples():
+                i = int(r.idx)
+                df.at[i, "Province"] = r.suggested_province
+                repl[(i, "Province")] = r.suggested_province
+                prov_log.append({"Excel row": int(df.at[i, "_row"]), "Country": r.Country, "District": r.District,
+                                 "Column": "Province", "Found": r.current_province, "Restored": r.suggested_province,
+                                 "Source": r.source})
+            if prov_log:
+                print("province of another country corrected: %d records" % len(prov_log), flush=True)
 
     # rounds that only exist as a copy of another round of the same Response and date (lookup has no such round)
     copy_drop = pd.Series(False, index=df.index)
@@ -557,6 +602,16 @@ def main():
     if a.dictionary:
         build_dictionary(chk, a.dictionary)
 
+    # ------------------------------------------------------------ quality checks (merged from the portal)
+    qres = None
+    if not a.no_quality:
+        # read again without turning the text "NA" into an empty cell (a province called NA is not an empty province)
+        qdf = pd.read_excel(a.dst, sheet_name=SHEET, keep_default_na=False, na_values=[""])
+        qres = qc_run(qdf, geo, qc_config(cv_ceiling=a.cv_ceiling / 100.0, pop_factor=a.pop_factor))
+        qres["fixes"] = pd.DataFrame(prov_log)
+        qc_print(qres)
+        qc_write(qres, a.quality)
+
     print("\nDone. Files written under", a.out_dir)
     print("  upload_to_sharepoint/ : AFRO_admin_data.xlsx" + (" + the data dictionary" if a.dictionary else ""))
     print("  review/               : audit" + (" + feedback workbook" if a.feedback else ""))
@@ -568,10 +623,486 @@ def main():
     if unresolved:
         print("  %d copy errors could not be fixed: see sheet Repairs in the audit workbook "
               "(Source = UNRESOLVED), to correct with the country." % len(unresolved))
+    if qres is not None:
+        print("  review/               : quality report (%d records with an Error, %d with a Warning)" % (qres["n_err"], qres["n_warn"]))
     if partial:
         print("WARNING: only %d countries in this file: do NOT upload the output as AFRO_admin_data.xlsx." % n_countries)
     else:
         print("Next: open AFRO_admin_data.xlsx in Excel and save once, then upload it to SharePoint.")
+    if a.fail_on_error and qres is not None and qres["n_err"]:
+        sys.exit(2)
+
+
+# =====================================================================================================
+# Quality checks (merged from the admin portal: admin_quality_checks.R)
+# =====================================================================================================
+# The same checks as the portal, run on the finished file (and, for the province / country check, also before
+# the update so that the province of another country can be corrected). Severity:
+#   Error    must be fixed before the record is used (wrong geography, missing key field, impossible date or number)
+#   Warning  needs a human look: may be a real problem or a genuine exception
+#   Info     good practice (combined co-administration record, spelling ...)
+# Besides the portal's checks there is one for the new co-administration columns (the combined total must be the
+# larger of the two vaccines). Only the province of another country is corrected by the script, with the
+# geography reference; everything else is reported in AFRO_admin_data_quality_report.xlsx.
+QC_LABELS = {
+    "missing_key": "Missing key field", "country_name": "Country name not standard",
+    "geo_province": "Province does not belong to the country",
+    "geo_unknown": "Province not found in the geography reference", "sia_date": "SIA date missing or implausible",
+    "report_date": "Report date before the SIA start / in the future", "negative_number": "Negative number",
+    "target_missing": "Target population missing or zero", "target_gt_total": "Target population larger than total population",
+    "coverage_ceiling": "Coverage above the ceiling", "coverage_high": "Coverage high (verify)",
+    "coverage_mismatch": "Reported coverage differs from vaccinated / target",
+    "target_jump": "Target population very different from other rounds",
+    "coadmin_mixed": "Co-administration reported both combined and separate",
+    "coadmin_combined": "Combined co-administration record", "coadmin_identical": "Identical figures for both vaccines",
+    "coadmin_total": "Combined total is not the larger of the two vaccines",
+    "vaccine_spelling": "Vaccine type spelling", "duplicate_key": "Duplicate record",
+}
+QC_SEV = ["Error", "Warning", "Info"]
+QC_OWN_USE_MIN = 5   # a province name used by this many records of the country itself is not a stray copy
+QC_COUNTRY_ALIAS = {
+    "CAMEROUN": "CAMEROON", "REPUBLIQUE CENTRAFRIQUE": "CENTRAL AFRICAN REPUBLIC",
+    "REPUBLIQUE CENTRAFRICAINE": "CENTRAL AFRICAN REPUBLIC", "TANZANIA": "UNITED REPUBLIC OF TANZANIA",
+    "TCHAD": "CHAD", "THE GAMBIA": "GAMBIA", "SWAZILAND": "ESWATINI", "CABO VERDE": "CABO VERDE",
+    "CAPE VERDE": "CABO VERDE", "COTE DIVOIRE": "COTE D IVOIRE", "IVORY COAST": "COTE D IVOIRE",
+    "DRC": "DEMOCRATIC REPUBLIC OF THE CONGO", "CONGO DEMOCRATIC REPUBLIC": "DEMOCRATIC REPUBLIC OF THE CONGO",
+    "REPUBLIC OF CONGO": "CONGO", "REPUBLIC OF THE CONGO": "CONGO", "GUINEA BISSAU": "GUINEA BISSAU",
+    "GUINEE BISSAU": "GUINEA BISSAU", "GUINEE": "GUINEA", "GUINEE EQUATORIALE": "EQUATORIAL GUINEA",
+}
+QC_VACCINE_CANON = ["nOPV2", "bOPV", "mOPV2", "nOPV2 & bOPV", "nOPV2_bOPV_IPV", "nOPV1", "nOPV3", "IPV", "fIPV",
+                    "MR", "Measles", "YF", "OPV"]
+
+
+def qc_config(cv_ceiling=1.5, cv_high=1.2, cv_recalc_tol=0.02, pop_factor=3.0, pop_min_rounds=3,
+              report_late_days=365, min_sia_year=2015):
+    return dict(cv_ceiling=cv_ceiling, cv_high=cv_high, cv_recalc_tol=cv_recalc_tol, pop_factor=pop_factor,
+                pop_min_rounds=pop_min_rounds, report_late_days=report_late_days, min_sia_year=min_sia_year)
+
+
+_QN_CACHE = {}
+
+
+def _qn(x):
+    """Name for matching: no accents, capitals, letters and digits separated by single spaces."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    k = x if isinstance(x, str) else str(x)
+    r = _QN_CACHE.get(k)
+    if r is None:
+        import unicodedata
+        t = unicodedata.normalize("NFKD", k).encode("ascii", "ignore").decode().upper()
+        r = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", t)).strip()
+        _QN_CACHE[k] = r
+    return r
+
+
+def _qcountry(x):
+    k = _qn(x)
+    return QC_COUNTRY_ALIAS.get(k, k)
+
+
+def _qblank(s):
+    return s.isna() | (s.astype(str).str.strip() == "")
+
+
+def _qdate(s):
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_datetime(s, unit="D", origin="1899-12-30", errors="coerce")
+    return pd.to_datetime(s, errors="coerce")
+
+
+def find_geo(user_path, src):
+    cands = [user_path] if user_path else []
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands.append(os.path.join(here, "geo_reference.csv"))
+    if os.environ.get("ADMIN_GEO"):
+        cands.append(os.environ["ADMIN_GEO"])
+    for base in (os.path.dirname(os.path.abspath(src)), os.getcwd(), here):
+        for rel in ("geo_reference.csv", os.path.join("input", "geo_reference.csv"),
+                    os.path.join("..", "data", "geo_reference.csv")):
+            cands.append(os.path.join(base, rel))
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def load_geo(path):
+    g = pd.read_excel(path) if path.lower().endswith((".xlsx", ".xls")) else pd.read_csv(path, encoding="utf-8")
+    g.columns = [str(c).strip().lower() for c in g.columns]
+    miss = [c for c in ("country", "province", "district") if c not in g.columns]
+    if miss:
+        raise ValueError("columns missing: " + ", ".join(miss))
+    g = g[["country", "province", "district"]].dropna().drop_duplicates().copy()
+    g["c_key"] = g["country"].map(_qcountry)
+    g["p_key"] = g["province"].map(_qn)
+    g["d_key"] = g["district"].map(_qn)
+    return g.reset_index(drop=True)
+
+
+def qc_prepare(df):
+    def col(name):
+        return df[name] if name in df.columns else pd.Series(np.nan, index=df.index)
+    w = pd.DataFrame({"idx": np.arange(len(df))}, index=df.index)
+    for k, name in (("Country", "Country"), ("Province", "Province"), ("District", "District"),
+                    ("Round", "Round_Add"), ("Vaccine", "Vaccine_type"), ("Response", "Response")):
+        w[k] = col(name).map(lambda x: x if isinstance(x, str) else ("" if pd.isna(x) else str(x)))
+    w["sia_date"] = _qdate(col("SIA_date"))
+    w["report_date"] = _qdate(col("Date_Report"))
+    for k, name in (("tot_pop", "TotPop"), ("target", "PopPolio"), ("vacc", "TotalNbrVaccPolio"), ("cv_rep", "CVPolio"),
+                    ("tn", "Tot_Vacc_nOPV2"), ("tb", "Total_Vacc_bOPV")):
+        w[k] = pd.to_numeric(col(name), errors="coerce")
+    w["age_grp"] = col("AgeGPolio").map(lambda x: "" if pd.isna(x) else str(x))
+    w["c_key"] = w["Country"].map(_qcountry)
+    w["p_key"] = w["Province"].map(_qn)
+    w["d_key"] = w["District"].map(_qn)
+    kn = w["Vaccine"].map(_qn)
+    w["fam"] = np.where(kn.str.contains("NOPV2") & kn.str.contains("BOPV"), "combined",
+                        np.where(kn.str.contains("NOPV2"), "nOPV2", np.where(kn.str.contains("BOPV"), "bOPV", "other")))
+    w["key_id"] = (w["c_key"] + "|" + w["p_key"] + "|" + w["d_key"] + "|" + w["sia_date"].dt.strftime("%Y-%m-%d").fillna("")
+                   + "|" + w["Round"].map(_qn) + "|" + kn + "|" + w["Response"].map(_qn))
+    return w
+
+
+def _qi(idx, check, sev, message, current=None, suggested=None):
+    idx = np.asarray(idx, dtype=int)
+    if len(idx) == 0:
+        return None
+    n = len(idx)
+
+    def rep(v):
+        if v is None:
+            return [""] * n
+        if isinstance(v, (list, tuple, np.ndarray, pd.Series)):
+            return ["" if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x) for x in v]
+        return [str(v)] * n
+    return pd.DataFrame({"idx": idx, "check": check, "severity": sev, "message": rep(message),
+                         "current": rep(current), "suggested": rep(suggested)})
+
+
+def _qfmt(x):
+    return "{:,.0f}".format(x)
+
+
+def qc_geo(w, geo):
+    """Province / country consistency. Returns (issues, corrections, effective province)."""
+    prov_eff = w["Province"].copy()
+    if geo is None:
+        return [], None, prov_eff
+    cp = geo[["c_key", "p_key"]].drop_duplicates()
+    okset = set(zip(cp["c_key"], cp["p_key"]))
+    prov_countries = cp.groupby("p_key")["c_key"].agg(lambda x: sorted(set(x))).to_dict()
+    ok = np.array([(c, p) in okset for c, p in zip(w["c_key"], w["p_key"])], dtype=bool)
+    known = w["c_key"].isin(set(geo["c_key"])).values
+    test = np.where(known & ~_qblank(w["Province"]).values & ~ok)[0]
+    if len(test) == 0:
+        return [], None, prov_eff
+    cd = geo.drop_duplicates(["c_key", "d_key", "province"])
+    grp = cd.groupby(["c_key", "d_key"])["province"].agg(["nunique", "first"])
+    uniq = grp[grp["nunique"] == 1]["first"].to_dict()
+    sugg = [uniq.get((w["c_key"].iat[i], w["d_key"].iat[i])) for i in test]
+    src = ["geography reference (district)" if s else None for s in sugg]
+    good = w[ok & ~_qblank(w["District"]).values]
+    ev = {}
+    if len(good):
+        cnt = good.groupby(["c_key", "d_key", "Province"]).size().reset_index(name="n")
+        for (c, d), g in cnt.groupby(["c_key", "d_key"]):
+            tot, top = g["n"].sum(), g["n"].max()
+            if top / tot >= 0.8:
+                ev[(c, d)] = g.sort_values("n", ascending=False)["Province"].iloc[0]
+    for k, i in enumerate(test):
+        if sugg[k] is None:
+            s = ev.get((w["c_key"].iat[i], w["d_key"].iat[i]))
+            if s:
+                sugg[k], src[k] = s, "other records of the same district"
+    other = [", ".join(c for c in prov_countries.get(w["p_key"].iat[i], []) if c) for i in test]
+    cross = np.array([bool(o) for o in other])
+    # a name that the country itself uses in many records is a naming variant (Rwanda EAST / NORTH, Malawi NORTH),
+    # not a stray copy from another country: reported as a Warning, never corrected by the script
+    use = w.groupby(["c_key", "p_key"]).size().to_dict()
+    n_use = np.array([use.get((w["c_key"].iat[i], w["p_key"].iat[i]), 0) for i in test])
+    stray = cross & (n_use < QC_OWN_USE_MIN)
+    variant = cross & ~stray
+    issues = []
+    for mask, sev, fmt in ((stray, "Error", "Province '%s' belongs to %s, not to %s"),
+                           (variant, "Warning", "Province '%s' is not an Admin1 of %s in the reference but is used by many records of %s: "
+                                                "another naming system or spelling? (reference says: %s)")):
+        ci = test[mask]
+        if sev == "Error":
+            msgs = [fmt % (w["Province"].iat[i], o, w["Country"].iat[i]) for i, o in zip(ci, np.array(other)[mask])]
+        else:
+            msgs = [fmt % (w["Province"].iat[i], w["Country"].iat[i], w["Country"].iat[i], o)
+                    for i, o in zip(ci, np.array(other)[mask])]
+        issues.append(_qi(ci, "geo_province", sev, msgs, current=w["Province"].iloc[ci].values,
+                          suggested=[sugg[k] for k in np.where(mask)[0]]))
+    ui = test[~cross]
+    issues.append(_qi(ui, "geo_unknown", "Info",
+                      ["Province '%s' is not an Admin1 of %s in the geography reference (spelling, or a new Admin1?)"
+                       % (w["Province"].iat[i], w["Country"].iat[i]) for i in ui],
+                      current=w["Province"].iloc[ui].values, suggested=[sugg[k] for k in np.where(~cross)[0]]))
+    corr = pd.DataFrame({"idx": test, "Country": w["Country"].iloc[test].values, "District": w["District"].iloc[test].values,
+                         "current_province": w["Province"].iloc[test].values, "suggested_province": sugg,
+                         "source": src, "certain": stray})
+    corr = corr[corr["suggested_province"].notna()].copy()
+    if len(corr):
+        prov_eff = prov_eff.copy()
+        prov_eff.iloc[corr["idx"].values] = corr["suggested_province"].values
+    return [x for x in issues if x is not None], corr, prov_eff
+
+
+def qc_run(df, geo=None, cfg=None, today=None):
+    """Run every check on a data frame. Returns {issues, corrections, by_check, by_country, n_rows, n_flagged}."""
+    cfg = cfg or qc_config()
+    today = pd.Timestamp(today or pd.Timestamp.today().normalize())
+    w = qc_prepare(df)
+    parts = []
+
+    def add(x):
+        if x is None:
+            return
+        if isinstance(x, list):
+            parts.extend(p for p in x if p is not None)
+        else:
+            parts.append(x)
+
+    # --- missing key fields
+    for nm, label in (("Country", "Country"), ("Province", "Province"), ("District", "District"),
+                      ("Vaccine", "Vaccine_type"), ("Response", "Response"), ("Round", "Round_Add")):
+        add(_qi(np.where(_qblank(w[nm]).values)[0], "missing_key", "Error", label + " is empty"))
+    add(_qi(np.where(w["sia_date"].isna().values)[0], "sia_date", "Error", "SIA_date is empty or could not be read"))
+    # --- country name
+    if geo is not None:
+        ref = set(geo["c_key"])
+        std = geo.drop_duplicates("c_key").set_index("c_key")["country"].to_dict()
+        i = np.where((~_qblank(w["Country"]) & ~w["c_key"].isin(ref)).values)[0]
+        add(_qi(i, "country_name", "Error", "Country name is not in the geography reference", current=w["Country"].iloc[i].values))
+        raw = w["Country"].map(_qn)
+        v = np.where((~_qblank(w["Country"]) & raw.isin(set(QC_COUNTRY_ALIAS)) & (raw != w["c_key"]) & w["c_key"].isin(ref)).values)[0]
+        standard = [std[w["c_key"].iat[k]] for k in v]
+        add(_qi(v, "country_name", "Info",
+                ["Country spelled '%s'; the standard name is '%s'" % (w["Country"].iat[k], s) for k, s in zip(v, standard)],
+                current=w["Country"].iloc[v].values, suggested=standard))
+    gi, corr, prov_eff = qc_geo(w, geo)
+    add(gi)
+    # --- dates
+    yr = w["sia_date"].dt.year
+    i = np.where((w["sia_date"].notna() & ((yr < cfg["min_sia_year"]) | (yr > today.year + 1))).values)[0]
+    add(_qi(i, "sia_date", "Error", ["SIA_date year %d is outside the plausible range" % yr.iat[k] for k in i],
+            current=w["sia_date"].dt.strftime("%Y-%m-%d").iloc[i].values))
+    i = np.where((w["sia_date"].notna() & (w["sia_date"] > today + pd.Timedelta(days=120))).values)[0]
+    add(_qi(i, "sia_date", "Warning", "SIA_date is more than 4 months in the future",
+            current=w["sia_date"].dt.strftime("%Y-%m-%d").iloc[i].values))
+    d = (w["report_date"] - w["sia_date"]).dt.days
+    i = np.where((d < 0).fillna(False).values)[0]
+    add(_qi(i, "report_date", "Warning", ["Report date is %d day(s) before the SIA start" % -d.iat[k] for k in i],
+            current=w["report_date"].dt.strftime("%Y-%m-%d").iloc[i].values,
+            suggested=w["sia_date"].dt.strftime("%Y-%m-%d").iloc[i].values))
+    i = np.where((w["report_date"].notna() & (w["report_date"] > today)).values)[0]
+    add(_qi(i, "report_date", "Warning", "Report date is in the future",
+            current=w["report_date"].dt.strftime("%Y-%m-%d").iloc[i].values))
+    i = np.where((d > cfg["report_late_days"]).fillna(False).values)[0]
+    add(_qi(i, "report_date", "Info", ["Report date is %d days after the SIA start" % d.iat[k] for k in i],
+            current=w["report_date"].dt.strftime("%Y-%m-%d").iloc[i].values))
+    # --- numbers
+    t, vv, tp = w["target"], w["vacc"], w["tot_pop"]
+    neg = np.where(((tp < 0) | (t < 0) | (vv < 0)).fillna(False).values)[0]
+    add(_qi(neg, "negative_number", "Error", "Population or number vaccinated is negative"))
+    i = np.where((vv.notna() & (vv > 0) & (t.isna() | (t <= 0))).values)[0]
+    add(_qi(i, "target_missing", "Error", "Vaccinated children reported but the target population is missing or zero",
+            current=t.iloc[i].values))
+    i = np.where(((tp > 0) & t.notna() & (t > tp * 1.0001)).fillna(False).values)[0]
+    add(_qi(i, "target_gt_total", "Warning",
+            ["Target population (%s) is larger than the total population (%s)" % (_qfmt(t.iat[k]), _qfmt(tp.iat[k])) for k in i]))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rc = vv / t.where(t > 0)
+    okc = rc.notna() & np.isfinite(rc)
+    i = np.where((okc & (rc > cfg["cv_ceiling"])).values)[0]
+    add(_qi(i, "coverage_ceiling", "Warning",
+            ["Vaccinated / target = %d%% (above the %d%% ceiling): invalid for coverage analysis until verified"
+             % (round(100 * rc.iat[k]), round(100 * cfg["cv_ceiling"])) for k in i],
+            current=["%.1f%%" % (100 * rc.iat[k]) for k in i]))
+    i = np.where((okc & (rc > cfg["cv_high"]) & (rc <= cfg["cv_ceiling"])).values)[0]
+    add(_qi(i, "coverage_high", "Info", ["Vaccinated / target = %d%%: please verify target and vaccinated" % round(100 * rc.iat[k]) for k in i],
+            current=["%.1f%%" % (100 * rc.iat[k]) for k in i]))
+    rep_ = w["cv_rep"]
+    i = np.where((okc & rep_.notna() & ((rc - rep_).abs() > cfg["cv_recalc_tol"])).values)[0]
+    sev = np.where(np.abs(rc.iloc[i].values - rep_.iloc[i].values) > 0.10, "Warning", "Info")
+    msg = ["Reported coverage %.1f%% but vaccinated / target = %.1f%%" % (100 * rep_.iat[k], 100 * rc.iat[k]) for k in i]
+    cur = ["%.1f%%" % (100 * rep_.iat[k]) for k in i]
+    sug = ["%.1f%%" % (100 * rc.iat[k]) for k in i]
+    for s_ in ("Warning", "Info"):
+        m_ = sev == s_
+        add(_qi(i[m_], "coverage_mismatch", s_, [x for x, f in zip(msg, m_) if f],
+                current=[x for x, f in zip(cur, m_) if f], suggested=[x for x, f in zip(sug, m_) if f]))
+    # --- target population compared with the same district's other campaign dates
+    dj = w[(w["target"] > 0) & w["sia_date"].notna()].copy()
+    if len(dj):
+        dj["grp"] = dj["c_key"] + "|" + prov_eff.loc[dj.index].map(_qn) + "|" + dj["d_key"] + "|" + dj["age_grp"].map(_qn)
+        per = dj.groupby(["grp", "sia_date"])["target"].median().reset_index(name="tp")
+        per["n_dates"] = per.groupby("grp")["grp"].transform("size")
+        per = per[per["n_dates"] >= cfg["pop_min_rounds"]].copy()
+        if len(per):
+            per = per.sort_values(["grp", "sia_date"]).reset_index(drop=True)
+            per["med_others"] = np.nan
+            for _, g in per.groupby("grp", sort=False):
+                a_ = g["tp"].values
+                per.loc[g.index, "med_others"] = [np.median(np.delete(a_, k)) for k in range(len(a_))]
+            per["ratio"] = per["tp"] / per["med_others"]
+            fl = per[(per["ratio"] >= cfg["pop_factor"]) | (per["ratio"] <= 1 / cfg["pop_factor"])].copy()
+            if len(fl):
+                def digit(r):
+                    for k in (1, 2, 3):
+                        if abs(r / 10 ** k - 1) < 0.25:
+                            return "possible extra digit"
+                        if abs(r * 10 ** k - 1) < 0.25:
+                            return "possible missing digit"
+                    return ""
+                fl["note"] = fl["ratio"].map(digit)
+                hit = dj.merge(fl[["grp", "sia_date", "med_others", "ratio", "note"]], on=["grp", "sia_date"], how="inner")
+                msgs = ["Target %s is %s the district median of its other campaign dates (%s)%s" % (
+                    _qfmt(r.target), ("%.1fx above" % r.ratio) if r.ratio >= 1 else ("%.1fx below" % (1 / r.ratio)),
+                    _qfmt(round(r.med_others)), (" - " + r.note) if r.note else "") for r in hit.itertuples()]
+                add(_qi(hit["idx"].values, "target_jump", "Warning", msgs, current=[_qfmt(x) for x in hit["target"]],
+                        suggested=[_qfmt(round(x)) for x in hit["med_others"]]))
+    # --- co-administration
+    comb = np.where((w["fam"] == "combined").values)[0]
+    add(_qi(comb, "coadmin_combined", "Info",
+            "Combined nOPV2 & bOPV record: the total is the larger of the two vaccines; confirm the figures apply to both",
+            current=w["Vaccine"].iloc[comb].values))
+    gk = w["c_key"] + "|" + w["d_key"] + "|" + w["sia_date"].dt.strftime("%Y-%m-%d").fillna("")
+    has_c = (w["fam"] == "combined").groupby(gk).transform("any")
+    has_s = w["fam"].isin(["nOPV2", "bOPV"]).groupby(gk).transform("any")
+    i = np.where((has_c & has_s & w["fam"].isin(["combined", "nOPV2", "bOPV"])).values)[0]
+    add(_qi(i, "coadmin_mixed", "Warning",
+            "Same district and start date reported as a combined record and as separate vaccine records (risk of double counting)",
+            current=w["Vaccine"].iloc[i].values))
+    sep = w[w["fam"].isin(["nOPV2", "bOPV"]) & w["vacc"].notna()].copy()
+    if len(sep):
+        sep["gk"] = gk.loc[sep.index]
+        g = sep.groupby("gk").agg(nf=("fam", "nunique"), nv=("vacc", "nunique"), nt=("target", "nunique"))
+        gg = set(g[(g["nf"] == 2) & (g["nv"] == 1) & (g["nt"] == 1)].index)
+        i = sep["idx"].values[sep["gk"].isin(gg).values]
+        add(_qi(i, "coadmin_identical", "Info",
+                "nOPV2 and bOPV records of the same district and date have identical target and vaccinated: please confirm",
+                current=w["vacc"].iloc[i].values))
+    both = (w["fam"] == "combined") & w["tn"].notna() & w["tb"].notna()
+    i = np.where((both & (w["tn"] == w["tb"]) & (w["tn"] > 0)).values)[0]
+    add(_qi(i, "coadmin_identical", "Info",
+            "Combined record with the same figure for both vaccines (taken as both when only one total was reported): please confirm",
+            current=w["tn"].iloc[i].values))
+    mx = w[["tn", "tb"]].max(axis=1)
+    i = np.where((both & ((w["vacc"].fillna(0) - mx.fillna(0)).abs() > 0.5)).values)[0]
+    add(_qi(i, "coadmin_total", "Error", "TotalNbrVaccPolio is not the larger of Tot_Vacc_nOPV2 and Total_Vacc_bOPV",
+            current=w["vacc"].iloc[i].values, suggested=mx.iloc[i].values))
+    # --- vaccine spelling
+    vtrim = w["Vaccine"].str.strip()
+    canon_map = {c.lower(): c for c in QC_VACCINE_CANON}
+    canon = vtrim.str.lower().map(canon_map)
+    i = np.where((~_qblank(vtrim) & canon.notna() & (vtrim != canon)).values)[0]
+    add(_qi(i, "vaccine_spelling", "Info", ["Vaccine type '%s' is spelled differently from '%s'" % (vtrim.iat[k], canon.iat[k]) for k in i],
+            current=vtrim.iloc[i].values, suggested=canon.iloc[i].values))
+    # --- duplicates
+    dup = w["key_id"].duplicated(keep=False)
+    i = np.where(dup.values)[0]
+    cnt = w["key_id"].map(w["key_id"].value_counts())
+    add(_qi(i, "duplicate_key", "Warning",
+            ["Same country, province, district, SIA date, round, vaccine and response appears %d times" % cnt.iat[k] for k in i]))
+
+    iss = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["idx", "check", "severity", "message", "current", "suggested"])
+    base = w[["idx", "Country", "Province", "District", "sia_date", "Round", "Vaccine", "Response"]].copy()
+    base["SIA_date"] = base.pop("sia_date").dt.strftime("%Y-%m-%d")
+    iss = iss.merge(base, on="idx", how="left")
+    iss["check_label"] = iss["check"].map(QC_LABELS)
+    iss["_o"] = iss["severity"].map({s: k for k, s in enumerate(QC_SEV)})
+    iss = iss.sort_values(["_o", "Country", "check", "District", "SIA_date"]).drop(columns="_o")
+    iss["Excel_row"] = iss["idx"] + 2
+    iss = iss[["severity", "check", "check_label", "Country", "Province", "District", "SIA_date", "Round", "Vaccine",
+               "Response", "message", "current", "suggested", "Excel_row", "idx"]].reset_index(drop=True)
+    if corr is not None and len(corr):
+        corr = corr.assign(Excel_row=corr["idx"] + 2)
+    # --- summaries
+    if len(iss):
+        by_check = (iss.groupby(["check_label", "severity"]).agg(Records=("idx", "nunique"), Countries=("Country", "nunique"))
+                    .reset_index().rename(columns={"check_label": "Check", "severity": "Severity"}))
+        by_check["_o"] = by_check["Severity"].map({s: k for k, s in enumerate(QC_SEV)})
+        by_check = by_check.sort_values(["_o", "Records"], ascending=[True, False]).drop(columns="_o")
+        tot = w.groupby("Country").size().rename("Records")
+        s = iss.groupby("Country").apply(lambda g: pd.Series({
+            "Errors": g.loc[g.severity == "Error", "idx"].nunique(), "Warnings": g.loc[g.severity == "Warning", "idx"].nunique(),
+            "Infos": g.loc[g.severity == "Info", "idx"].nunique(), "Records with an issue": g["idx"].nunique()}), include_groups=False)
+        bc = pd.concat([tot, s], axis=1).fillna(0).reset_index().rename(columns={"index": "Country"})
+        ew = iss[iss.severity.isin(["Error", "Warning"])].groupby("Country")["idx"].nunique()
+        bc["% with an error or warning"] = (100 * bc["Country"].map(ew).fillna(0) / bc["Records"].clip(lower=1)).round(1)
+        by_country = bc.sort_values(["Errors", "Warnings"], ascending=False)
+    else:
+        by_check = pd.DataFrame(columns=["Check", "Severity", "Records", "Countries"])
+        by_country = w.groupby("Country").size().rename("Records").reset_index()
+    return {"issues": iss, "corrections": corr, "by_check": by_check, "by_country": by_country, "n_rows": len(df),
+            "n_flagged": int(iss["idx"].nunique()), "config": cfg, "prov_eff": prov_eff,
+            "n_err": int(iss.loc[iss.severity == "Error", "idx"].nunique()),
+            "n_warn": int(iss.loc[iss.severity == "Warning", "idx"].nunique()),
+            "n_info": int(iss.loc[iss.severity == "Info", "idx"].nunique())}
+
+
+def qc_write(res, path, country=None):
+    cfg = res["config"]
+    ov = pd.DataFrame({"Item": ["Records checked", "Records with at least one issue", "Errors (records)", "Warnings (records)",
+                                "Info (records)", "Coverage ceiling", "Target population flag threshold (times higher or lower than usual)",
+                                "Run at"],
+                       "Value": [res["n_rows"], res["n_flagged"], res["n_err"], res["n_warn"], res["n_info"],
+                                 "%d%%" % round(100 * cfg["cv_ceiling"]), "%gx" % cfg["pop_factor"],
+                                 pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")]})
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        ov.to_excel(xw, sheet_name="Overview", index=False)
+        res["by_check"].to_excel(xw, sheet_name="By check", index=False)
+        res["by_country"].to_excel(xw, sheet_name="By country", index=False)
+        res["issues"].drop(columns="idx").to_excel(xw, sheet_name="Issues", index=False)
+        if res["corrections"] is not None and len(res["corrections"]):
+            res["corrections"].drop(columns="idx").to_excel(xw, sheet_name="Suggested fixes", index=False)
+        if res.get("fixes") is not None and len(res["fixes"]):
+            res["fixes"].to_excel(xw, sheet_name="Fixes applied", index=False)
+    print("quality report written:", path, flush=True)
+
+
+def qc_print(res):
+    print("quality checks: %d records | Errors: %d | Warnings: %d | Info: %d records (a record can have several)" %
+          (res["n_rows"], res["n_err"], res["n_warn"], res["n_info"]), flush=True)
+    bc = res["by_check"]
+    for r in bc[bc["Severity"] == "Error"].itertuples():
+        print("   Error   %-55s %6d records" % (r.Check, r.Records), flush=True)
+    for r in bc[bc["Severity"] == "Warning"].itertuples():
+        print("   Warning %-55s %6d records" % (r.Check, r.Records), flush=True)
+
+
+def run_check_only(a, rev_dir):
+    """--check-only: run the quality checks on a file as it is (like run_admin_quality_check.R of the portal)."""
+    print("loading", a.src, flush=True)
+    xl = pd.ExcelFile(a.src)
+    x = xl.parse(SHEET if SHEET in xl.sheet_names else xl.sheet_names[0], keep_default_na=False, na_values=[""])
+    x = x.rename(columns={"SIA-date": "SIA_date"}) if "SIA_date" not in x.columns else x
+    if a.country:
+        x = x[x["Country"].map(_qcountry) == _qcountry(a.country)]
+    orig = x.index.values
+    x = x.reset_index(drop=True)
+    print(len(x), "records", flush=True)
+    if not len(x):
+        sys.exit("no records to check")
+    geo = None
+    gp = find_geo(a.geo, a.src)
+    if gp:
+        geo = load_geo(gp)
+        print("geography reference: %s (%d districts)" % (gp, len(geo)), flush=True)
+    else:
+        print("geo_reference.csv not found: the province / country check is skipped", flush=True)
+    res = qc_run(x, geo, qc_config(cv_ceiling=a.cv_ceiling / 100.0, pop_factor=a.pop_factor))
+    res["issues"]["Excel_row"] = orig[res["issues"]["idx"].values] + 2
+    if res["corrections"] is not None and len(res["corrections"]):
+        res["corrections"]["Excel_row"] = orig[res["corrections"]["idx"].values] + 2
+    qc_print(res)
+    qc_write(res, os.path.join(rev_dir, "AFRO_admin_data_quality_report.xlsx"))
+    if a.fail_on_error and res["n_err"]:
+        sys.exit(2)
 
 
 def model_poppolio(df, out_total, out_vt, pop_new, pop_reason, pop_fixed, drop):
