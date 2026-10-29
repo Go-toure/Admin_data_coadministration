@@ -36,8 +36,9 @@ Before anything else the script looks for the errors made by dragging or pasting
 them. Two references are used: the **campaign lookup** (primary) and the SharePoint backups.
 
 **The lookup** (`lookup.xlsx`: Round Number, OBR Name, Vaccines, Country, Round Start Date, Round Status) lists the
-planned and implemented rounds. It is found automatically (`--lookup FILE`, the `ADMIN_LOOKUP` variable, `lookup.xlsx`
-or `data/lookup.xlsx` next to the input or the script, or `../data`); `--no-lookup` switches it off.
+planned and implemented rounds. The file lives in this repository, next to the script (`lookup.xlsx`), and is refreshed by the lookup fetch pipeline
+(`refresh_preparedness_lookup.py` of the IM workflow copies it here after every successful refresh). Another file can be
+given with `--lookup FILE`; `--no-lookup` switches it off.
 
 What is detected:
 
