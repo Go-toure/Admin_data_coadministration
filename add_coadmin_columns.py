@@ -122,6 +122,10 @@ def main():
     ap.add_argument("--no-infer", action="store_true",
                     help="do not infer the campaign of a copied row from the rest of the file when the backups "
                          "do not hold the right value (the row is then only listed as UNRESOLVED)")
+    ap.add_argument("--lookup", help="campaign lookup workbook (Round Number, OBR Name, Vaccines, Country, Round Start "
+                                     "Date, Round Status) used to cross-check the repairs and the Response / date / round "
+                                     "of every campaign (found automatically in ../data or next to the input)")
+    ap.add_argument("--no-lookup", action="store_true", help="do not use the campaign lookup")
     ap.add_argument("--no-dictionary", action="store_true", help="do not build the data dictionary")
     ap.add_argument("--no-audit", action="store_true", help="do not write the audit workbook")
     ap.add_argument("--no-feedback", action="store_true", help="do not write the feedback workbook")
@@ -194,12 +198,25 @@ def main():
 
     cvp_all = num(df["CVPolio"]) if "CVPolio" in df.columns else pd.Series(np.nan, index=df.index)
 
+    # campaign lookup (planned and implemented rounds): second reference for the repairs and the cross-check
+    lk = None
+    if not a.no_lookup:
+        lk_path = find_lookup(a.lookup, a.src)
+        if lk_path:
+            try:
+                lk = load_lookup(lk_path)
+                print("lookup: %s (%d rounds, %d countries)" % (lk_path, len(lk), lk["_ck"].nunique()), flush=True)
+            except Exception as e:
+                print("lookup not used (%s): %s" % (lk_path, e), flush=True)
+        else:
+            print("lookup: not found (give it with --lookup): campaigns are not cross-checked", flush=True)
+
     # copy / drag-fill errors (Response from another country, nOPV3..nOPV15): restored from the backups
     repairs = []
     repl = {}
     if not a.no_repair:
         repairs = repair_copy_errors(df, find_backups(a.backups, a.src), a.src, os.path.join(a.out_dir, "_backup_cache"),
-                                     infer=not a.no_infer)
+                                     infer=not a.no_infer, lk=lk)
         for r in repairs:
             if r["Restored"] and r["Column"] in ("Response", "Round_Add", "Year", "SIAMTH"):
                 repl[(int(r["Excel row"]) - 2, r["Column"])] = r["Restored"]
@@ -498,9 +515,10 @@ def main():
                        out_cvn, out_cvb, cvp_all, approach, out_tn, out_tb)
 
     # ----------------------------------------------------------------- audit
+    lk_report = lookup_crosscheck(df, lk) if lk is not None else None
     if a.audit:
         write_audit(a.audit, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
-                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, cvp_all, pop_reason, out_cvn, out_cvb, model_info, repairs)
+                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, cvp_all, pop_reason, out_cvn, out_cvb, model_info, repairs, lk_report)
 
     # ------------------------------------------------------------- self-check
     chk = pd.read_excel(a.dst, sheet_name=SHEET)
@@ -748,7 +766,7 @@ def write_feedback(path, df, keep, out_vt, out_total, pop, pop_before, pop_fixed
 
 def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
                 drop, merged_log, keep, paired, pop_fixed=None, pop_before=None, pop_after=None, cvp=None,
-                pop_reason=None, cv_n=None, cv_b=None, model_info=None, repairs=None):
+                pop_reason=None, cv_n=None, cv_b=None, model_info=None, repairs=None, lk_report=None):
     cols = ["_row", "Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Response", "SIA_date"]
     a = df[cols].copy()
     a.rename(columns={"_row": "Original_row"}, inplace=True)
@@ -770,6 +788,9 @@ def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_tota
         summ.to_excel(xw, sheet_name="Summary", index=False)
         if repairs:
             pd.DataFrame(repairs).to_excel(xw, sheet_name="Repairs", index=False)
+        if lk_report is not None:
+            lk_report[0].to_excel(xw, sheet_name="Lookup_check", index=False)
+            lk_report[1].to_excel(xw, sheet_name="Lookup_no_data", index=False)
         review.to_excel(xw, sheet_name="To_review", index=False)
         vtfix.to_excel(xw, sheet_name="Vaccine_type_fixes", index=False)
         changed.to_excel(xw, sheet_name="All_co-admin_records", index=False)
@@ -926,19 +947,165 @@ def _nk(x):
     return re.sub(r"[^A-Z0-9]", "", t)
 
 
-def infer_campaigns(cur, pending, bad_resp, bad_vt):
+# ---------------------------------------------------------------- campaign lookup (planned and implemented rounds)
+LOOKUP_COUNTRY_ALIAS = {"UNITEDREPUBLICOFTANZANIA": "TANZANIA", "CAMEROUN": "CAMEROON",
+                        "REPUBLIQUECENTRAFRIQUE": "CENTRALAFRICANREPUBLIC",
+                        "REPUBLIQUECENTRAFRICAINE": "CENTRALAFRICANREPUBLIC", "CAR": "CENTRALAFRICANREPUBLIC"}
+
+
+def _lkc(c):
+    t = _nk(c)
+    return LOOKUP_COUNTRY_ALIAS.get(t, t)
+
+
+def _rk(r):
+    """Response / OBR name for matching: lower case, letters and digits only (nOPV-sNID == nOPV-Snid)."""
+    return re.sub(r"[^a-z0-9]", "", str(r).lower()) if isinstance(r, str) else ""
+
+
+def _vset(v):
+    return {m.lower() for m in re.findall(r"[nbm]OPV\d?", str(v), re.I)}
+
+
+def _rnum(x):
+    m = re.search(r"(\d+)", str(x))
+    return int(m.group(1)) if m else None
+
+
+def find_lookup(user_path, src):
+    cands = [user_path] if user_path else []
+    if os.environ.get("ADMIN_LOOKUP"):
+        cands.append(os.environ["ADMIN_LOOKUP"])
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (os.path.dirname(os.path.abspath(src)), here, os.getcwd()):
+        for rel in ("lookup.xlsx", os.path.join("data", "lookup.xlsx"), os.path.join("..", "data", "lookup.xlsx"),
+                    os.path.join("..", "..", "data", "lookup.xlsx")):
+            cands.append(os.path.join(base, rel))
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def load_lookup(path):
+    L = pd.read_excel(path)
+    need = ["Round Number", "OBR Name", "Country", "Round Start Date"]
+    miss = [c for c in need if c not in L.columns]
+    if miss:
+        raise ValueError("columns missing: " + ", ".join(miss))
+    L = L[L["OBR Name"].notna()].copy()
+    L["_ck"] = L["Country"].map(_lkc)
+    L["_rk"] = L["OBR Name"].map(_rk)
+    L["_d"] = pd.to_datetime(L["Round Start Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    L["_rn"] = L["Round Number"].map(_rnum)
+    L["_vs"] = L["Vaccines"].map(_vset) if "Vaccines" in L.columns else [set() for _ in range(len(L))]
+    return L.reset_index(drop=True)
+
+
+def _round_offsets(pairs, lk):
+    """Per Response: how the round numbers of the data differ from the lookup's (the lookup starts some
+    campaigns at Round 0, the data at Rnd1). pairs: DataFrame with _rk, _d, rn (round number in the data)."""
+    m = pairs.merge(lk[["_rk", "_d", "_rn"]].drop_duplicates(["_rk", "_d"]), on=["_rk", "_d"], how="inner")
+    m = m[m["rn"].notna() & m["_rn"].notna()]
+    if m.empty:
+        return {}
+    m["diff"] = m["rn"] - m["_rn"]
+    return {k: int(g["diff"].mode().iloc[0]) for k, g in m.groupby("_rk")}
+
+
+def lookup_crosscheck(df, lk):
+    """Compare every Country / Response / SIA_date / Round_Add of the data with the lookup.
+    Returns (one row per campaign round of the data with its status, lookup rounds that have no data)."""
+    g = pd.DataFrame({"Country": df["Country"], "Response": df["Response"],
+                      "_d": df["SIA_date"].map(_dkey), "Round_Add": df["Round_Add"].map(_s),
+                      "Vaccine_type": df["Vaccine_type"].map(lambda x: x.strip() if isinstance(x, str) else "")})
+    g["_rk"] = g["Response"].map(_rk)
+    g["_ck"] = g["Country"].map(_lkc)
+    g["rn"] = g["Round_Add"].map(_rnum)
+    agg = (g.groupby(["Country", "Response", "_d", "Round_Add"], dropna=False)
+           .agg(Records=("Country", "size"), Vaccine_type=("Vaccine_type", lambda x: ", ".join(sorted(set(x) - {""}))),
+                _rk=("_rk", "first"), _ck=("_ck", "first"), rn=("rn", "first")).reset_index())
+    off = _round_offsets(agg[["_rk", "_d", "rn"]].drop_duplicates(), lk)
+    rows = []
+    for r in agg.to_dict("records"):
+        st, lc, lr, ld, days, lv = "OK", "", "", "", "", ""
+        rk_, d_, rn_ = r["_rk"], r["_d"], r["rn"]
+        e = lk[lk["_rk"] == rk_] if rk_ else lk.iloc[0:0]
+        if not rk_:
+            st = "No Response name"
+        elif e.empty:
+            st = "Response not in the lookup"
+        else:
+            lc = " / ".join(sorted(set(e["Country"].astype(str))))
+            if r["_ck"] not in set(e["_ck"]):
+                st = "Response listed for another country in the lookup"
+            ex = e[e["_d"] == d_]
+            if len(ex):
+                x = ex.iloc[0]
+                lr, ld, lv = x["Round Number"], x["Round Start Date"], x.get("Vaccines", "")
+                if st == "OK" and rn_ is not None and not pd.isna(rn_) and not pd.isna(x["_rn"]) \
+                        and rn_ != x["_rn"] + off.get(rk_, 0):
+                    st = "Round differs from the lookup"
+            else:
+                try:
+                    diff = (pd.to_datetime(e["_d"], errors="coerce") - pd.Timestamp(d_)).abs().dt.days
+                    x = e.loc[diff.idxmin()]
+                    days = int(diff.min())
+                    lr, ld, lv = x["Round Number"], x["Round Start Date"], x.get("Vaccines", "")
+                    if st == "OK":
+                        st = ("Date differs from the lookup by %d day(s)" % days) if days <= 7 else \
+                             "Date not in the lookup for this Response"
+                except Exception:
+                    if st == "OK":
+                        st = "Date not readable"
+        rows.append({"Country": r["Country"], "Response": r["Response"], "SIA_date": d_, "Round_Add": r["Round_Add"],
+                     "Records": r["Records"], "Vaccine_type": r["Vaccine_type"], "Status": st, "Lookup_country": lc,
+                     "Lookup_round": lr, "Lookup_start_date": str(ld)[:10], "Days_difference": days,
+                     "Lookup_vaccines": lv})
+    rep = pd.DataFrame(rows)
+    rep["_o"] = (rep["Status"] != "OK").astype(int)
+    rep = rep.sort_values(["_o", "Status", "Country", "Response", "SIA_date"], ascending=[False, True, True, True, True]) \
+             .drop(columns="_o")
+    ok = int(rep["Status"].eq("OK").sum())
+    print("lookup: %d of %d campaign rounds of the data agree with the lookup; the others are in sheet Lookup_check" %
+          (ok, len(rep)), flush=True)
+    # lookup rounds with no records in the data (a start date within 7 days counts as present)
+    have = {}
+    for r in agg.to_dict("records"):
+        have.setdefault(r["_rk"], []).append(r["_d"])
+    miss = []
+    for _, x in lk.iterrows():
+        ds = have.get(x["_rk"], [])
+        try:
+            near = any(abs((pd.Timestamp(d) - pd.Timestamp(x["_d"])).days) <= 7 for d in ds if d)
+        except Exception:
+            near = False
+        if not near:
+            miss.append({"Country": x["Country"], "OBR Name": x["OBR Name"], "Round Number": x["Round Number"],
+                         "Vaccines": x.get("Vaccines", ""), "Round Start Date": str(x["Round Start Date"])[:10],
+                         "Round Status": x.get("Round Status", ""),
+                         "Response_in_data": "yes (other dates)" if ds else "no"})
+    nodata = pd.DataFrame(miss, columns=["Country", "OBR Name", "Round Number", "Vaccines", "Round Start Date",
+                                         "Round Status", "Response_in_data"])
+    return rep, nodata
+
+
+def infer_campaigns(cur, pending, bad_resp, bad_vt, lk=None, footprint=True):
     """Right campaign for rows whose Response comes from another country and that no backup can restore.
 
-    The evidence is the footprint of the campaign, nothing else is used:
-      block (5 rows or more with the same wrong Response, date and round): the Response of the same country
-        whose districts are the same districts (at least 80% both ways) and the same vaccine. Date and round
-        are the block's own; a warning is added when the round was already used by that Response on the same
-        districts (then it is probably the next round) - this is not changed.
-      single row (or a few rows): one campaign round of the same country, vaccine and province, within 90 days
-        of the row, that covers at least 90% of the province's districts and does not have this district. The
-        row is that district's missing record: its Response, SIA_date and Round_Add are all taken from it,
-        because the date and the round were copied from the other country together with the Response.
-    Only a unique answer is used. Returns {row index: {set, why, confidence, check}}."""
+    Two kinds of evidence, used together:
+      the lookup (planned and implemented rounds: Response, round number, start date, vaccine, country): the one
+        round of the same country and vaccine that started on the row's SIA_date gives the Response and the round;
+      the footprint of the campaign in the data itself:
+        block (5 rows or more with the same wrong Response, date and round): the Response of the same country
+          whose districts are the same districts (at least 80% both ways) and the same vaccine;
+        single row (or a few rows): the one campaign round of the same country, vaccine and province, within 90
+          days, that covers at least 90% of the province's districts and lacks this district. The row is that
+          district's missing record: its Response, SIA_date and Round_Add all come from that round, because the
+          date and the round were copied from the other country together with the Response.
+    When both exist and disagree nothing is changed. The round number comes from the lookup, shifted by the
+    way the data numbers the rounds of that Response. Only a unique answer is used.
+    Returns {row index: {set, why, confidence, check}} (or {unresolved: reason})."""
     out = {}
     if not pending:
         return out
@@ -949,16 +1116,45 @@ def infer_campaigns(cur, pending, bad_resp, bad_vt):
     good["_np"] = good["Province"].map(_nk)
     good["_vt"] = good["Vaccine_type"].map(lambda x: x.strip() if isinstance(x, str) else "")
     good["_rd"] = good["Round_Add"].map(_s)
+    good["_rk"] = good["Response"].map(_rk)
+    spell = good.groupby("_rk")["Response"].agg(lambda x: x.value_counts().index[0]).to_dict()
+    off = {}
+    if lk is not None:
+        pr = good[["_rk", "_d"]].copy()
+        pr["rn"] = good["_rd"].map(_rnum)
+        off = _round_offsets(pr.drop_duplicates(), lk)
+
+    def lk_info(rk, d):
+        """(label of the round in the data's numbering, lookup text) for a Response and a start date."""
+        if lk is None:
+            return None, ""
+        e = lk[(lk["_rk"] == rk) & (lk["_d"] == d)]
+        if len(e) != 1:
+            return None, ""
+        x = e.iloc[0]
+        lab = ("Rnd%d" % (x["_rn"] + off.get(rk, 0))) if not pd.isna(x["_rn"]) else None
+        return lab, "lookup: %s %s starts %s" % (x["OBR Name"], x["Round Number"], d)
+
+    def lk_by_date(ck, d, vts):
+        if lk is None or not d:
+            return None
+        e = lk[(lk["_ck"] == _lkc(ck)) & (lk["_d"] == d)]
+        vs = set().union(*[_vset(v) for v in vts]) if vts else set()
+        if vs:
+            keep_ = [bool(v & vs) or not v for v in e["_vs"]]
+            e = e.loc[keep_]
+        rks = list(dict.fromkeys(e["_rk"]))
+        return (rks[0], e[e["_rk"] == rks[0]].iloc[0]["OBR Name"]) if len(rks) == 1 else None
+
     groups = {}
     for i in pending:
         groups.setdefault((cur.at[i, "_ck"], cur.at[i, "Response"], _dkey(cur.at[i, "SIA_date"]),
                            _s(cur.at[i, "Round_Add"])), []).append(i)
     for (ck, found, dk, rd), idx in groups.items():
         gi = good[good["_ck"] == ck]
-        if gi.empty:
-            continue
         vts = {x.strip() if isinstance(x, str) else "" for x in cur.loc[idx, "Vaccine_type"]}
-        if len(idx) >= 5:
+        ldate = lk_by_date(ck, dk, vts)            # lookup: the round of this country that starts on this date
+        if len(idx) >= 5 and not gi.empty:
             G = {_nk(x) for x in cur.loc[idx, "District"]}
             scored = []
             for resp, grp in gi.groupby("Response"):
@@ -968,41 +1164,66 @@ def infer_campaigns(cur, pending, bad_resp, bad_vt):
                 inter = len(G & C)
                 scored.append((min(inter / len(G), inter / max(len(C), 1)), resp, grp))
             scored.sort(key=lambda t: -t[0])
-            if scored and scored[0][0] >= 0.8 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.1):
-                score, resp, grp = scored[0]
-                same_round = grp[(grp["_rd"] == rd) & (grp["_d"] != dk) & grp["_nd"].isin(G)]
-                check = ""
+            fp = scored[0] if footprint and scored and scored[0][0] >= 0.8 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.1) else None
+            fp_rk = _rk(fp[1]) if fp else None
+            if ldate and fp_rk and ldate[0] != fp_rk:
+                for i in idx:
+                    out[i] = {"unresolved": "the lookup says %s (round starting %s), the districts say %s: check with the country"
+                                            % (ldate[1], dk, fp[1])}
+                continue
+            rk_ = ldate[0] if ldate else fp_rk
+            if rk_ is None:
+                continue
+            resp = spell.get(rk_) or (ldate[1] if ldate else fp[1])
+            lab, ltxt = lk_info(rk_, dk)
+            st = {"Response": resp}
+            if lab and lab != rd:
+                st["Round_Add"] = lab
+            why = []
+            if fp:
+                why.append("same country, same vaccine, same %d districts as %s (%.0f%% match)" % (len(G), resp, fp[0] * 100))
+            if ltxt:
+                why.append(ltxt)
+            check = ""
+            if not ltxt and fp:
+                same_round = fp[2][(fp[2]["_rd"] == rd) & (fp[2]["_d"] != dk) & fp[2]["_nd"].isin(G)]
                 if len(same_round):
                     check = ("this Response already has %s for the same districts on %s: the block (%s) is probably "
                              "the next round; Round_Add was not changed" % (rd, same_round["_d"].iloc[0], dk))
-                for i in idx:
-                    out[i] = {"set": {"Response": resp},
-                              "why": "same country, same vaccine, same %d districts as %s (%.0f%% match)"
-                                     % (len(G), resp, score * 100),
-                              "confidence": "medium" if check else "high", "check": check}
+            for i in idx:
+                out[i] = {"set": dict(st), "why": "; ".join(why), "check": check, "lookup": bool(ltxt),
+                          "confidence": "high" if ltxt else ("medium" if check else "high")}
+            continue
+        if gi.empty:
             continue
         for i in idx:
             prov, dist = _nk(cur.at[i, "Province"]), _nk(cur.at[i, "District"])
             gp = gi[gi["_np"] == prov]
             n_p = gp["_nd"].nunique()
+            cand = None
             try:
                 d0 = pd.Timestamp(dk)
+                if footprint and n_p and dist:
+                    cands = []
+                    for (resp, cd, cr), grp in gp.groupby(["Response", "_d", "_rd"]):
+                        if not (set(grp["_vt"]) & vts) or not cd:
+                            continue
+                        if abs((pd.Timestamp(cd) - d0).days) > 90:
+                            continue
+                        covered = set(grp["_nd"])
+                        if dist in covered or len(covered) / n_p < 0.9:
+                            continue
+                        cands.append((resp, cd, cr, len(covered), n_p, grp))
+                    if len(cands) == 1:
+                        cand = cands[0]
             except Exception:
+                cand = None
+            if ldate and cand and ldate[0] != _rk(cand[0]):
+                out[i] = {"unresolved": "the lookup says %s (round starting %s), the province says %s: check with the country"
+                                        % (ldate[1], dk, cand[0])}
                 continue
-            if not n_p or not dist:
-                continue
-            cands = []
-            for (resp, cd, cr), grp in gp.groupby(["Response", "_d", "_rd"]):
-                if not (set(grp["_vt"]) & vts) or not cd:
-                    continue
-                if abs((pd.Timestamp(cd) - d0).days) > 90:
-                    continue
-                covered = set(grp["_nd"])
-                if dist in covered or len(covered) / n_p < 0.9:
-                    continue
-                cands.append((resp, cd, cr, len(covered), n_p, grp))
-            if len(cands) == 1:
-                resp, cd, cr, k, n_p, grp = cands[0]
+            if cand:
+                resp, cd, cr, k, n_p, grp = cand
                 st = {"Response": resp, "SIA_date": cd, "Round_Add": cr}
                 for extra in ("Year", "SIAMTH"):   # date-derived columns, only when they hold plain values
                     if extra in cur.columns:
@@ -1011,14 +1232,26 @@ def infer_campaigns(cur, pending, bad_resp, bad_vt):
                         if len(vals) and not str(vals.iloc[0]).startswith("=") and str(vals.iloc[0]) != str(mine) \
                                 and not str(mine).startswith("="):
                             st[extra] = vals.iloc[0].item() if hasattr(vals.iloc[0], "item") else vals.iloc[0]
-                out[i] = {"set": st, "confidence": "medium",
-                          "why": "%s %s (%s) covers %d of the %d districts of %s and is the only round within 90 days "
-                                 "that lacks %s; the row's date and round came with the wrong Response"
-                                 % (resp, cr, cd, k, n_p, cur.at[i, "Province"], cur.at[i, "District"])}
+                lab, ltxt = lk_info(_rk(resp), cd)
+                check = ""
+                if lab and lab != cr:
+                    check = "the lookup numbers this round %s, the data %s: Round_Add kept as in the data" % (lab, cr)
+                why = ("%s %s (%s) covers %d of the %d districts of %s and is the only round within 90 days that lacks %s; "
+                       "the row's date and round came with the wrong Response" % (resp, cr, cd, k, n_p, cur.at[i, "Province"], cur.at[i, "District"]))
+                if ltxt:
+                    why += "; " + ltxt
+                out[i] = {"set": st, "why": why, "check": check, "lookup": bool(ltxt), "confidence": "high" if ltxt else "medium"}
+            elif ldate:
+                rk_ = ldate[0]
+                lab, ltxt = lk_info(rk_, dk)
+                st = {"Response": spell.get(rk_) or ldate[1]}
+                if lab and lab != rd:
+                    st["Round_Add"] = lab
+                out[i] = {"set": st, "why": ltxt or "lookup", "check": "", "lookup": True, "confidence": "high"}
     return out
 
 
-def repair_copy_errors(df, backup_files, src, cache_dir, infer=True):
+def repair_copy_errors(df, backup_files, src, cache_dir, infer=True, lk=None):
     """Find and fix the copy / drag-fill errors in Response and Vaccine_type, in place. Returns the repair log.
 
     Response: a name that starts with the code of another country (e.g. the South Sudan name copied onto DRC
@@ -1052,8 +1285,17 @@ def repair_copy_errors(df, backup_files, src, cache_dir, infer=True):
     def resp_ok(prefix, ck):
         return prefix is None or prefix not in owners or owners[prefix] == ck
 
-    cur["_resp_ok"] = [resp_ok(p, c) if isinstance(r, str) else True
-                       for p, c, r in zip(cur["_pre"], cur["_ck"], cur["Response"])]
+    # the lookup says to which country each campaign name belongs: this also finds copies that are already in
+    # every backup (then the code of the name is shared by two countries and the backups cannot tell the owner)
+    lk_owner = lk.groupby("_rk")["_ck"].agg(set).to_dict() if lk is not None else {}
+
+    def name_ok(r, ck):
+        if not isinstance(r, str):
+            return True
+        o = lk_owner.get(_rk(r))
+        return resp_ok(_prefix(r), ck) and (o is None or _lkc(ck) in o)
+
+    cur["_resp_ok"] = [name_ok(r, c) for c, r in zip(cur["_ck"], cur["Response"])]
     bad_resp = ~cur["_resp_ok"]
     vt = cur["Vaccine_type"].map(lambda x: x.strip() if isinstance(x, str) else x)
     bad_vt = vt.map(lambda x: bool(isinstance(x, str) and KNOWN_BAD_NOPV.match(x) and KNOWN_BAD_NOPV.match(x).group(1) != "2"))
@@ -1093,29 +1335,12 @@ def repair_copy_errors(df, backup_files, src, cache_dir, infer=True):
         return {"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "Province": df.at[i, "Province"],
                 "District": df.at[i, "District"], "SIA_date": _dkey(df.at[i, "SIA_date"])}
 
-    pending = []
-    for i in df.index[bad_resp]:
-        found = df.at[i, "Response"]
-        ck = cur.at[i, "_ck"]
-        valid = lambda r, ck=ck: resp_ok(_prefix(r), ck)
-        new, src_ = from_backups(i, 0, valid)
-        if new is None:
-            new, src_ = peers(i, "Response", valid)
-        row = dict(rowinfo(i), Column="Response", Found=found, Rule="Response name belongs to another country")
-        if new is None:
-            pending.append((i, row))
-        else:
-            df.at[i, "Response"] = new
-            row.update({"Restored": new, "Source": src_})
-            log.append(row)
+    # Response: 1. the lookup (planned and implemented rounds) is the primary source, 2. the backups, 3. other rows of
+    # the same country, date and round, 4. the footprint of the campaign in the data (only if nothing else answers)
+    bad_idx = list(df.index[bad_resp])
+    lk_inf = infer_campaigns(cur, bad_idx, bad_resp, bad_vt, lk, footprint=infer) if (bad_idx and (lk is not None or infer)) else {}
 
-    inferred = infer_campaigns(cur, [i for i, _ in pending], bad_resp, bad_vt) if (infer and pending) else {}
-    for i, row in pending:
-        inf = inferred.get(i)
-        if inf is None:
-            row.update({"Restored": "", "Source": "UNRESOLVED: no earlier version or other rows give the right name"})
-            log.append(row)
-            continue
+    def apply_inferred(i, row, inf, label):
         for col, val in inf["set"].items():
             old = df.at[i, col] if col in df.columns else None
             if col == "SIA_date":
@@ -1125,9 +1350,44 @@ def repair_copy_errors(df, backup_files, src, cache_dir, infer=True):
             r2 = dict(row if col == "Response" else rowinfo(i), Column=col,
                       Found=(_dkey(old) if col == "SIA_date" else old),
                       Rule=row["Rule"] if col == "Response" else "copied together with the Response from another country",
-                      Restored=val, Source="INFERRED: " + inf["why"], Confidence=inf["confidence"],
+                      Restored=val, Source=label + inf["why"], Confidence=inf["confidence"],
                       Check=inf.get("check", ""))
             log.append(r2)
+
+    for i in bad_idx:
+        found = df.at[i, "Response"]
+        ck = cur.at[i, "_ck"]
+        valid = lambda r, ck=ck: name_ok(r, ck)
+        row = dict(rowinfo(i), Column="Response", Found=found,
+                   Rule="Response name belongs to another country" +
+                        (" (found with the lookup)" if lk_owner.get(_rk(found)) and _prefix(found) not in owners else ""))
+        inf = lk_inf.get(i)
+        if inf and "set" in inf and inf.get("lookup"):
+            apply_inferred(i, row, inf, "lookup: ")
+            continue
+        new, src_ = from_backups(i, 0, valid)
+        if new is None:
+            new, src_ = peers(i, "Response", valid)
+        if new is not None:
+            df.at[i, "Response"] = new
+            row.update({"Restored": new, "Source": src_})
+            log.append(row)
+        elif inf and "set" in inf:
+            apply_inferred(i, row, inf, "INFERRED: ")
+        else:
+            why_ = ("UNRESOLVED: " + inf["unresolved"]) if inf else \
+                "UNRESOLVED: no lookup round, earlier version or other rows give the right name"
+            row.update({"Restored": "", "Source": why_})
+            log.append(row)
+
+    # every restored Response is checked against the lookup, whatever source it came from
+    if lk is not None:
+        keyset = set(zip(lk["_ck"], lk["_rk"], lk["_d"]))
+        for r in log:
+            if r["Column"] == "Response" and r["Restored"] and not r.get("Lookup"):
+                i = int(r["Excel row"]) - 2
+                ok_ = (_lkc(cur.at[i, "_ck"]), _rk(r["Restored"]), _dkey(df.at[i, "SIA_date"])) in keyset
+                r["Lookup"] = "confirmed: this round starts on that date" if ok_ else "not confirmed (round or date not in the lookup)"
 
     def vt_valid(v):
         return not (KNOWN_BAD_NOPV.match(v.strip()) and KNOWN_BAD_NOPV.match(v.strip()).group(1) != "2")
