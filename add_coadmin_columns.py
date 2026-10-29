@@ -124,7 +124,8 @@ def main():
                          "do not hold the right value (the row is then only listed as UNRESOLVED)")
     ap.add_argument("--lookup", help="campaign lookup workbook (Round Number, OBR Name, Vaccines, Country, Round Start "
                                      "Date, Round Status) used to cross-check the repairs and the Response / date / round "
-                                     "of every campaign (found automatically in ../data or next to the input)")
+                                     "of every campaign (default: lookup.xlsx next to this script, kept up to date by the "
+                                     "lookup fetch pipeline)")
     ap.add_argument("--no-lookup", action="store_true", help="do not use the campaign lookup")
     ap.add_argument("--keep-copied-rounds", action="store_true",
                     help="do not remove the rounds that the lookup does not have and that copy another round of the "
@@ -992,13 +993,14 @@ def _rnum(x):
 
 
 def find_lookup(user_path, src):
+    """The lookup is kept in the repository, next to this script (lookup.xlsx); the fetch pipeline refreshes it."""
     cands = [user_path] if user_path else []
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands.append(os.path.join(here, "lookup.xlsx"))
     if os.environ.get("ADMIN_LOOKUP"):
         cands.append(os.environ["ADMIN_LOOKUP"])
-    here = os.path.dirname(os.path.abspath(__file__))
-    for base in (os.path.dirname(os.path.abspath(src)), here, os.getcwd()):
-        for rel in ("lookup.xlsx", os.path.join("data", "lookup.xlsx"), os.path.join("..", "data", "lookup.xlsx"),
-                    os.path.join("..", "..", "data", "lookup.xlsx")):
+    for base in (os.path.dirname(os.path.abspath(src)), os.getcwd(), here):
+        for rel in ("lookup.xlsx", os.path.join("data", "lookup.xlsx"), os.path.join("..", "data", "lookup.xlsx")):
             cands.append(os.path.join(base, rel))
     for c in cands:
         if c and os.path.isfile(c):
