@@ -32,37 +32,51 @@ new; the estimates of the first run are not remembered, so keep the workbook fro
 
 ## Repair of copy and drag-fill errors
 
-Before anything else the script looks for the errors made by dragging or pasting a value down in Excel, and
-fixes them using the SharePoint backups as the reference. It finds the backups by itself in
-`../SharePoint_version_backup/snapshots/admin` (or give the folder with `--backups`; `--no-repair` switches this off).
+Before anything else the script looks for the errors made by dragging or pasting a value down in Excel and fixes
+them. Two references are used: the **campaign lookup** (primary) and the SharePoint backups.
 
-- **Response of another country**: a Response name starting with the code of a different country (for example the
-  South Sudan name `SSD-...` on DRC, Botswana or Zimbabwe rows). The owner of each code is learned from the
-  backups (a country that holds 95% of the rows of that code in at least half of the versions), so one bad
-  version cannot change it.
+**The lookup** (`lookup.xlsx`: Round Number, OBR Name, Vaccines, Country, Round Start Date, Round Status) lists the
+planned and implemented rounds. It is found automatically (`--lookup FILE`, the `ADMIN_LOOKUP` variable, `lookup.xlsx`
+or `data/lookup.xlsx` next to the input or the script, or `../data`); `--no-lookup` switches it off.
+
+What is detected:
+
+- **Response of another country**: a campaign name that the lookup lists for a different country, or a name starting
+  with the code of a different country in the backups (e.g. `SSD-...` on DRC, Botswana or Zimbabwe rows). The lookup
+  finds copies that are already in every backup, where the code is shared by two countries and the backups cannot
+  tell the owner (for example the Malawi name on 303 Angola rows, the Namibia name on Cameroon and Niger).
 - **`nOPV3` ... `nOPV15`** in `Vaccine_type`: a drag-fill of `nOPV2`.
 
-Each error is restored from the same row in the newest earlier backup that holds a valid value; if there is none,
-from the other rows of the same country, date and round; for `Vaccine_type` finally from what the Response name
-says (bOPV / nOPV), otherwise `nOPV2`.
+How a wrong Response is restored, in this order:
 
-**When the error is already in the oldest backup** (the case of Ahmed's first copy errors), no backup can restore it.
-For a Response of another country the script then works out the right campaign from the footprint of the data
-(`--no-infer` switches this off):
+1. **The lookup**: the one round of the same country and vaccine that started on the row's SIA_date gives the
+   Response and the round number (shifted by the way the data numbers the rounds of that Response, as the lookup
+   starts some campaigns at Round 0). When the districts of the data point to another campaign, nothing is changed
+   and the rows are listed as `UNRESOLVED` with both answers.
+2. **The same row in the newest earlier backup** that holds a valid value.
+3. **The other rows of the same country, date and round** (majority).
+4. **The footprint of the campaign in the data** (`--no-infer` switches this off): a block of rows (5 or more with
+   the same wrong Response, date and round) takes the Response of the same country and vaccine that covers the same
+   districts (at least 80% both ways, accents ignored); a single row takes the one campaign round of the same
+   country, vaccine and province, within 90 days, that covers at least 90% of the province's districts and lacks
+   this district (its Response, SIA_date and Round_Add all come from that round, because the date and the round were
+   copied from the other country together with the Response). Only a unique answer is used.
 
-- **A block of rows** (5 or more with the same wrong Response, date and round, e.g. 23 Angola Benguela rows carrying
-  `CAM-...`): it takes the Response of the same country and vaccine whose districts are the same districts (at least
-  80% both ways, accents ignored). If that Response already has the same round for those districts, a warning is
-  written in the `Check` column (probably the next round); the round is not changed.
-- **A single row** (e.g. a Nigeria district carrying the Chad name, date and round): it looks for the one campaign
-  round of the same country, vaccine and province, within 90 days, that covers at least 90% of the province's
-  districts and does not have this district. The row is that district's missing record, so its Response, SIA_date
-  and Round_Add are all taken from that round.
+For `Vaccine_type` the backups come first, then what the Response name says (bOPV / nOPV), otherwise `nOPV2`.
 
-Only a unique answer is used. Inferred values are marked `INFERRED` (with the reason and a confidence) in the audit
-sheet `Repairs`: confirm them with the countries. What still cannot be fixed is not guessed: it is listed as
-`UNRESOLVED`. Every repair (row, value found, value restored, source) is in the same sheet. Renames that stay within
-the same country (for example a corrected campaign name) are kept.
+Every repair (row, value found, value restored, source, confidence, and whether the lookup confirms it) is in the
+audit sheet `Repairs`. `Source` starts with `lookup:`, `backup`, `other rows` or `INFERRED:`. What is still unclear
+is not guessed: it is `UNRESOLVED`. Renames that stay within the same country are kept.
+
+### Lookup cross-check of the whole file
+
+The audit workbook also has two sheets built from the lookup, after the repairs:
+
+- `Lookup_check`: one line per Country / Response / SIA_date / Round_Add of the data with its status: OK, Response not
+  in the lookup, Response listed for another country, Date differs from the lookup by N days, Date not in the lookup for
+  this Response, Round differs from the lookup (with the lookup's round and start date). Nothing is changed from this
+  sheet: it is the list to take to the countries (for example a round that the data has twice and the lookup once).
+- `Lookup_no_data`: rounds of the lookup (planned or implemented) with no records in the data.
 
 ## Which files it accepts
 
