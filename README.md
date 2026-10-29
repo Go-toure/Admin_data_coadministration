@@ -78,6 +78,16 @@ The audit workbook also has two sheets built from the lookup, after the repairs:
   sheet: it is the list to take to the countries (for example a round that the data has twice and the lookup once).
 - `Lookup_no_data`: rounds of the lookup (planned or implemented) with no records in the data.
 
+### Rounds that only exist as a copy
+
+If the data has two rounds of the same Response on the same date, the lookup has only one of them for that date, and
+the extra round is not a round of that Response in the lookup, the script checks whether the extra round copies
+the real one (the same `TotalNbrVaccPolio` in at least 80% of the districts they share). If so, the lookup is
+trusted and the extra round is removed from the upload file (example: `CHD-2024-11-1_nOPV` has `Rnd1` and `Rnd2` on
+2024-11-22 with the same totals; the lookup has Round 1 only, so the 158 `Rnd2` rows go). The removed rows are
+listed in the audit sheet `Removed_copies`, and the backups still hold them. `--keep-copied-rounds` switches this
+off. A round that the lookup does have on another date is never removed (then the date is wrong, see `Lookup_check`).
+
 ## Which files it accepts
 
 - The full regional admin data, raw or already processed (it recognises a processed file, see above).
