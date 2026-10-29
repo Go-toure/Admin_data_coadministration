@@ -89,6 +89,38 @@ trusted and the extra round is removed from the upload file (example: `CHD-2024-
 listed in the audit sheet `Removed_copies`, and the backups still hold them. `--keep-copied-rounds` switches this
 off. A round that the lookup does have on another date is never removed (then the date is wrong, see `Lookup_check`).
 
+## Quality checks (merged from the admin portal)
+
+All the checks of the portal (`admin_quality_checks.R`) run on the finished file, so one script both updates and checks
+the admin data. They need `geo_reference.csv` (country, province, district; kept in this repository next to the script,
+rebuilt from the portal's `input/geo_reference.rds`; another file with `--geo FILE`). Severity: **Error** = fix before the
+record is used, **Warning** = needs a human look, **Info** = good practice.
+
+| Check | Severity |
+|---|---|
+| Missing key field (Country, Province, District, Vaccine_type, Response, Round_Add, SIA_date) | Error |
+| Country name not in the geography reference / alternative spelling (CAMEROUN, TANZANIA ...) | Error / Info |
+| Province of another country (stray copy) / used by many records of the country (other naming system) / not in the reference | Error / Warning / Info |
+| SIA_date outside 2015 - next year; more than 4 months ahead | Error / Warning |
+| Report date before the SIA, in the future, or more than a year after | Warning / Warning / Info |
+| Negative numbers; vaccinated but no target; target larger than total population | Error / Error / Warning |
+| Coverage above the ceiling (150%); coverage above 120%; reported coverage differs from vaccinated / target | Warning / Info / Warning or Info |
+| Target population 3 times above or below the district's other rounds (possible extra / missing digit) | Warning |
+| Co-administration: combined record, combined and separate for the same district and date, identical figures for both vaccines | Info / Warning / Info |
+| Co-administration: `TotalNbrVaccPolio` is not the larger of `Tot_Vacc_nOPV2` and `Total_Vacc_bOPV` (new) | Error |
+| Vaccine type spelling | Info |
+| Duplicate record | Warning |
+
+The report is `review/AFRO_admin_data_quality_report.xlsx` (Overview, By check, By country, Issues, Suggested fixes, Fixes
+applied). Fixes made by the script: a province that belongs to **another country** and is rare in its own country (fewer than
+5 records) is replaced with the province of that district in the geography reference (or the one its other records use);
+names used by many records of a country (Rwanda `EAST`, Malawi `NORTH`) are only reported. Everything else is reported,
+not changed. Thresholds: `--cv-ceiling` (default 150) and `--pop-factor` (default 3); `--no-quality` and `--no-fix-province`
+switch the checks / the province fix off; `--fail-on-error` exits with code 2 when records with an Error remain.
+
+`--check-only` runs only the checks, on a file as it is (nothing is updated), like the portal's daily
+`run_admin_quality_check.R`; `--country Nigeria` limits it to one country.
+
 ## Which files it accepts
 
 - The full regional admin data, raw or already processed (it recognises a processed file, see above).
