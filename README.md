@@ -30,6 +30,24 @@ are corrected (a few more district medians may change). The script recognises a 
 use its own earlier estimates as history. `--force-model-poppolio` overrides this. On such a file the feedback workbook lists only what is still wrong or
 new; the estimates of the first run are not remembered, so keep the workbook from that run.
 
+## Repair of copy and drag-fill errors
+
+Before anything else the script looks for the errors made by dragging or pasting a value down in Excel, and
+fixes them using the SharePoint backups as the reference. It finds the backups by itself in
+`../SharePoint_version_backup/snapshots/admin` (or give the folder with `--backups`; `--no-repair` switches this off).
+
+- **Response of another country**: a Response name starting with the code of a different country (for example the
+  South Sudan name `SSD-...` on DRC, Botswana or Zimbabwe rows). The owner of each code is learned from the
+  backups (a country that holds 95% of the rows of that code in at least half of the versions), so one bad
+  version cannot change it.
+- **`nOPV3` ... `nOPV15`** in `Vaccine_type`: a drag-fill of `nOPV2`.
+
+Each error is restored from the same row in the newest earlier backup that holds a valid value; if there is none,
+from the other rows of the same country, date and round; for `Vaccine_type` finally from what the Response name
+says (bOPV / nOPV), otherwise `nOPV2`. What cannot be fixed is not guessed: it is listed as `UNRESOLVED` in the
+audit sheet `Repairs`, to correct with the country. Every repair (row, value found, value restored, source) is
+in the same sheet. Renames that stay within the same country (for example a corrected campaign name) are kept.
+
 ## Which files it accepts
 
 - The full regional admin data, raw or already processed (it recognises a processed file, see above).
