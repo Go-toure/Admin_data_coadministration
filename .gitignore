@@ -13,3 +13,5 @@ _history/
 # the campaign lookup is kept in the repository
 !lookup.xlsx
 !geo_reference.csv
+
+logs/
