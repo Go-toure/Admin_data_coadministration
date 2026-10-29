@@ -119,6 +119,9 @@ def main():
     ap.add_argument("--backups", help="folder with the SharePoint backups (AFRO_admin_data__*.xlsx), the reference for "
                                       "the repair of copy errors (found automatically next to this repository)")
     ap.add_argument("--no-repair", action="store_true", help="do not look for copy / drag-fill errors")
+    ap.add_argument("--no-infer", action="store_true",
+                    help="do not infer the campaign of a copied row from the rest of the file when the backups "
+                         "do not hold the right value (the row is then only listed as UNRESOLVED)")
     ap.add_argument("--no-dictionary", action="store_true", help="do not build the data dictionary")
     ap.add_argument("--no-audit", action="store_true", help="do not write the audit workbook")
     ap.add_argument("--no-feedback", action="store_true", help="do not write the feedback workbook")
@@ -195,10 +198,13 @@ def main():
     repairs = []
     repl = {}
     if not a.no_repair:
-        repairs = repair_copy_errors(df, find_backups(a.backups, a.src), a.src, os.path.join(a.out_dir, "_backup_cache"))
+        repairs = repair_copy_errors(df, find_backups(a.backups, a.src), a.src, os.path.join(a.out_dir, "_backup_cache"),
+                                     infer=not a.no_infer)
         for r in repairs:
-            if r["Restored"] and r["Column"] == "Response":
-                repl[(int(r["Excel row"]) - 2, "Response")] = r["Restored"]
+            if r["Restored"] and r["Column"] in ("Response", "Round_Add", "Year", "SIAMTH"):
+                repl[(int(r["Excel row"]) - 2, r["Column"])] = r["Restored"]
+            elif r["Restored"] and r["Column"] == "SIA_date":
+                repl[(int(r["Excel row"]) - 2, "SIA_date")] = pd.Timestamp(r["Restored"]).to_pydatetime()
 
     # ------------------------------------------------------------------ logic
     vt_orig = df["Vaccine_type"].astype(object)
@@ -521,8 +527,12 @@ def main():
     print("  upload_to_sharepoint/ : AFRO_admin_data.xlsx" + (" + the data dictionary" if a.dictionary else ""))
     print("  review/               : audit" + (" + feedback workbook" if a.feedback else ""))
     unresolved = [r for r in repairs if not r["Restored"]]
+    inferred = [r for r in repairs if r["Restored"] and str(r.get("Source", "")).startswith("INFERRED")]
+    if inferred:
+        print("  %d values were inferred from the rest of the file (backups had no right value): sheet Repairs, "
+              "Source = INFERRED. Confirm them with the countries." % len(inferred))
     if unresolved:
-        print("  %d copy errors could not be fixed from the backups: see sheet Repairs in the audit workbook "
+        print("  %d copy errors could not be fixed: see sheet Repairs in the audit workbook "
               "(Source = UNRESOLVED), to correct with the country." % len(unresolved))
     if partial:
         print("WARNING: only %d countries in this file: do NOT upload the output as AFRO_admin_data.xlsx." % n_countries)
@@ -909,7 +919,106 @@ def _owners(frames):
     return owners
 
 
-def repair_copy_errors(df, backup_files, src, cache_dir):
+def _nk(x):
+    """District / province name for matching: no accents, capitals, letters and digits only."""
+    import unicodedata
+    t = unicodedata.normalize("NFKD", _s(x)).encode("ascii", "ignore").decode().upper()
+    return re.sub(r"[^A-Z0-9]", "", t)
+
+
+def infer_campaigns(cur, pending, bad_resp, bad_vt):
+    """Right campaign for rows whose Response comes from another country and that no backup can restore.
+
+    The evidence is the footprint of the campaign, nothing else is used:
+      block (5 rows or more with the same wrong Response, date and round): the Response of the same country
+        whose districts are the same districts (at least 80% both ways) and the same vaccine. Date and round
+        are the block's own; a warning is added when the round was already used by that Response on the same
+        districts (then it is probably the next round) - this is not changed.
+      single row (or a few rows): one campaign round of the same country, vaccine and province, within 90 days
+        of the row, that covers at least 90% of the province's districts and does not have this district. The
+        row is that district's missing record: its Response, SIA_date and Round_Add are all taken from it,
+        because the date and the round were copied from the other country together with the Response.
+    Only a unique answer is used. Returns {row index: {set, why, confidence, check}}."""
+    out = {}
+    if not pending:
+        return out
+    good = cur[~bad_resp & ~bad_vt].copy()
+    good = good[good["Response"].map(lambda r: isinstance(r, str))]
+    good["_d"] = good["SIA_date"].map(_dkey)
+    good["_nd"] = good["District"].map(_nk)
+    good["_np"] = good["Province"].map(_nk)
+    good["_vt"] = good["Vaccine_type"].map(lambda x: x.strip() if isinstance(x, str) else "")
+    good["_rd"] = good["Round_Add"].map(_s)
+    groups = {}
+    for i in pending:
+        groups.setdefault((cur.at[i, "_ck"], cur.at[i, "Response"], _dkey(cur.at[i, "SIA_date"]),
+                           _s(cur.at[i, "Round_Add"])), []).append(i)
+    for (ck, found, dk, rd), idx in groups.items():
+        gi = good[good["_ck"] == ck]
+        if gi.empty:
+            continue
+        vts = {x.strip() if isinstance(x, str) else "" for x in cur.loc[idx, "Vaccine_type"]}
+        if len(idx) >= 5:
+            G = {_nk(x) for x in cur.loc[idx, "District"]}
+            scored = []
+            for resp, grp in gi.groupby("Response"):
+                if not (set(grp["_vt"]) & vts):
+                    continue
+                C = set(grp["_nd"])
+                inter = len(G & C)
+                scored.append((min(inter / len(G), inter / max(len(C), 1)), resp, grp))
+            scored.sort(key=lambda t: -t[0])
+            if scored and scored[0][0] >= 0.8 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.1):
+                score, resp, grp = scored[0]
+                same_round = grp[(grp["_rd"] == rd) & (grp["_d"] != dk) & grp["_nd"].isin(G)]
+                check = ""
+                if len(same_round):
+                    check = ("this Response already has %s for the same districts on %s: the block (%s) is probably "
+                             "the next round; Round_Add was not changed" % (rd, same_round["_d"].iloc[0], dk))
+                for i in idx:
+                    out[i] = {"set": {"Response": resp},
+                              "why": "same country, same vaccine, same %d districts as %s (%.0f%% match)"
+                                     % (len(G), resp, score * 100),
+                              "confidence": "medium" if check else "high", "check": check}
+            continue
+        for i in idx:
+            prov, dist = _nk(cur.at[i, "Province"]), _nk(cur.at[i, "District"])
+            gp = gi[gi["_np"] == prov]
+            n_p = gp["_nd"].nunique()
+            try:
+                d0 = pd.Timestamp(dk)
+            except Exception:
+                continue
+            if not n_p or not dist:
+                continue
+            cands = []
+            for (resp, cd, cr), grp in gp.groupby(["Response", "_d", "_rd"]):
+                if not (set(grp["_vt"]) & vts) or not cd:
+                    continue
+                if abs((pd.Timestamp(cd) - d0).days) > 90:
+                    continue
+                covered = set(grp["_nd"])
+                if dist in covered or len(covered) / n_p < 0.9:
+                    continue
+                cands.append((resp, cd, cr, len(covered), n_p, grp))
+            if len(cands) == 1:
+                resp, cd, cr, k, n_p, grp = cands[0]
+                st = {"Response": resp, "SIA_date": cd, "Round_Add": cr}
+                for extra in ("Year", "SIAMTH"):   # date-derived columns, only when they hold plain values
+                    if extra in cur.columns:
+                        vals = cur.loc[grp.index, extra].dropna()
+                        mine = cur.at[i, extra]
+                        if len(vals) and not str(vals.iloc[0]).startswith("=") and str(vals.iloc[0]) != str(mine) \
+                                and not str(mine).startswith("="):
+                            st[extra] = vals.iloc[0].item() if hasattr(vals.iloc[0], "item") else vals.iloc[0]
+                out[i] = {"set": st, "confidence": "medium",
+                          "why": "%s %s (%s) covers %d of the %d districts of %s and is the only round within 90 days "
+                                 "that lacks %s; the row's date and round came with the wrong Response"
+                                 % (resp, cr, cd, k, n_p, cur.at[i, "Province"], cur.at[i, "District"])}
+    return out
+
+
+def repair_copy_errors(df, backup_files, src, cache_dir, infer=True):
     """Find and fix the copy / drag-fill errors in Response and Vaccine_type, in place. Returns the repair log.
 
     Response: a name that starts with the code of another country (e.g. the South Sudan name copied onto DRC
@@ -917,7 +1026,12 @@ def repair_copy_errors(df, backup_files, src, cache_dir):
       1. the same row in the newest earlier backup that holds a valid value,
       2. the other rows of the same country, date and round (majority),
       3. for Vaccine_type, what the Response name says (bOPV / nOPV); otherwise nOPV2.
-    Whatever cannot be fixed is listed as unresolved, nothing is guessed."""
+    Errors that were already in the oldest backup cannot be restored that way. For a Response of another country
+    the campaign is then inferred from the footprint (infer_campaigns): a block of rows takes the Response of the
+    same country's campaign that covers the same districts; a single row takes the campaign round that the other
+    districts of its province have and it lacks (the date and the round, copied from the other country together
+    with the Response, are corrected too). These are marked INFERRED, with the reason; whatever is still unclear is
+    listed as unresolved."""
     cur = _prep(df)
     snaps = []
     if backup_files:
@@ -979,6 +1093,7 @@ def repair_copy_errors(df, backup_files, src, cache_dir):
         return {"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "Province": df.at[i, "Province"],
                 "District": df.at[i, "District"], "SIA_date": _dkey(df.at[i, "SIA_date"])}
 
+    pending = []
     for i in df.index[bad_resp]:
         found = df.at[i, "Response"]
         ck = cur.at[i, "_ck"]
@@ -988,11 +1103,31 @@ def repair_copy_errors(df, backup_files, src, cache_dir):
             new, src_ = peers(i, "Response", valid)
         row = dict(rowinfo(i), Column="Response", Found=found, Rule="Response name belongs to another country")
         if new is None:
-            row.update({"Restored": "", "Source": "UNRESOLVED: no earlier version or other rows give the right name"})
+            pending.append((i, row))
         else:
             df.at[i, "Response"] = new
             row.update({"Restored": new, "Source": src_})
-        log.append(row)
+            log.append(row)
+
+    inferred = infer_campaigns(cur, [i for i, _ in pending], bad_resp, bad_vt) if (infer and pending) else {}
+    for i, row in pending:
+        inf = inferred.get(i)
+        if inf is None:
+            row.update({"Restored": "", "Source": "UNRESOLVED: no earlier version or other rows give the right name"})
+            log.append(row)
+            continue
+        for col, val in inf["set"].items():
+            old = df.at[i, col] if col in df.columns else None
+            if col == "SIA_date":
+                df.at[i, col] = pd.Timestamp(val).to_pydatetime()
+            else:
+                df.at[i, col] = val
+            r2 = dict(row if col == "Response" else rowinfo(i), Column=col,
+                      Found=(_dkey(old) if col == "SIA_date" else old),
+                      Rule=row["Rule"] if col == "Response" else "copied together with the Response from another country",
+                      Restored=val, Source="INFERRED: " + inf["why"], Confidence=inf["confidence"],
+                      Check=inf.get("check", ""))
+            log.append(r2)
 
     def vt_valid(v):
         return not (KNOWN_BAD_NOPV.match(v.strip()) and KNOWN_BAD_NOPV.match(v.strip()).group(1) != "2")
