@@ -157,6 +157,29 @@ What the lookup cannot fix stays an Error ("Missing key field") for the countrie
 (before the lookup starts), Ethiopia records with a blank District (no other identifier in the record or in any backup), and the
 few records with a blank Province that has no match.
 
+## Publishing to SharePoint (`publish_admin_data.py`)
+
+A separate script puts the latest corrected file on SharePoint, in place of the one that is there. Double-click
+`publish_admin_data.bat` or run `python publish_admin_data.py` (`--dry-run` runs the checks only).
+
+1. It takes the highest `AFRO_admin_data_vNN.xlsx` in `coadmin_output/upload_to_sharepoint` (or the scope
+   `upload_to_sharepoint` folder), or the file given with `--file`.
+2. It checks the file: `Sheet1` only, the key and co-administration columns, about 38 countries (not a country file), and
+   that `check_dp` holds values (the file was opened and saved once in Excel).
+3. It downloads the live file and compares: no column lost, not more than 10% fewer records, not the same file.
+4. It backs up the live file with `SharePoint_version_backup` and checks the backup holds exactly that file (SHA-256).
+   If not, it stops before touching SharePoint.
+5. It uploads the file as `AFRO_admin_data.xlsx` **into the existing SharePoint file** (same file, same link). SharePoint
+   refuses the upload if someone changed the file meanwhile or has it open. The upload is checked by size and SHA-256.
+6. Storage: SharePoint keeps every overwrite as a full extra copy, so the script deletes the version history of that file
+   (the local backup keeps the history) and tries to empty the deleted copies from the site recycle bin. If the recycle bin
+   cannot be emptied with the app's permissions, it says so; then empty it in Site contents > Recycle bin > Second-stage
+   recycle bin, or ask IT. `--keep-versions` and `--no-purge-bin` switch these off.
+7. It runs the backup again, so the file just published is the newest local version.
+
+Credentials come from the environment or a `secrets.env` (`--secrets FILE`; otherwise the backup repository's and the IM
+workflow's `config/secrets.env` are tried). The dictionary file is not part of this script.
+
 ## Which files it accepts
 
 - The full regional admin data, raw or already processed (it recognises a processed file, see above).
