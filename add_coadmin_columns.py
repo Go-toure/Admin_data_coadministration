@@ -144,6 +144,10 @@ def main():
                     help="quality checks: target population this many times above / below the district median is flagged (default 3)")
     ap.add_argument("--fail-on-error", action="store_true",
                     help="exit with code 2 when the quality checks still find records with an Error")
+    ap.add_argument("--no-fill-response", action="store_true",
+                    help="do not fill an empty Response from the campaign lookup (country, start date, round)")
+    ap.add_argument("--no-fill-cvpolio", action="store_true",
+                    help="do not fill an empty CVPolio with TotalNbrVaccPolio / PopPolio")
     ap.add_argument("--no-dedupe", action="store_true",
                     help="do not remove exact duplicates (same key and every other value the same); they are removed by default")
     ap.add_argument("--resolve-duplicates", choices=["none", "complete", "first"], default="none",
@@ -280,6 +284,22 @@ def main():
                                  "Source": r.source})
             if prov_log:
                 print("province of another country corrected: %d records" % len(prov_log), flush=True)
+
+    # an empty Response is filled from the campaign lookup (country + start date + round)
+    if lk is not None and not a.no_fill_response:
+        fills = fill_blank_response(df, lk)
+        for i, inf in fills.items():
+            val = inf["set"]["Response"]
+            df.at[i, "Response"] = val
+            repl[(i, "Response")] = val
+            repairs.append({"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "Province": df.at[i, "Province"],
+                            "District": df.at[i, "District"], "SIA_date": _dkey(df.at[i, "SIA_date"]), "Column": "Response",
+                            "Found": "", "Rule": "Response is empty", "Restored": val, "Source": "lookup: " + inf["why"],
+                            "Confidence": inf["confidence"], "Check": ""})
+        if fills:
+            print("empty Response filled from the lookup: %d records (%d exact, %d within a few days)" %
+                  (len(fills), sum(1 for v in fills.values() if v["confidence"] == "high"),
+                   sum(1 for v in fills.values() if v["confidence"] != "high")), flush=True)
 
     # SIA_date written as text ("18-sept-20", "2020-09-18 00:00:00 UTC" ...) is turned into a real date
     date_log = []
@@ -489,6 +509,21 @@ def main():
         model_info = model_poppolio(df, out_total, out_vt, pop_new, pop_reason, pop_fixed, drop)
     pop_before = pop
     pop = pop_new
+    # an empty CVPolio is filled with vaccinated / target population (TotalNbrVaccPolio / PopPolio); a record
+    # without a vaccinated total (target only) keeps an empty coverage
+    cvp_fill = pd.Series(False, index=df.index)
+    cvp_val = pd.Series(np.nan, index=df.index)
+    if "CVPolio" in df.columns and not a.no_fill_cvpolio:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cvp_val = (out_total / pop.where(pop > 0)).round(6)
+        cvp_fill = cvp_all.isna() & cvp_val.notna() & ~drop
+        if cvp_fill.any():
+            print("empty CVPolio filled with TotalNbrVaccPolio / PopPolio: %d records (%d target-only records stay empty)" %
+                  (int(cvp_fill.sum()), int((cvp_all.isna() & ~cvp_fill & ~drop).sum())), flush=True)
+            for i in df.index[cvp_fill]:
+                prov_log.append({"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "District": df.at[i, "District"],
+                                 "Column": "CVPolio", "Found": "", "Restored": float(cvp_val[i]),
+                                 "Source": "TotalNbrVaccPolio / PopPolio (CVPolio was empty)"})
 
     with np.errstate(divide="ignore", invalid="ignore"):
         pop_ok = pop.where(pop > 0)
@@ -580,6 +615,12 @@ def main():
                              ("Country", "Province", "District", "SIA_date", "TotalNbrVaccPolio", "Response")]
                     c = ws_new.cell(row=r_out, column=j + 1, value="=" + "&".join(parts))
                     c._style = copy(oc._style)
+                    continue
+                if h == "CVPolio" and bool(cvp_fill.iat[i]):
+                    c = ws_new.cell(row=r_out, column=j + 1, value=float(cvp_val.iat[i]))
+                    c._style = copy(oc._style)
+                    if c.number_format == "General":
+                        c.number_format = "0.00"
                     continue
                 if h == "PopPolio" and bool(pop_fixed.iat[i]):
                     c = ws_new.cell(row=r_out, column=j + 1, value=int(pop.iat[i]))
@@ -899,6 +940,62 @@ def existing_in_repository(df, repo_path):
     rk = set(portal_key(rp))
     nk = portal_key(df)
     return nk.isin(rk), rp
+
+
+def fill_blank_response(df, lk):
+    """Fill an empty Response from the campaign lookup (the portal reports it as a missing key field).
+
+    For every group of records with the same country, SIA_date and round and an empty Response:
+      - exact: the one lookup round of that country and vaccine that started on that date;
+      - near: when there is none, the one round of that country and vaccine whose start date is within 21 days and
+        whose round number is the group's round number (the rounds of the data are often dated a few days off);
+    Only a unique answer is used. When the lookup name contains the name of a province of the country ("Kwara
+    Response"), only the records of that province are filled. The spelling already used in the data is kept.
+    Returns {row index: {set, why, confidence, check}}."""
+    out = {}
+    resp_blank = df["Response"].isna() | (df["Response"].astype(str).str.strip() == "")
+    if not resp_blank.any():
+        return out
+    ck = df["Country"].map(_lkc)
+    dts = df["SIA_date"].map(parse_sia_text)
+    rd = df["Round_Add"].map(_s)
+    spell = (df.loc[~resp_blank, "Response"].groupby(df.loc[~resp_blank, "Response"].map(_rk)).agg(lambda x: x.value_counts().index[0]).to_dict())
+    pkey = df["Province"].map(_qn)
+    b = df[resp_blank]
+    for (c, d_, r_), g in b.groupby([ck[b.index], dts[b.index].dt.strftime("%Y-%m-%d"), rd[b.index]], dropna=False):
+        if not isinstance(d_, str):
+            continue
+        lc = lk[lk["_ck"] == c]
+        if lc.empty:
+            continue
+        vs = set().union(*[_vset(v) for v in g["Vaccine_type"]])
+        if not vs:
+            continue
+        lc = lc.loc[[bool(v & vs) or not v for v in lc["_vs"]]]
+        e = lc[lc["_d"] == d_]
+        near = None
+        if e.empty:
+            days = (pd.to_datetime(lc["_d"], errors="coerce") - pd.Timestamp(d_)).abs().dt.days
+            rn = _rnum(r_)
+            e = lc[(days <= 21) & (lc["_rn"] == rn)] if rn is not None else lc.iloc[0:0]
+            if len(e):
+                near = int(days[e.index].min())
+        rks = list(dict.fromkeys(e["_rk"]))
+        if len(rks) != 1:
+            continue
+        x = e[e["_rk"] == rks[0]].iloc[0]
+        nm = _qn(x["OBR Name"])
+        hit = {p for p in set(pkey[g.index]) if p and re.search(r"\b" + re.escape(p) + r"\b", nm)}
+        rows = [i for i in g.index if (not hit or pkey[i] in hit)]
+        name = spell.get(rks[0]) or x["OBR Name"]
+        why = "lookup: %s %s starts %s" % (x["OBR Name"], x["Round Number"], x["Round Start Date"])
+        if near is not None:
+            why += " (%d day(s) from the record's SIA_date, same round number)" % near
+        if hit:
+            why += "; only the records of " + ", ".join(sorted(hit))
+        for i in rows:
+            out[i] = {"set": {"Response": name}, "why": why, "confidence": "high" if near is None else "medium", "check": ""}
+    return out
 
 
 def find_geo(user_path, src):
@@ -2294,7 +2391,7 @@ add("Prop_0dosesPolio", "polio", "Proportion of the vaccinated children who were
 add("Total_Nbr_1dose_Plus_vaccPolio_0_59M", "polio", "Children with 1 or more previous doses vaccinated, 0-59 months (sum of the two age groups).")
 add("TotalNbrVaccPolio", "polio", "Total number of children vaccinated with polio vaccine in the district and round, as reported. For a co-administered record (Vaccine_type 'nOPV2 & bOPV') it is the larger of Tot_Vacc_nOPV2 and Total_Vacc_bOPV, so a child vaccinated with both vaccines is counted once.",
     "Reported value; about 60% of records equal zero-dose + one-or-more-dose children. Not the sum of the two vaccines. Placed just before Response.")
-add("CVPolio", "polio", "Polio vaccination coverage as stored in the source (ratio: 1.00 = 100%).", "Not always equal to TotalNbrVaccPolio / PopPolio. Used to correct PopPolio where it was clearly wrong (coverage above 1.5 or below 0.5). Some values are above 1.5.")
+add("CVPolio", "polio", "Polio vaccination coverage as stored in the source (ratio: 1.00 = 100%).", "Not always equal to TotalNbrVaccPolio / PopPolio. Used to correct PopPolio where it was clearly wrong (coverage above 1.5 or below 0.5). When it was empty it is filled with TotalNbrVaccPolio / PopPolio (target-only records stay empty). Some values are above 1.5.")
 add("Doses.UsedPolio", "polio", "Polio vaccine doses used.", "Almost always empty.")
 add("WastRPolio", "polio", "Polio vaccine wastage rate.", "Mostly empty.")
 add("NbrVacMeasles", "other", "Children vaccinated against measles during the campaign.")
