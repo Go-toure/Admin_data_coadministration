@@ -116,6 +116,9 @@ def main():
     ap.add_argument("--force-model-poppolio", action="store_true",
                     help="run the population model even when the input was already processed "
                          "(not recommended: the model would use its own earlier estimates as history)")
+    ap.add_argument("--backups", help="folder with the SharePoint backups (AFRO_admin_data__*.xlsx), the reference for "
+                                      "the repair of copy errors (found automatically next to this repository)")
+    ap.add_argument("--no-repair", action="store_true", help="do not look for copy / drag-fill errors")
     ap.add_argument("--no-dictionary", action="store_true", help="do not build the data dictionary")
     ap.add_argument("--no-audit", action="store_true", help="do not write the audit workbook")
     ap.add_argument("--no-feedback", action="store_true", help="do not write the feedback workbook")
@@ -185,6 +188,17 @@ def main():
     if partial:
         print("WARNING: the file has only %d countries. It is not the full regional admin data: use the output "
               "for checking only, do NOT upload it to SharePoint as AFRO_admin_data.xlsx." % n_countries, flush=True)
+
+    cvp_all = num(df["CVPolio"]) if "CVPolio" in df.columns else pd.Series(np.nan, index=df.index)
+
+    # copy / drag-fill errors (Response from another country, nOPV3..nOPV15): restored from the backups
+    repairs = []
+    repl = {}
+    if not a.no_repair:
+        repairs = repair_copy_errors(df, find_backups(a.backups, a.src), a.src, os.path.join(a.out_dir, "_backup_cache"))
+        for r in repairs:
+            if r["Restored"] and r["Column"] == "Response":
+                repl[(int(r["Excel row"]) - 2, "Response")] = r["Restored"]
 
     # ------------------------------------------------------------------ logic
     vt_orig = df["Vaccine_type"].astype(object)
@@ -280,7 +294,7 @@ def main():
     pop_reason = pd.Series("", index=df.index, dtype=object)
     pop_new = pop.copy()
     if a.fix_poppolio:
-        cvp = num(df["CVPolio"])
+        cvp = cvp_all
         with np.errstate(divide="ignore", invalid="ignore"):
             cv_now = out_total / pop.where(pop > 0)
             implied = (out_total / cvp.where(cvp > 0)).round()
@@ -432,9 +446,10 @@ def main():
                     c = ws_new.cell(row=r_out, column=j + 1, value=int(pop.iat[i]))
                     c._style = copy(oc._style)
                     continue
-                if oc.value is None:
+                val = repl.get((i, h), oc.value)
+                if val is None:
                     continue
-                c = ws_new.cell(row=r_out, column=j + 1, value=oc.value)
+                c = ws_new.cell(row=r_out, column=j + 1, value=val)
                 c._style = copy(oc._style)
         r_out += 1
     last_row = r_out - 1
@@ -474,12 +489,12 @@ def main():
     # -------------------------------------------------------------- feedback
     if a.feedback:
         write_feedback(a.feedback, df, keep, out_vt, out_total, pop, pop_before, pop_fixed, pop_reason,
-                       out_cvn, out_cvb, num(df["CVPolio"]), approach, out_tn, out_tb)
+                       out_cvn, out_cvb, cvp_all, approach, out_tn, out_tb)
 
     # ----------------------------------------------------------------- audit
     if a.audit:
         write_audit(a.audit, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
-                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, num(df["CVPolio"]), pop_reason, out_cvn, out_cvb, model_info)
+                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, cvp_all, pop_reason, out_cvn, out_cvb, model_info, repairs)
 
     # ------------------------------------------------------------- self-check
     chk = pd.read_excel(a.dst, sheet_name=SHEET)
@@ -505,6 +520,10 @@ def main():
     print("\nDone. Files written under", a.out_dir)
     print("  upload_to_sharepoint/ : AFRO_admin_data.xlsx" + (" + the data dictionary" if a.dictionary else ""))
     print("  review/               : audit" + (" + feedback workbook" if a.feedback else ""))
+    unresolved = [r for r in repairs if not r["Restored"]]
+    if unresolved:
+        print("  %d copy errors could not be fixed from the backups: see sheet Repairs in the audit workbook "
+              "(Source = UNRESOLVED), to correct with the country." % len(unresolved))
     if partial:
         print("WARNING: only %d countries in this file: do NOT upload the output as AFRO_admin_data.xlsx." % n_countries)
     else:
@@ -719,7 +738,7 @@ def write_feedback(path, df, keep, out_vt, out_total, pop, pop_before, pop_fixed
 
 def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
                 drop, merged_log, keep, paired, pop_fixed=None, pop_before=None, pop_after=None, cvp=None,
-                pop_reason=None, cv_n=None, cv_b=None, model_info=None):
+                pop_reason=None, cv_n=None, cv_b=None, model_info=None, repairs=None):
     cols = ["_row", "Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Response", "SIA_date"]
     a = df[cols].copy()
     a.rename(columns={"_row": "Original_row"}, inplace=True)
@@ -739,6 +758,8 @@ def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_tota
                            "Vaccine_type_before", "Vaccine_type_after"]]
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
         summ.to_excel(xw, sheet_name="Summary", index=False)
+        if repairs:
+            pd.DataFrame(repairs).to_excel(xw, sheet_name="Repairs", index=False)
         review.to_excel(xw, sheet_name="To_review", index=False)
         vtfix.to_excel(xw, sheet_name="Vaccine_type_fixes", index=False)
         changed.to_excel(xw, sheet_name="All_co-admin_records", index=False)
@@ -768,6 +789,234 @@ def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_tota
             rem.sort_values(["Country", "Province", "District", "Year"]).to_excel(
                 xw, sheet_name="CV_still_above_1.5", index=False)
     print("audit written:", path)
+
+
+# =====================================================================================================
+# Repair of copy / drag-fill errors (uses the SharePoint backups as the reference)
+# =====================================================================================================
+REF_COLS = ["Country", "Province", "District", "Admin_3", "SIA_date", "Round_Add", "Response", "Vaccine_type",
+            "TotalNbrVaccPolio", "PopPolio"]
+COUNTRY_ALIAS = {"CAMEROUN": "CAMEROON", "RÉPUBLIQUE CENTRAFRICAINE": "CENTRAL AFRICAN REPUBLIC",
+                 "RÉPUBLIQUE CENTRAFRIQUE": "CENTRAL AFRICAN REPUBLIC", "CAR": "CENTRAL AFRICAN REPUBLIC"}
+KNOWN_BAD_NOPV = re.compile(r"^nopv(\d+)$", re.I)
+
+
+def _ckey(c):
+    c = str(c).strip().upper()
+    return COUNTRY_ALIAS.get(c, c)
+
+
+def _prefix(r):
+    m = re.match(r"^([A-Za-z]+)", r) if isinstance(r, str) else None
+    return m.group(1).upper() if m else None
+
+
+def _dkey(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    return x.strftime("%Y-%m-%d") if hasattr(x, "strftime") else str(x)[:10]
+
+
+def _s(x):
+    """Text of a cell for matching; an empty cell, NaN and the text 'NA' (as pandas reads it) are all ''."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    t = str(x).strip()
+    return "" if t.upper() in ("NA", "N/A", "NAN", "NONE", "NULL") else t
+
+
+def _numkey(x):
+    v = pd.to_numeric(x, errors="coerce")
+    return "" if pd.isna(v) else str(round(float(v), 2))
+
+
+def _prep(d):
+    """Add the helper columns used to recognise a row in another version of the file."""
+    d = d.copy()
+    for c in REF_COLS:
+        if c not in d.columns:
+            d[c] = np.nan
+    d["_ck"] = [_ckey(c) for c in d["Country"]]
+    d["_pre"] = [_prefix(r) for r in d["Response"]]
+    parts = [(str(a), _s(b), _s(c), _s(e), _dkey(f), _s(g), _numkey(h), _numkey(i)) for a, b, c, e, f, g, h, i in
+             zip(d["_ck"], d["Province"], d["District"], d["Admin_3"], d["SIA_date"], d["Round_Add"],
+                 d["TotalNbrVaccPolio"], d["PopPolio"])]
+    d["_kA"] = ["|".join(p) for p in parts]
+    d["_kB"] = ["|".join(p[:6]) for p in parts]
+    d["_kA"] = d["_kA"] + "#" + d.groupby("_kA").cumcount().astype(str)
+    d["_kB"] = d["_kB"] + "#" + d.groupby("_kB").cumcount().astype(str)
+    return d
+
+
+def find_backups(user_dir, src):
+    import glob
+    cands = []
+    if user_dir:
+        cands.append(user_dir)
+    if os.environ.get("ADMIN_BACKUP_DIR"):
+        cands.append(os.environ["ADMIN_BACKUP_DIR"])
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (here, os.getcwd(), os.path.dirname(os.path.abspath(src))):
+        cands.append(os.path.join(base, "..", "SharePoint_version_backup", "snapshots", "admin"))
+        cands.append(base)
+    for d in cands:
+        files = sorted(glob.glob(os.path.join(d, "AFRO_admin_data__*.xlsx")))
+        if files:
+            return files
+    return []
+
+
+def _md5(path):
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_backup(path, cache_dir):
+    cache = os.path.join(cache_dir, os.path.basename(path) + ".pkl")
+    if os.path.exists(cache) and os.path.getmtime(cache) >= os.path.getmtime(path):
+        return pd.read_pickle(cache)
+    d = pd.read_excel(path, sheet_name=0, usecols=lambda c: c in REF_COLS)
+    os.makedirs(cache_dir, exist_ok=True)
+    d.to_pickle(cache)
+    return d
+
+
+def _owners(frames):
+    """Response prefix (country code at the start of the name) -> the country that owns it, learned from the
+    versions of the file: a prefix is owned by a country that holds 95% of its rows in at least half of the
+    versions where the prefix is used (a copy error in one version cannot change the owner)."""
+    present, votes = {}, {}
+    for f in frames:
+        t = f.dropna(subset=["_pre"]).groupby(["_pre", "_ck"]).size().unstack(fill_value=0)
+        tot = t.sum(axis=1)
+        for p in t.index:
+            if tot[p] >= 20:
+                present[p] = present.get(p, 0) + 1
+                c = t.loc[p].idxmax()
+                if t.loc[p, c] / tot[p] >= 0.95:
+                    votes.setdefault(p, {}).setdefault(c, 0)
+                    votes[p][c] += 1
+    owners = {}
+    for p, cn in votes.items():
+        if len(cn) == 1:
+            c, v = next(iter(cn.items()))
+            if v * 2 >= present[p]:
+                owners[p] = c
+    return owners
+
+
+def repair_copy_errors(df, backup_files, src, cache_dir):
+    """Find and fix the copy / drag-fill errors in Response and Vaccine_type, in place. Returns the repair log.
+
+    Response: a name that starts with the code of another country (e.g. the South Sudan name copied onto DRC
+    rows). Vaccine_type: nOPV3 ... nOPV15 (a drag-fill of nOPV2). Each is restored, in this order, from
+      1. the same row in the newest earlier backup that holds a valid value,
+      2. the other rows of the same country, date and round (majority),
+      3. for Vaccine_type, what the Response name says (bOPV / nOPV); otherwise nOPV2.
+    Whatever cannot be fixed is listed as unresolved, nothing is guessed."""
+    cur = _prep(df)
+    snaps = []
+    if backup_files:
+        me = _md5(src)
+        for p in backup_files[-8:]:
+            try:
+                if os.path.getsize(p) == os.path.getsize(src) and _md5(p) == me:
+                    continue   # the backup of this very file
+                snaps.append((os.path.basename(p), _prep(_load_backup(p, cache_dir))))
+            except Exception as e:  # a damaged backup must not stop the update
+                print("backup skipped (%s): %s" % (os.path.basename(p), e), flush=True)
+    if snaps:
+        print("repair: reference = %d earlier backup(s)" % len(snaps), flush=True)
+    else:
+        print("repair: no earlier backup found, the file itself is the only reference", flush=True)
+    owners = _owners([s[1] for s in snaps] if snaps else [cur])
+
+    def resp_ok(prefix, ck):
+        return prefix is None or prefix not in owners or owners[prefix] == ck
+
+    cur["_resp_ok"] = [resp_ok(p, c) if isinstance(r, str) else True
+                       for p, c, r in zip(cur["_pre"], cur["_ck"], cur["Response"])]
+    bad_resp = ~cur["_resp_ok"]
+    vt = cur["Vaccine_type"].map(lambda x: x.strip() if isinstance(x, str) else x)
+    bad_vt = vt.map(lambda x: bool(isinstance(x, str) and KNOWN_BAD_NOPV.match(x) and KNOWN_BAD_NOPV.match(x).group(1) != "2"))
+    log = []
+
+    # one lookup table per snapshot: key -> value
+    look = []
+    for name, s in snaps:
+        look.append((name, dict(zip(s["_kA"], zip(s["Response"], s["Vaccine_type"]))),
+                     dict(zip(s["_kB"], zip(s["Response"], s["Vaccine_type"])))))
+
+    def from_backups(i, which, valid):
+        for name, la, lb in reversed(look):
+            for tbl in (la, lb):
+                v = tbl.get(cur.at[i, "_kA" if tbl is la else "_kB"])
+                if v is not None:
+                    cand = v[which]
+                    if isinstance(cand, str) and valid(cand):
+                        return cand, "backup " + name
+        return None, None
+
+    def peers(i, column, valid):
+        ck, dk, rd = cur.at[i, "_ck"], _dkey(cur.at[i, "SIA_date"]), str(cur.at[i, "Round_Add"])
+        d_ = cur["SIA_date"].map(_dkey)
+        for sel in ((cur["_ck"] == ck) & (d_ == dk) & (cur["Round_Add"].astype(str) == rd),
+                    (cur["_ck"] == ck) & (d_ == dk)):
+            sel = sel & ~bad_resp & ~bad_vt
+            vals = cur.loc[sel, column].dropna()
+            vals = vals[vals.map(valid)]
+            if len(vals) >= 3:
+                top = vals.value_counts()
+                if top.iloc[0] / len(vals) >= 0.8:
+                    return top.index[0], "other rows of the same country, date and round"
+        return None, None
+
+    def rowinfo(i):
+        return {"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "Province": df.at[i, "Province"],
+                "District": df.at[i, "District"], "SIA_date": _dkey(df.at[i, "SIA_date"])}
+
+    for i in df.index[bad_resp]:
+        found = df.at[i, "Response"]
+        ck = cur.at[i, "_ck"]
+        valid = lambda r, ck=ck: resp_ok(_prefix(r), ck)
+        new, src_ = from_backups(i, 0, valid)
+        if new is None:
+            new, src_ = peers(i, "Response", valid)
+        row = dict(rowinfo(i), Column="Response", Found=found, Rule="Response name belongs to another country")
+        if new is None:
+            row.update({"Restored": "", "Source": "UNRESOLVED: no earlier version or other rows give the right name"})
+        else:
+            df.at[i, "Response"] = new
+            row.update({"Restored": new, "Source": src_})
+        log.append(row)
+
+    def vt_valid(v):
+        return not (KNOWN_BAD_NOPV.match(v.strip()) and KNOWN_BAD_NOPV.match(v.strip()).group(1) != "2")
+
+    for i in df.index[bad_vt]:
+        found = df.at[i, "Vaccine_type"]
+        new, src_ = from_backups(i, 1, vt_valid)
+        if new is None:
+            r = str(df.at[i, "Response"]).lower()
+            if "bopv" in r and "nopv" not in r:
+                new, src_ = "bOPV", "Response name"
+            elif "nopv" in r:
+                new, src_ = "nOPV2", "Response name"
+            else:
+                new, src_ = peers(i, "Vaccine_type", vt_valid)
+                if new is None:
+                    new, src_ = "nOPV2", "default (drag-fill of nOPV2)"
+        df.at[i, "Vaccine_type"] = new
+        log.append(dict(rowinfo(i), Column="Vaccine_type", Found=found, Rule="nOPV3 ... nOPV15: drag-fill of nOPV2",
+                        Restored=new, Source=src_))
+    fixed = sum(1 for r in log if r["Restored"])
+    print("repair: %d copy/drag-fill errors found, %d restored, %d unresolved" % (len(log), fixed, len(log) - fixed),
+          flush=True)
+    return log
 
 
 # =====================================================================================================
