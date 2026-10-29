@@ -126,6 +126,9 @@ def main():
                                      "Date, Round Status) used to cross-check the repairs and the Response / date / round "
                                      "of every campaign (found automatically in ../data or next to the input)")
     ap.add_argument("--no-lookup", action="store_true", help="do not use the campaign lookup")
+    ap.add_argument("--keep-copied-rounds", action="store_true",
+                    help="do not remove the rounds that the lookup does not have and that copy another round of the "
+                         "same Response and date (they are removed by default and listed in the audit)")
     ap.add_argument("--no-dictionary", action="store_true", help="do not build the data dictionary")
     ap.add_argument("--no-audit", action="store_true", help="do not write the audit workbook")
     ap.add_argument("--no-feedback", action="store_true", help="do not write the feedback workbook")
@@ -223,6 +226,16 @@ def main():
             elif r["Restored"] and r["Column"] == "SIA_date":
                 repl[(int(r["Excel row"]) - 2, "SIA_date")] = pd.Timestamp(r["Restored"]).to_pydatetime()
 
+    # rounds that only exist as a copy of another round of the same Response and date (lookup has no such round)
+    copy_drop = pd.Series(False, index=df.index)
+    copy_log = pd.DataFrame()
+    if lk is not None and not a.keep_copied_rounds:
+        copy_drop, copy_log = find_copied_rounds(df, lk)
+        if copy_drop.any():
+            print("copied rounds removed: %d rows (%s); listed in sheet Removed_copies of the audit workbook" %
+                  (int(copy_drop.sum()), ", ".join(sorted(set(copy_log["Response"].astype(str) + " " + copy_log["Round_Add"].astype(str))))),
+                  flush=True)
+
     # ------------------------------------------------------------------ logic
     vt_orig = df["Vaccine_type"].astype(object)
     vt = vt_orig.map(lambda x: x.strip() if isinstance(x, str) else x)
@@ -281,6 +294,7 @@ def main():
     out_total = total.copy()
     out_vt = vt_norm.copy()
     drop = pd.Series(False, index=df.index)
+    drop |= copy_drop
 
     single = approach.isin([A_NONE, A_KEPT])
     out_tn[single & is_n] = total[single & is_n]
@@ -385,7 +399,8 @@ def main():
     out_cvb[no_total] = np.nan
 
     keep = ~drop
-    print("pairs merged:", int(drop.sum()), "-> rows out:", int(keep.sum()), flush=True)
+    print("pairs merged:", int(drop.sum() - copy_drop.sum()), "| copied rounds removed:", int(copy_drop.sum()),
+          "-> rows out:", int(keep.sum()), flush=True)
 
     # -------------------------------------------------------- new sheet build
     base_cols = [h for h in header if h not in BLOCK]
@@ -518,7 +533,7 @@ def main():
     lk_report = lookup_crosscheck(df, lk) if lk is not None else None
     if a.audit:
         write_audit(a.audit, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
-                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, cvp_all, pop_reason, out_cvn, out_cvb, model_info, repairs, lk_report)
+                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, cvp_all, pop_reason, out_cvn, out_cvb, model_info, repairs, lk_report, copy_log)
 
     # ------------------------------------------------------------- self-check
     chk = pd.read_excel(a.dst, sheet_name=SHEET)
@@ -766,13 +781,15 @@ def write_feedback(path, df, keep, out_vt, out_total, pop, pop_before, pop_fixed
 
 def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
                 drop, merged_log, keep, paired, pop_fixed=None, pop_before=None, pop_after=None, cvp=None,
-                pop_reason=None, cv_n=None, cv_b=None, model_info=None, repairs=None, lk_report=None):
+                pop_reason=None, cv_n=None, cv_b=None, model_info=None, repairs=None, lk_report=None, copy_log=None):
     cols = ["_row", "Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Response", "SIA_date"]
     a = df[cols].copy()
     a.rename(columns={"_row": "Original_row"}, inplace=True)
     a["Approach"] = approach
     a["Vaccine_type_before"] = vt_orig
     a["Vaccine_type_after"] = out_vt.where(keep, "(merged into the other record)")
+    if copy_log is not None and len(copy_log):
+        a.loc[df["_row"].isin(copy_log["Original_row"]).values, "Vaccine_type_after"] = "(copied round removed)"
     a["TotalNbrVaccPolio_before"] = total
     a["TotalNbrVaccPolio_after"] = out_total.where(keep)
     a["Tot_Vacc_nOPV2"] = out_tn.where(keep)
@@ -791,6 +808,8 @@ def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_tota
         if lk_report is not None:
             lk_report[0].to_excel(xw, sheet_name="Lookup_check", index=False)
             lk_report[1].to_excel(xw, sheet_name="Lookup_no_data", index=False)
+        if copy_log is not None and len(copy_log):
+            copy_log.to_excel(xw, sheet_name="Removed_copies", index=False)
         review.to_excel(xw, sheet_name="To_review", index=False)
         vtfix.to_excel(xw, sheet_name="Vaccine_type_fixes", index=False)
         changed.to_excel(xw, sheet_name="All_co-admin_records", index=False)
@@ -1088,6 +1107,60 @@ def lookup_crosscheck(df, lk):
     nodata = pd.DataFrame(miss, columns=["Country", "OBR Name", "Round Number", "Vaccines", "Round Start Date",
                                          "Round Status", "Response_in_data"])
     return rep, nodata
+
+
+def find_copied_rounds(df, lk):
+    """Rounds that exist in the data but not in the lookup and only copy another round of the same Response and date.
+
+    Example: CHD-2024-11-1_nOPV has Rnd1 and Rnd2 on the same date with the same totals, the lookup has Round 1
+    only. The lookup is trusted: the extra round is removed. All conditions must hold:
+      - the Response and the date are in the lookup for exactly one round (the real one);
+      - the extra round is not a round of that Response in the lookup (otherwise it is a real round with a wrong
+        date, which is only reported in Lookup_check);
+      - the extra round has the same TotalNbrVaccPolio as the real round in at least 80% of the districts they share.
+    Returns (mask of the rows to remove, log of them)."""
+    g = pd.DataFrame({"_ck": df["Country"].map(_lkc), "_rk": df["Response"].map(_rk), "_d": df["SIA_date"].map(_dkey),
+                      "rd": df["Round_Add"].map(_s)}, index=df.index)
+    g["rn"] = g["rd"].map(_rnum)
+    g = g[(g["_rk"] != "") & (g["_d"] != "") & g["rn"].notna()]
+    nr = g.groupby(["_rk", "_d"])["rn"].transform("nunique")
+    off = _round_offsets(g.loc[nr == 1, ["_rk", "_d", "rn"]].drop_duplicates(), lk)
+    valid = {k: {int(x) + off.get(k, 0) for x in grp["_rn"].dropna()} for k, grp in lk.groupby("_rk")}
+    mask = pd.Series(False, index=df.index)
+    rows = []
+    tot = pd.to_numeric(df["TotalNbrVaccPolio"], errors="coerce")
+    key = (df["Province"].map(_nk) + "|" + df["District"].map(_nk) + "|" + df["Admin_3"].map(_nk))
+    for (ck, rk_, d_), grp in g[nr > 1].groupby(["_ck", "_rk", "_d"]):
+        e = lk[(lk["_rk"] == rk_) & (lk["_d"] == d_)]
+        if len(e) != 1 or pd.isna(e.iloc[0]["_rn"]):
+            continue
+        real = int(e.iloc[0]["_rn"]) + off.get(rk_, 0)
+        if real not in set(grp["rn"].astype(int)):
+            continue
+        base = grp[grp["rn"] == real]
+        for extra_rn in sorted(set(grp["rn"].astype(int)) - {real}):
+            if extra_rn in valid.get(rk_, set()):
+                continue   # a real round of this Response: the date is wrong, not the round
+            ex = grp[grp["rn"] == extra_rn]
+            b_t = pd.Series(tot[base.index].values, index=key[base.index].values)
+            e_t = pd.Series(tot[ex.index].values, index=key[ex.index].values)
+            b_t, e_t = b_t[~b_t.index.duplicated()], e_t[~e_t.index.duplicated()]
+            common = b_t.index.intersection(e_t.index)
+            if len(common) < 5:
+                continue
+            same = float((b_t[common] == e_t[common]).mean())
+            if same < 0.8:
+                continue
+            mask[ex.index] = True
+            for i in ex.index:
+                rows.append({"Original_row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"],
+                             "Province": df.at[i, "Province"], "District": df.at[i, "District"],
+                             "SIA_date": d_, "Round_Add": df.at[i, "Round_Add"], "Response": df.at[i, "Response"],
+                             "TotalNbrVaccPolio": df.at[i, "TotalNbrVaccPolio"],
+                             "Reason": "the lookup has %s (%s) only; Rnd%d has the same total as Rnd%d in %.0f%% of the %d "
+                                       "districts they share: a copy" % (e.iloc[0]["OBR Name"], e.iloc[0]["Round Number"],
+                                                                       extra_rn, real, same * 100, len(common))})
+    return mask, pd.DataFrame(rows)
 
 
 def infer_campaigns(cur, pending, bad_resp, bad_vt, lk=None, footprint=True):
