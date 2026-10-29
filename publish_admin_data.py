@@ -46,6 +46,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 try:
@@ -325,6 +326,24 @@ class Graph:
         return dest
 
 
+def same_content(a, b):
+    """True when two xlsx files hold the same workbook. SharePoint rewrites the document properties of an Office file it
+    stores, so the bytes can differ by a few KB although the data are the same; then the sheet data parts are compared."""
+    if sha256_file(a) == sha256_file(b):
+        return True, "identical bytes"
+    try:
+        def parts(path):
+            with zipfile.ZipFile(path) as z:
+                return {n: hashlib.sha256(z.read(n)).hexdigest() for n in z.namelist()
+                        if n.startswith("xl/worksheets/") or n in ("xl/sharedStrings.xml", "xl/styles.xml")}
+        pa, pb = parts(a), parts(b)
+        if pa and pa == pb:
+            return True, "same sheet data (SharePoint rewrote the document properties)"
+    except (zipfile.BadZipFile, OSError):
+        pass
+    return False, ""
+
+
 # ----------------------------------------------------------------------------------------------- backup tool
 def run_backup(repo, key=BACKUP_KEY):
     script = Path(repo) / "sp_versions.py"
@@ -529,29 +548,49 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="publish_admin_"))
     try:
         live_path = g.download(item, tmp / "live.xlsx")
-        live_sha, new_sha = sha256_file(live_path), sha256_file(src)
-        if live_sha == new_sha and not args.force:
-            log("The file on SharePoint is already identical to this version. Nothing to do.")
-            return 0
-        live = inspect_workbook(live_path)
-        d_rows = new["rows"] - live["rows"]
-        pct = d_rows / live["rows"] if live["rows"] else 0
-        log(f"Live file now   : {live['rows']:,} records, {len(live['header'])} columns")
-        log(f"Change          : {d_rows:+,} records ({pct:+.1%})")
-        lost = [h for h in live["header"] if h and h not in new["header"]]
-        gained = [h for h in new["header"] if h and h not in live["header"]]
-        if gained:
-            log("   new columns: " + ", ".join(gained))
-        if lost:
-            die("the new file lacks columns that the live file has: " + ", ".join(lost[:15]))
-        if -pct > args.max_row_drop and not args.force:
-            die(f"the new file has {-pct:.1%} fewer records than the live file (limit {args.max_row_drop:.0%}). "
-                f"Check the file, or use --force if this is expected.")
+        live_sha = sha256_file(live_path)
+        already, why = same_content(live_path, src)
+        if already and not args.force:
+            log(f"The file on SharePoint already holds this version ({why}); it will not be uploaded again.")
+        else:
+            live = inspect_workbook(live_path)
+            d_rows = new["rows"] - live["rows"]
+            pct = d_rows / live["rows"] if live["rows"] else 0
+            log(f"Live file now   : {live['rows']:,} records, {len(live['header'])} columns")
+            log(f"Change          : {d_rows:+,} records ({pct:+.1%})")
+            lost = [h for h in live["header"] if h and h not in new["header"]]
+            gained = [h for h in new["header"] if h and h not in live["header"]]
+            if gained:
+                log("   new columns: " + ", ".join(gained))
+            if lost:
+                die("the new file lacks columns that the live file has: " + ", ".join(lost[:15]))
+            if -pct > args.max_row_drop and not args.force:
+                die(f"the new file has {-pct:.1%} fewer records than the live file (limit {args.max_row_drop:.0%}). "
+                    f"Check the file, or use --force if this is expected.")
+        skip_upload = already and not args.force
+        # somebody may have changed the live file after this file was made: their edits would be overwritten
+        try:
+            live_mod = dt.datetime.fromisoformat(item.get("lastModifiedDateTime", "").replace("Z", "+00:00"))
+            src_mod = dt.datetime.fromtimestamp(src.stat().st_mtime, dt.timezone.utc)
+        except ValueError:
+            live_mod = src_mod = None
+        if not skip_upload and live_mod and live_mod > src_mod:
+            log("")
+            log(f"WARNING: the file on SharePoint was modified by {mod_by} at {item.get('lastModifiedDateTime')},")
+            log(f"         AFTER {src.name} was saved ({src_mod:%Y-%m-%d %H:%M} UTC). Publishing would overwrite that change.")
+            log("         It is saved in the local backup, but check what changed first (python sp_versions.py compare admin N M)")
+            log("         and rebuild from the newest version if needed.")
+            if not args.force:
+                die("the live file is newer than the file to publish. Re-run with --force once you checked it.")
 
         log("")
         log("Plan:")
-        log(f"   1. back up the live file locally ({args.backup_repo})" if not args.no_backup else "   1. (local backup skipped)")
-        log(f"   2. replace AFRO_admin_data.xlsx on SharePoint with {src.name} (uploaded as {TARGET_NAME})")
+        if skip_upload:
+            log("   1. (no upload: SharePoint already holds this version)")
+            log("   2. (no upload)")
+        else:
+            log(f"   1. back up the live file locally ({args.backup_repo})" if not args.no_backup else "   1. (local backup skipped)")
+            log(f"   2. replace AFRO_admin_data.xlsx on SharePoint with {src.name} (uploaded as {TARGET_NAME})")
         log("   3. delete the SharePoint version history of the file" + (" (skipped)" if args.keep_versions else ""))
         log("   4. back up again, so the new file is the newest local version")
         if args.dry_run:
@@ -564,32 +603,40 @@ def main():
                 log("Cancelled. Nothing was changed.")
                 return 0
 
-        # 3. local backup of the live file
-        if not args.no_backup:
-            log("Backing up the live file ...")
-            ok, msg = run_backup(args.backup_repo)
-            log("   " + msg)
-            ver, present = backup_holds(args.backup_repo, live_sha)
-            if not ok or ver is None or not present:
-                die("the local backup does not hold the file that is on SharePoint now, so the upload was not started. "
-                    "Run run_backup.bat in SharePoint_version_backup, or use --no-backup if you accept the risk.")
-            log(f"   the live file is saved locally as backup version {ver}")
+        if not skip_upload:
+            # 3. local backup of the live file
+            if not args.no_backup:
+                log("Backing up the live file ...")
+                ok, msg = run_backup(args.backup_repo)
+                log("   " + msg)
+                ver, present = backup_holds(args.backup_repo, live_sha)
+                if not ok or ver is None or not present:
+                    die("the local backup does not hold the file that is on SharePoint now, so the upload was not started. "
+                        "Run run_backup.bat in SharePoint_version_backup, or use --no-backup if you accept the risk.")
+                log(f"   the live file is saved locally as backup version {ver}")
 
-        # 4. upload
-        staged = tmp / TARGET_NAME
-        shutil.copyfile(src, staged)              # the copy carries the SharePoint name; the original keeps its name
-        log(f"Uploading {TARGET_NAME} ({human(staged.stat().st_size)}) ...")
-        upload_replace(g, item, staged, etag)
+            # 4. upload
+            staged = tmp / TARGET_NAME
+            shutil.copyfile(src, staged)              # the copy carries the SharePoint name; the original keeps its name
+            log(f"Uploading {TARGET_NAME} ({human(staged.stat().st_size)}) ...")
+            upload_replace(g, item, staged, etag)
 
-        # 5. verify
-        now = item_now(g, item)
-        if int(now.get("size", -1)) != staged.stat().st_size:
-            die(f"after the upload SharePoint reports {now.get('size')} bytes, expected {staged.stat().st_size}. "
-                f"Restore the previous file from the local backup (restore {BACKUP_KEY} latest).")
-        back = g.download(now if now.get("@microsoft.graph.downloadUrl") else item, tmp / "check.xlsx")
-        if sha256_file(back) != new_sha:
-            die("the file on SharePoint is not identical to the uploaded one. Restore the previous file from the local backup.")
-        log("Upload checked: SharePoint holds exactly the new file.")
+            # 5. verify
+            now = item_now(g, item)
+            got = int(now.get("size", -1))
+            if abs(got - staged.stat().st_size) > 0.02 * staged.stat().st_size:
+                die(f"after the upload SharePoint reports {got} bytes, expected about {staged.stat().st_size}. "
+                    f"Restore the previous file from the local backup (restore {BACKUP_KEY} latest).")
+            back = g.download(now if now.get("@microsoft.graph.downloadUrl") else item, tmp / "check.xlsx")
+            ok_same, why = same_content(back, staged)
+            if not ok_same:
+                x, y = inspect_workbook(back), inspect_workbook(staged)
+                if x["header"] == y["header"] and x["rows"] == y["rows"]:
+                    ok_same, why = True, "same columns and record count (file repackaged by SharePoint)"
+                    log("   WARNING: the sheet data are not byte-identical to the uploaded file; same columns and records.")
+            if not ok_same:
+                die("the file on SharePoint is not the uploaded one. Restore the previous file from the local backup.")
+            log(f"Upload checked: SharePoint holds the new file ({why}).")
 
         # 6. storage
         if args.keep_versions:
@@ -615,7 +662,7 @@ def main():
             log("Local backup after the upload: " + (msg or ("done" if ok else "failed")))
 
         log("")
-        log("DONE. AFRO_admin_data.xlsx on SharePoint is now " + src.name + ".")
+        log("DONE. AFRO_admin_data.xlsx on SharePoint is " + src.name + ".")
         log("Next: tell the countries/focal points if needed, and send the feedback workbook.")
         return 0
     finally:
