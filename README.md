@@ -138,6 +138,25 @@ switch the checks / the province fix off; `--fail-on-error` exits with code 2 wh
   and the repository rows of the same countries give context to the target population check; only the records of the file
   are reported.
 
+## Filling empty key fields and empty coverage
+
+Two gaps are filled by default, and every fill is logged:
+
+- **Empty `Response`, from the lookup** (`--no-fill-response` switches this off). Records with a blank Response are
+  grouped by country, SIA_date and round. For each group the lookup must give **one** campaign round of the same country
+  and a compatible vaccine that starts on that date (confidence `high`), or within 21 days of it with the same round number
+  (confidence `medium`). When the lookup name carries a province (for example `Kwara Response`), only the rows of that province
+  are filled. A group is left empty if the lookup gives zero or several answers. The spelling is the one the data already
+  uses for that Response. Fills are in the audit sheet `Repairs` (`Source` starts with `lookup:`). **Confirm the `medium` fills
+  with the countries**: the date in the data differs from the lookup by a few days.
+- **Empty `CVPolio`, from the target** (`--no-fill-cvpolio` switches this off): where the vaccinated total is known and the target
+  is known, `CVPolio` = `TotalNbrVaccPolio` / `PopPolio` (population = target). Rows with a target but no vaccinated total stay
+  empty. The fills are in `Fixes applied` of the quality report (column `CVPolio`).
+
+What the lookup cannot fix stays an Error ("Missing key field") for the countries: Nigeria records from 2022 to January 2023
+(before the lookup starts), Ethiopia records with a blank District (no other identifier in the record or in any backup), and the
+few records with a blank Province that has no match.
+
 ## Which files it accepts
 
 - The full regional admin data, raw or already processed (it recognises a processed file, see above).
