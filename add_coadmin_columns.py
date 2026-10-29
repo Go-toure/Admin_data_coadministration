@@ -144,6 +144,15 @@ def main():
                     help="quality checks: target population this many times above / below the district median is flagged (default 3)")
     ap.add_argument("--fail-on-error", action="store_true",
                     help="exit with code 2 when the quality checks still find records with an Error")
+    ap.add_argument("--no-dedupe", action="store_true",
+                    help="do not remove exact duplicates (same key and every other value the same); they are removed by default")
+    ap.add_argument("--resolve-duplicates", choices=["none", "complete", "first"], default="none",
+                    help="records with the same key but different values: none = only list them in the quality report "
+                         "(default), complete = keep the most complete record, first = keep the first one (the portal's rule)")
+    ap.add_argument("--repository", help="the portal repository (AFRO_admin_data_repository.xlsx): records whose key is already "
+                                         "in it are listed (Already_in_repository) and its rows give context to the target population check")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="with --repository: leave out of the output the records that already exist in the repository")
     ap.add_argument("--no-dictionary", action="store_true", help="do not build the data dictionary")
     ap.add_argument("--no-audit", action="store_true", help="do not write the audit workbook")
     ap.add_argument("--no-feedback", action="store_true", help="do not write the feedback workbook")
@@ -272,6 +281,46 @@ def main():
             if prov_log:
                 print("province of another country corrected: %d records" % len(prov_log), flush=True)
 
+    # SIA_date written as text ("18-sept-20", "2020-09-18 00:00:00 UTC" ...) is turned into a real date
+    date_log = []
+    for i in df.index[df["SIA_date"].map(lambda x: isinstance(x, str))]:
+        dv = parse_sia_text(df.at[i, "SIA_date"])
+        if pd.isna(dv):
+            continue
+        old_ = df.at[i, "SIA_date"]
+        df.at[i, "SIA_date"] = dv.to_pydatetime()
+        repl[(i, "SIA_date")] = dv.to_pydatetime()
+        date_log.append({"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "District": df.at[i, "District"],
+                         "Column": "SIA_date", "Found": old_, "Restored": dv.strftime("%Y-%m-%d"), "Source": "date written as text"})
+    if date_log:
+        print("SIA_date written as text converted: %d records" % len(date_log), flush=True)
+    prov_log = prov_log + date_log
+
+    # duplicates (the portal's duplicate check and fix) and records that already exist in the repository
+    dup_drop = pd.Series(False, index=df.index)
+    dup_log, dup_groups = pd.DataFrame(), pd.DataFrame()
+    if not a.no_dedupe:
+        dup_drop, dup_log, dup_groups = find_duplicates(df, a.resolve_duplicates)
+        n_ex = len(dup_log)
+        n_conf = int(dup_groups["duplicate_group"].nunique()) if len(dup_groups) else 0
+        print("duplicates: %d exact copies removed; %d groups of records with the same key but different values (%s)" %
+              (n_ex, n_conf, "removed as asked" if a.resolve_duplicates != "none" else "listed in the quality report, not removed"),
+              flush=True)
+    exist_drop = pd.Series(False, index=df.index)
+    repo_ctx = None
+    existing_rows = pd.DataFrame()
+    if a.repository:
+        try:
+            ex_mask, repo_ctx = existing_in_repository(df, a.repository)
+            existing_rows = df.loc[ex_mask, ["_row", "Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response"]] \
+                .rename(columns={"_row": "Excel_row"})
+            print("repository: %d records of the file already exist in it%s" %
+                  (int(ex_mask.sum()), " (left out of the output)" if a.skip_existing else ""), flush=True)
+            if a.skip_existing:
+                exist_drop = ex_mask
+        except Exception as e:
+            print("repository not used (%s): %s" % (a.repository, e), flush=True)
+
     # rounds that only exist as a copy of another round of the same Response and date (lookup has no such round)
     copy_drop = pd.Series(False, index=df.index)
     copy_log = pd.DataFrame()
@@ -281,6 +330,12 @@ def main():
             print("copied rounds removed: %d rows (%s); listed in sheet Removed_copies of the audit workbook" %
                   (int(copy_drop.sum()), ", ".join(sorted(set(copy_log["Response"].astype(str) + " " + copy_log["Round_Add"].astype(str))))),
                   flush=True)
+
+    pre_drop = copy_drop | dup_drop | exist_drop
+    pre_label = pd.Series("", index=df.index)
+    pre_label[copy_drop] = "(copied round removed)"
+    pre_label[dup_drop] = "(duplicate removed)"
+    pre_label[exist_drop] = "(already in the repository)"
 
     # ------------------------------------------------------------------ logic
     vt_orig = df["Vaccine_type"].astype(object)
@@ -306,10 +361,10 @@ def main():
     ex_b = num(df["Total_Vacc_bOPV"]) if have_block else pd.Series(np.nan, index=df.index)
 
     key_str = pd.Series(["|".join(str(v) for v in t) for t in df[KEY].itertuples(index=False)], index=df.index)
-    cand = (is_n | is_b) & resp_both & ~vt_both
+    cand = (is_n | is_b) & resp_both & ~vt_both & ~pre_drop
     # a district that has an nOPV2 record AND a bOPV record for the same Response, year and round is
     # co-administered even when the Response name does not mention both vaccines (DRC, South Sudan)
-    cand_any = (is_n | is_b) & ~vt_both
+    cand_any = (is_n | is_b) & ~vt_both & ~pre_drop
     df["_key"] = key_str
     occ = pd.Series(0, index=df.index)
     occ[cand_any] = df[cand_any].groupby(["_key", vt_norm[cand_any]]).cumcount()
@@ -340,7 +395,7 @@ def main():
     out_total = total.copy()
     out_vt = vt_norm.copy()
     drop = pd.Series(False, index=df.index)
-    drop |= copy_drop
+    drop |= pre_drop
 
     single = approach.isin([A_NONE, A_KEPT])
     out_tn[single & is_n] = total[single & is_n]
@@ -445,8 +500,8 @@ def main():
     out_cvb[no_total] = np.nan
 
     keep = ~drop
-    print("pairs merged:", int(drop.sum() - copy_drop.sum()), "| copied rounds removed:", int(copy_drop.sum()),
-          "-> rows out:", int(keep.sum()), flush=True)
+    print("pairs merged:", int(drop.sum() - pre_drop.sum()), "| copied rounds removed:", int(copy_drop.sum()),
+          "| duplicates removed:", int(dup_drop.sum()), "-> rows out:", int(keep.sum()), flush=True)
 
     # -------------------------------------------------------- new sheet build
     base_cols = [h for h in header if h not in BLOCK]
@@ -579,7 +634,7 @@ def main():
     lk_report = lookup_crosscheck(df, lk) if lk is not None else None
     if a.audit:
         write_audit(a.audit, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
-                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, cvp_all, pop_reason, out_cvn, out_cvb, model_info, repairs, lk_report, copy_log)
+                    drop, merged_log, keep, paired, pop_fixed, pop_before, pop, cvp_all, pop_reason, out_cvn, out_cvb, model_info, repairs, lk_report, copy_log, pre_label)
 
     # ------------------------------------------------------------- self-check
     chk = pd.read_excel(a.dst, sheet_name=SHEET)
@@ -607,8 +662,12 @@ def main():
     if not a.no_quality:
         # read again without turning the text "NA" into an empty cell (a province called NA is not an empty province)
         qdf = pd.read_excel(a.dst, sheet_name=SHEET, keep_default_na=False, na_values=[""])
-        qres = qc_run(qdf, geo, qc_config(cv_ceiling=a.cv_ceiling / 100.0, pop_factor=a.pop_factor))
+        ctx_ = None
+        if repo_ctx is not None:
+            ctx_ = repo_ctx.rename(columns={"SIA-date": "SIA_date"})
+        qres = qc_run(qdf, geo, qc_config(cv_ceiling=a.cv_ceiling / 100.0, pop_factor=a.pop_factor), context=ctx_)
         qres["fixes"] = pd.DataFrame(prov_log)
+        qres["dup_log"], qres["dup_groups"], qres["existing"] = dup_log, dup_groups, existing_rows
         qc_print(qres)
         qc_write(qres, a.quality)
 
@@ -709,6 +768,137 @@ def _qdate(s):
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_datetime(s, unit="D", origin="1899-12-30", errors="coerce")
     return pd.to_datetime(s, errors="coerce")
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Duplicates and text dates (merged from the portal: create_unique_id_dt, remove_duplicates_from_repo,
+# find_all_duplicates, validate_admin_data, parse_sia_date)
+# ---------------------------------------------------------------------------------------------------------
+PORTAL_KEY_COLS = ["Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response"]
+FR_MONTHS = [(r"janv\.?", "jan"), (r"f[eé]vr\.?|f[eé]v\.?", "feb"), (r"mars", "mar"), (r"avr\.?", "apr"), (r"mai", "may"),
+             (r"juin", "jun"), (r"juil\.?", "jul"), (r"ao[uû]t", "aug"), (r"sept\.?", "sep"), (r"oct\.?", "oct"),
+             (r"nov\.?", "nov"), (r"d[eé]c\.?", "dec")]
+
+
+def parse_sia_text(x):
+    """A SIA date written as text ("2020-09-18", "2020-09-18 00:00:00 UTC", "18-sept-20", "18/09/2020") -> Timestamp or NaT."""
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return pd.NaT
+    if hasattr(x, "year"):
+        return pd.Timestamp(x)
+    s = str(x).strip().lower()
+    if s in ("", "na", "nan"):
+        return pd.NaT
+    s = re.sub(r"\s+utc$", "", s)
+    for pat, rep in FR_MONTHS:
+        s = re.sub(pat, rep, s)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%b-%y", "%d-%b-%Y", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return pd.Timestamp(pd.to_datetime(s, format=fmt))
+        except Exception:
+            continue
+    return pd.NaT
+
+
+def _pk_clean(s):
+    v = s.where(s.notna(), "NA").astype(str).str.strip().replace("", "NA").str.upper()
+    v = v.str.replace(r"\s+", "_", regex=True).str.replace(r"[^A-Za-z0-9_\-]", "", regex=True)
+    return v.replace("", "EMPTY")
+
+
+def portal_key(df, with_admin3=False):
+    """The portal's duplicate key (KEY_ID): Country | Province | District | SIA_date | Round_Add | Vaccine_type | Response,
+    each cleaned the same way. with_admin3 adds Admin_3 (sub-districts of the same district are not duplicates)."""
+    cols = list(PORTAL_KEY_COLS)
+    if with_admin3 and "Admin_3" in df.columns:
+        cols.insert(3, "Admin_3")
+    parts = []
+    for c in cols:
+        if c not in df.columns:
+            continue
+        if c == "SIA_date":
+            dv = df[c].map(parse_sia_text)
+            parts.append(dv.dt.strftime("%Y-%m-%d").fillna("NA"))
+        else:
+            parts.append(_pk_clean(df[c]))
+    return parts[0].str.cat(parts[1:], sep="|") if parts else pd.Series("", index=df.index)
+
+
+def find_duplicates(df, resolve="none"):
+    """Duplicate check and fix of the portal.
+    - exact duplicates (same key AND every other value the same): the extra copies are removed (the first is kept);
+    - conflicting duplicates (same key, other values differ): listed with a suggestion (the most complete record, then
+      the first one) and removed only with resolve='complete' or 'first';
+    - records with an empty key field are not treated as duplicates (they are reported as missing key fields).
+    Returns (mask of rows to remove, log of the removed exact copies, table of the duplicate groups)."""
+    key = portal_key(df, with_admin3=True)
+    need = [c for c in ("Country", "Province", "District", "Round_Add", "Vaccine_type", "Response") if c in df.columns]
+    blank = pd.Series(False, index=df.index)
+    for c in need:
+        blank |= df[c].isna() | (df[c].astype(str).str.strip() == "")
+    blank |= df["SIA_date"].map(parse_sia_text).isna()
+    cols = []
+    for c in df.columns:
+        if str(c).startswith("_") or c in ("check_dp", "prov_candidates"):
+            continue
+        first = df[c].dropna()
+        if len(first) and isinstance(first.iloc[0], str) and first.iloc[0].startswith("="):
+            continue
+        cols.append(c)
+    sig = pd.util.hash_pandas_object(df[cols].astype(str), index=False)
+    d = pd.DataFrame({"key": key, "sig": sig, "blank": blank}, index=df.index)
+    d["n"] = d["key"].map(d["key"].value_counts())
+    cand = (d["n"] > 1) & ~d["blank"]
+    drop = pd.Series(False, index=df.index)
+    log_rows, grp_rows = [], []
+    if not cand.any():
+        return drop, pd.DataFrame(), pd.DataFrame()
+    sub = d[cand]
+    extra = sub.groupby(["key", "sig"]).cumcount() > 0
+    first_of = sub[~extra].drop_duplicates(["key", "sig"]).set_index(["key", "sig"]).index
+    first_row = {ks: i for i, ks in zip(sub[~extra].index, zip(sub[~extra]["key"], sub[~extra]["sig"]))}
+    for i in sub.index[extra]:
+        drop[i] = True
+        log_rows.append({"Excel_row": int(df.at[i, "_row"]), "Kept_row": int(df.at[first_row[(d.at[i, "key"], d.at[i, "sig"])], "_row"]),
+                         "Country": df.at[i, "Country"], "Province": df.at[i, "Province"], "District": df.at[i, "District"],
+                         "SIA_date": parse_sia_text(df.at[i, "SIA_date"]).strftime("%Y-%m-%d"),
+                         "Round_Add": df.at[i, "Round_Add"], "Vaccine_type": df.at[i, "Vaccine_type"],
+                         "Response": df.at[i, "Response"], "Reason": "exact duplicate: every value is the same as in row %d"
+                                                                  % int(df.at[first_row[(d.at[i, "key"], d.at[i, "sig"])], "_row"])})
+    rest = sub[~extra]
+    rest = rest[rest["key"].map(rest["key"].value_counts()) > 1]
+    filled = df[cols].notna() & (df[cols].astype(str) != "")
+    score = filled.sum(axis=1)
+    gid = 0
+    for key_, g in rest.groupby("key", sort=False):
+        gid += 1
+        idx = list(g.index)
+        keeper = max(idx, key=lambda i: (score[i], -idx.index(i))) if resolve != "first" else idx[0]
+        suggested = max(idx, key=lambda i: (score[i], -idx.index(i)))
+        differ = [c for c in cols if df.loc[idx, c].astype(str).nunique() > 1]
+        for n_, i in enumerate(idx, 1):
+            applied = resolve in ("complete", "first") and i != keeper
+            if applied:
+                drop[i] = True
+            grp_rows.append({"duplicate_group": gid, "record_num": n_, "Excel_row": int(df.at[i, "_row"]),
+                             "Country": df.at[i, "Country"], "Province": df.at[i, "Province"], "District": df.at[i, "District"],
+                             "SIA_date": parse_sia_text(df.at[i, "SIA_date"]).strftime("%Y-%m-%d"),
+                             "Round_Add": df.at[i, "Round_Add"], "Vaccine_type": df.at[i, "Vaccine_type"],
+                             "Response": df.at[i, "Response"], "TotalNbrVaccPolio": df.at[i, "TotalNbrVaccPolio"],
+                             "PopPolio": df.at[i, "PopPolio"], "Filled_cells": int(score[i]),
+                             "Suggested": "keep" if i == suggested else "remove", "Applied": "removed" if applied else "",
+                             "Columns_that_differ": ", ".join(differ[:12]) + (" ..." if len(differ) > 12 else "")})
+    return drop, pd.DataFrame(log_rows), pd.DataFrame(grp_rows)
+
+
+def existing_in_repository(df, repo_path):
+    """Records of the file whose portal key is already in the repository (the portal's 'records already exist' check)."""
+    xl = pd.ExcelFile(repo_path)
+    rp = xl.parse(SHEET if SHEET in xl.sheet_names else xl.sheet_names[0], keep_default_na=False, na_values=[""])
+    rp = rp.rename(columns={"SIA-date": "SIA_date"}) if "SIA_date" not in rp.columns else rp
+    rk = set(portal_key(rp))
+    nk = portal_key(df)
+    return nk.isin(rk), rp
 
 
 def find_geo(user_path, src):
@@ -850,10 +1040,17 @@ def qc_geo(w, geo):
     return [x for x in issues if x is not None], corr, prov_eff
 
 
-def qc_run(df, geo=None, cfg=None, today=None):
+def qc_run(df, geo=None, cfg=None, today=None, context=None):
     """Run every check on a data frame. Returns {issues, corrections, by_check, by_country, n_rows, n_flagged}."""
     cfg = cfg or qc_config()
     today = pd.Timestamp(today or pd.Timestamp.today().normalize())
+    n_ctx = 0
+    n_new = len(df)
+    if context is not None and len(context):
+        # rows of the repository (same countries) only give context to the target population check; they are not reported
+        ctx = context[context["Country"].map(_qcountry).isin(set(df["Country"].map(_qcountry)))]
+        n_ctx = len(ctx)
+        df = pd.concat([ctx, df], ignore_index=True, sort=False)
     w = qc_prepare(df)
     parts = []
 
@@ -1009,6 +1206,14 @@ def qc_run(df, geo=None, cfg=None, today=None):
             ["Same country, province, district, SIA date, round, vaccine and response appears %d times" % cnt.iat[k] for k in i]))
 
     iss = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["idx", "check", "severity", "message", "current", "suggested"])
+    if n_ctx:
+        iss = iss[(iss["idx"] >= n_ctx) & (iss["check"] != "duplicate_key")].copy()
+        iss["idx"] = iss["idx"] - n_ctx
+        w = w.iloc[n_ctx:].copy()
+        w["idx"] = w["idx"] - n_ctx
+        if corr is not None and len(corr):
+            corr = corr[corr["idx"] >= n_ctx].copy()
+            corr["idx"] = corr["idx"] - n_ctx
     base = w[["idx", "Country", "Province", "District", "sia_date", "Round", "Vaccine", "Response"]].copy()
     base["SIA_date"] = base.pop("sia_date").dt.strftime("%Y-%m-%d")
     iss = iss.merge(base, on="idx", how="left")
@@ -1037,7 +1242,7 @@ def qc_run(df, geo=None, cfg=None, today=None):
     else:
         by_check = pd.DataFrame(columns=["Check", "Severity", "Records", "Countries"])
         by_country = w.groupby("Country").size().rename("Records").reset_index()
-    return {"issues": iss, "corrections": corr, "by_check": by_check, "by_country": by_country, "n_rows": len(df),
+    return {"issues": iss, "corrections": corr, "by_check": by_check, "by_country": by_country, "n_rows": n_new,
             "n_flagged": int(iss["idx"].nunique()), "config": cfg, "prov_eff": prov_eff,
             "n_err": int(iss.loc[iss.severity == "Error", "idx"].nunique()),
             "n_warn": int(iss.loc[iss.severity == "Warning", "idx"].nunique()),
@@ -1062,6 +1267,10 @@ def qc_write(res, path, country=None):
             res["corrections"].drop(columns="idx").to_excel(xw, sheet_name="Suggested fixes", index=False)
         if res.get("fixes") is not None and len(res["fixes"]):
             res["fixes"].to_excel(xw, sheet_name="Fixes applied", index=False)
+        for key_, sheet in (("dup_log", "Removed_duplicates"), ("dup_groups", "Duplicate_groups"),
+                            ("existing", "Already_in_repository")):
+            if res.get(key_) is not None and len(res[key_]):
+                res[key_].to_excel(xw, sheet_name=sheet, index=False)
     print("quality report written:", path, flush=True)
 
 
@@ -1095,7 +1304,22 @@ def run_check_only(a, rev_dir):
         print("geography reference: %s (%d districts)" % (gp, len(geo)), flush=True)
     else:
         print("geo_reference.csv not found: the province / country check is skipped", flush=True)
-    res = qc_run(x, geo, qc_config(cv_ceiling=a.cv_ceiling / 100.0, pop_factor=a.pop_factor))
+    x["_row"] = orig + 2
+    dup_drop, dup_log, dup_groups = find_duplicates(x, "none")
+    print("duplicates: %d exact copies (would be removed by the update); %d groups with the same key but different values" %
+          (len(dup_log), int(dup_groups["duplicate_group"].nunique()) if len(dup_groups) else 0), flush=True)
+    ctx_, existing_rows = None, pd.DataFrame()
+    if a.repository:
+        try:
+            ex_mask, rp = existing_in_repository(x, a.repository)
+            existing_rows = x.loc[ex_mask, ["_row", "Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response"]] \
+                .rename(columns={"_row": "Excel_row"})
+            ctx_ = rp.rename(columns={"SIA-date": "SIA_date"})
+            print("repository: %d records of the file already exist in it" % int(ex_mask.sum()), flush=True)
+        except Exception as e:
+            print("repository not used (%s): %s" % (a.repository, e), flush=True)
+    res = qc_run(x.drop(columns="_row"), geo, qc_config(cv_ceiling=a.cv_ceiling / 100.0, pop_factor=a.pop_factor), context=ctx_)
+    res["dup_log"], res["dup_groups"], res["existing"] = dup_log, dup_groups, existing_rows
     res["issues"]["Excel_row"] = orig[res["issues"]["idx"].values] + 2
     if res["corrections"] is not None and len(res["corrections"]):
         res["corrections"]["Excel_row"] = orig[res["corrections"]["idx"].values] + 2
@@ -1313,15 +1537,16 @@ def write_feedback(path, df, keep, out_vt, out_total, pop, pop_before, pop_fixed
 
 def write_audit(path, df, approach, vt_orig, out_vt, vt_changed, total, out_total, out_tn, out_tb,
                 drop, merged_log, keep, paired, pop_fixed=None, pop_before=None, pop_after=None, cvp=None,
-                pop_reason=None, cv_n=None, cv_b=None, model_info=None, repairs=None, lk_report=None, copy_log=None):
+                pop_reason=None, cv_n=None, cv_b=None, model_info=None, repairs=None, lk_report=None, copy_log=None, pre_label=None):
     cols = ["_row", "Country", "Province", "District", "Admin_3", "Year", "Round_Add", "Response", "SIA_date"]
     a = df[cols].copy()
     a.rename(columns={"_row": "Original_row"}, inplace=True)
     a["Approach"] = approach
     a["Vaccine_type_before"] = vt_orig
     a["Vaccine_type_after"] = out_vt.where(keep, "(merged into the other record)")
-    if copy_log is not None and len(copy_log):
-        a.loc[df["_row"].isin(copy_log["Original_row"]).values, "Vaccine_type_after"] = "(copied round removed)"
+    if pre_label is not None and (pre_label != "").any():
+        m_ = (pre_label != "").values
+        a.loc[m_, "Vaccine_type_after"] = pre_label[m_].values
     a["TotalNbrVaccPolio_before"] = total
     a["TotalNbrVaccPolio_after"] = out_total.where(keep)
     a["Tot_Vacc_nOPV2"] = out_tn.where(keep)
