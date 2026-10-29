@@ -121,6 +121,23 @@ switch the checks / the province fix off; `--fail-on-error` exits with code 2 wh
 `--check-only` runs only the checks, on a file as it is (nothing is updated), like the portal's daily
 `run_admin_quality_check.R`; `--country Nigeria` limits it to one country.
 
+## Duplicates, text dates and the repository (merged from the admin portal)
+
+- **Duplicate key**: Country | Province | District | Admin_3 | SIA_date | Round_Add | Vaccine_type | Response, cleaned as in
+  the portal (the portal's key without Admin_3; sub-districts of one district are not duplicates). Records with an empty key
+  field are not treated as duplicates (they are reported as missing key fields).
+- **Exact duplicates** (same key and every other value the same) are removed by the update, the first copy is kept
+  (`--no-dedupe` switches this off). They are listed in `Removed_duplicates` of the quality report.
+- **Same key, different values** are never removed by default: they are listed in `Duplicate_groups` (group, record number,
+  the columns that differ, the most complete record marked `keep`). `--resolve-duplicates complete` keeps the most complete
+  record of each group, `--resolve-duplicates first` keeps the first one (what the portal does).
+- **Text dates**: a SIA_date written as text ("2020-09-18 00:00:00 UTC", "18-sept-20", "18/09/2020") is turned into a real
+  date (logged in `Fixes applied`).
+- **Repository** (`--repository AFRO_admin_data_repository.xlsx`): records whose key already exists in the portal's repository
+  are listed in `Already_in_repository` (`--skip-existing` leaves them out of the output, like the portal's "Skip duplicates"),
+  and the repository rows of the same countries give context to the target population check; only the records of the file
+  are reported.
+
 ## Which files it accepts
 
 - The full regional admin data, raw or already processed (it recognises a processed file, see above).
