@@ -44,9 +44,25 @@ fixes them using the SharePoint backups as the reference. It finds the backups b
 
 Each error is restored from the same row in the newest earlier backup that holds a valid value; if there is none,
 from the other rows of the same country, date and round; for `Vaccine_type` finally from what the Response name
-says (bOPV / nOPV), otherwise `nOPV2`. What cannot be fixed is not guessed: it is listed as `UNRESOLVED` in the
-audit sheet `Repairs`, to correct with the country. Every repair (row, value found, value restored, source) is
-in the same sheet. Renames that stay within the same country (for example a corrected campaign name) are kept.
+says (bOPV / nOPV), otherwise `nOPV2`.
+
+**When the error is already in the oldest backup** (the case of Ahmed's first copy errors), no backup can restore it.
+For a Response of another country the script then works out the right campaign from the footprint of the data
+(`--no-infer` switches this off):
+
+- **A block of rows** (5 or more with the same wrong Response, date and round, e.g. 23 Angola Benguela rows carrying
+  `CAM-...`): it takes the Response of the same country and vaccine whose districts are the same districts (at least
+  80% both ways, accents ignored). If that Response already has the same round for those districts, a warning is
+  written in the `Check` column (probably the next round); the round is not changed.
+- **A single row** (e.g. a Nigeria district carrying the Chad name, date and round): it looks for the one campaign
+  round of the same country, vaccine and province, within 90 days, that covers at least 90% of the province's
+  districts and does not have this district. The row is that district's missing record, so its Response, SIA_date
+  and Round_Add are all taken from that round.
+
+Only a unique answer is used. Inferred values are marked `INFERRED` (with the reason and a confidence) in the audit
+sheet `Repairs`: confirm them with the countries. What still cannot be fixed is not guessed: it is listed as
+`UNRESOLVED`. Every repair (row, value found, value restored, source) is in the same sheet. Renames that stay within
+the same country (for example a corrected campaign name) are kept.
 
 ## Which files it accepts
 
