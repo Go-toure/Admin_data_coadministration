@@ -555,20 +555,28 @@ def cmd_check(a):
 
 # ----------------------------------------------------------------------------------------------- excel
 PS_SAVE = r'''
-$ErrorActionPreference = "Stop"
 $path = $args[0]
 $xl = New-Object -ComObject Excel.Application
 $xl.Visible = $false
 $xl.DisplayAlerts = $false
+$xl.EnableEvents = $false
+$code = 0
 try {
-  $wb = $xl.Workbooks.Open($path)
+  $wb = $xl.Workbooks.Open($path, 0, $false)
   $xl.CalculateFull()
   $wb.Save()
   $wb.Close($false)
-} finally {
-  $xl.Quit()
-  [System.Runtime.Interopservices.Marshal]::ReleaseComObject($xl) | Out-Null
+} catch {
+  Write-Output ("EXCEL_ERROR: " + $_.Exception.Message)
+  $code = 1
 }
+# Excel sometimes refuses to quit for a moment after a big save (0x800AC472): wait and try again
+for ($i = 0; $i -lt 6; $i++) {
+  try { $xl.Quit(); break } catch { Start-Sleep -Seconds 5 }
+}
+try { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($xl) | Out-Null } catch {}
+[GC]::Collect(); [GC]::WaitForPendingFinalizers()
+exit $code
 '''
 
 
@@ -609,18 +617,22 @@ def cmd_excel(a):
         log("Opening %s in Excel, recalculating and saving (a minute or two) ..." % f.name)
         try:
             r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps), str(f)],
-                               capture_output=True, text=True, timeout=int(S["excel_timeout_min"]) * 60)
+                               capture_output=True, text=True, errors="replace", timeout=int(S["excel_timeout_min"]) * 60)
         except subprocess.TimeoutExpired:
             die("Excel did not finish in %s minutes. Close any Excel window that is still open and try again, or open "
                 "the file yourself, save it and run 'excel --verify-only'." % S["excel_timeout_min"])
         if r.returncode:
-            die("Excel could not save the file: %s\n  Open it yourself, save once, then run: python admin.py excel --verify-only"
-                % (r.stderr.strip()[:300] or r.stdout.strip()[:300]))
+            # the save may still have worked (Excel is sometimes slow to quit): the stored values decide
+            log("Excel reported a problem: %s" % (r.stdout.strip() or r.stderr.strip())[:200].replace("\n", " "))
+            log("Checking whether the file was saved anyway ...")
         try:
             ps.unlink()
         except Exception:
             pass
-    ok, why = checkdp_filled(f)
+    try:
+        ok, why = checkdp_filled(f)
+    except Exception as e:
+        ok, why = False, "the file could not be read (%s): close any Excel window that still has it open" % type(e).__name__
     m["excel"] = {"ok": ok, "at": now(), "method": "manual" if a.verify_only else "excel automation", "detail": why}
     save_manifest(rd, m)
     if not ok:
