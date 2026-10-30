@@ -54,7 +54,8 @@ DEFAULTS = {
     "key_columns": ["Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response"],
     "scope_script_dir": "",
     "scope_data_dir": "",
-    "excel_timeout_min": 20,
+    "excel_timeout_min": 30,
+    "excel_visible": True,                    # show the Excel window while it saves (any pop-up can then be answered)
 }
 EXPECTED_CHANGE = {"Response", "Round_Add", "District", "Province", "Country", "SIA_date", "Vaccine_type", "PopPolio",
                    "CVPolio", "TotalNbrVaccPolio", "Tot_Vacc_nOPV2", "CV_nOPV2", "Total_Vacc_bOPV", "CV_bOPV", "TotPop",
@@ -555,25 +556,37 @@ def cmd_check(a):
 
 # ----------------------------------------------------------------------------------------------- excel
 PS_SAVE = r'''
+# Opens the workbook in Excel, lets it calculate, saves and quits. Every Excel call is retried: right after a big
+# open, Excel often answers "busy" (0x800AC472) for a few seconds.
 $path = $args[0]
+$visible = ($args[1] -eq "1")
 $xl = New-Object -ComObject Excel.Application
-$xl.Visible = $false
+$xl.Visible = $visible
 $xl.DisplayAlerts = $false
 $xl.EnableEvents = $false
+$wb = $null
 $code = 0
-try {
-  $wb = $xl.Workbooks.Open($path, 0, $false)
-  $xl.CalculateFull()
-  $wb.Save()
-  $wb.Close($false)
-} catch {
-  Write-Output ("EXCEL_ERROR: " + $_.Exception.Message)
-  $code = 1
+function Step([string]$name, [scriptblock]$sb, [int]$tries = 12) {
+  for ($i = 1; $i -le $tries; $i++) {
+    try { $null = (& $sb); Write-Host ("STEP ok: " + $name); return $true }
+    catch { Start-Sleep -Seconds 5 }
+  }
+  Write-Host ("STEP FAILED: " + $name)
+  return $false
 }
-# Excel sometimes refuses to quit for a moment after a big save (0x800AC472): wait and try again
-for ($i = 0; $i -lt 6; $i++) {
-  try { $xl.Quit(); break } catch { Start-Sleep -Seconds 5 }
+Step "ready" { if (-not $xl.Ready) { throw "not ready" } } 24 | Out-Null
+if (-not (Step "open" { $global:wb = $xl.Workbooks.Open($path, 0, $false) })) { $code = 1 }
+if ($code -eq 0) {
+  Step "automatic calculation" { $xl.Calculation = -4105 } | Out-Null
+  Step "calculate" { $xl.Calculate() } | Out-Null
+  for ($i = 0; $i -lt 120; $i++) {                      # wait until Excel has finished calculating (up to 10 min)
+    try { if ($xl.CalculationState -eq 0) { break } } catch {}
+    Start-Sleep -Seconds 5
+  }
+  if (-not (Step "save" { $global:wb.Saved = $false; $global:wb.Save() })) { $code = 1 }
+  Step "close" { $global:wb.Close($false) } | Out-Null
 }
+Step "quit" { $xl.Quit() } 6 | Out-Null
 try { [System.Runtime.Interopservices.Marshal]::ReleaseComObject($xl) | Out-Null } catch {}
 [GC]::Collect(); [GC]::WaitForPendingFinalizers()
 exit $code
@@ -616,14 +629,15 @@ def cmd_excel(a):
         ps.write_text(PS_SAVE, encoding="utf-8")
         log("Opening %s in Excel, recalculating and saving (a minute or two) ..." % f.name)
         try:
-            r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps), str(f)],
+            r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps), str(f),
+                                "1" if S.get("excel_visible", True) else "0"],
                                capture_output=True, text=True, errors="replace", timeout=int(S["excel_timeout_min"]) * 60)
         except subprocess.TimeoutExpired:
             die("Excel did not finish in %s minutes. Close any Excel window that is still open and try again, or open "
                 "the file yourself, save it and run 'excel --verify-only'." % S["excel_timeout_min"])
         if r.returncode:
             # the save may still have worked (Excel is sometimes slow to quit): the stored values decide
-            log("Excel reported a problem: %s" % (r.stdout.strip() or r.stderr.strip())[:200].replace("\n", " "))
+            log("Excel reported a problem: %s" % (r.stdout.strip() or r.stderr.strip())[-300:].replace("\n", " | "))
             log("Checking whether the file was saved anyway ...")
         try:
             ps.unlink()
