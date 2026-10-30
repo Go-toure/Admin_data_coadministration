@@ -132,9 +132,10 @@ def main():
                          "same Response and date (they are removed by default and listed in the audit)")
     ap.add_argument("--align-response-names", nargs="*", metavar="COUNTRY", default=None,
                     help="rename a Response to the exact name of the lookup when it is clearly the same campaign (same country, "
-                         "start date within 7 days, the lookup name starts with the Response); give the countries to apply it to "
-                         "(e.g. --align-response-names MALAWI) or none for all countries. Off by default: the list of candidate "
-                         "renames should be reviewed first")
+                         "start date within 7 days, the lookup name starts with the Response). Done by default for all countries; "
+                         "give countries (e.g. --align-response-names MALAWI) to restrict it to them")
+    ap.add_argument("--no-align-response-names", action="store_true",
+                    help="keep the Response names as reported even when the lookup spells them differently")
     ap.add_argument("--district-source", metavar="FILE",
                     help="a recovered or original file (e.g. a country template with Prov_Name / Dist_Name, or an older admin file) "
                          "used to fill empty District values: records of the same Response and round are matched on province "
@@ -311,7 +312,7 @@ def main():
                    sum(1 for v in fills.values() if v["confidence"] != "high")), flush=True)
 
     # a Response that is not a name of the lookup but clearly is the same campaign gets the lookup's name
-    if lk is not None and a.align_response_names is not None:
+    if lk is not None and not a.no_align_response_names:
         afills = align_response_names(df, lk, a.align_response_names)
         for i, inf in afills.items():
             val = inf["set"]["Response"]
