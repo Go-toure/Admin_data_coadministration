@@ -7,7 +7,8 @@ admin.py - one command for the whole AFRO admin data cycle.
     python admin.py build             build the next version from the LIVE file (backup first)
     python admin.py check             verify the newest build against the file it started from
     python admin.py excel             store the check_dp values in the build (written directly; --use-excel to use Excel)
-    python admin.py publish           replace the file on SharePoint (all gates must be green)
+    python admin.py publish           replace the file AND the data dictionary on SharePoint (all gates must be green)
+    python admin.py dictionary        push only the data dictionary of the last published build (retry / refresh)
     python admin.py all               backup -> build -> check -> excel -> publish
     python admin.py runs              list the builds
     python admin.py inspect           quality + hygiene + lookup checks on a file (the live file by default)
@@ -90,6 +91,8 @@ def P(rel):
 WORK = P(S["workspace"])
 RUNS = WORK / "runs"
 STATE = WORK / "state.json"
+DICT_BACKUPS = WORK / "dictionary_backups"      # the previous live dictionary is kept here before it is replaced
+DICT_FAILED_RC = 3                              # publish script: admin data published, dictionary push failed
 LOGDIR = HERE / "logs"
 BACKUP_REPO = P(S["backup_repo"])
 
@@ -292,6 +295,13 @@ def cmd_status(a):
     if st.get("published"):
         print("\nLast published: v%s on %s (SharePoint backup version %s)"
               % (st["published"].get("version"), st["published"].get("at"), st["published"].get("backup_version")))
+    for pn, pd in reversed(run_dirs()):
+        pm = read_json(pd / "manifest.json", {})
+        if pm.get("published"):
+            ds = pm["published"].get("dictionary")
+            if ds:
+                print("Data dictionary: %s (v%d)%s" % (ds, pn, "  <- run 'python admin.py dictionary'" if ds == "failed" else ""))
+            break
     n, d, m = latest_run(unpublished=True)
     if n:
         print("\nNext step for v%d: %s" % (n, next_step(m)))
@@ -810,18 +820,78 @@ def cmd_publish(a):
     cmd = [sys.executable, pub, "--file", f, "--backup-repo", BACKUP_REPO]
     if not getattr(a, "ask", False) and "--yes" not in (a.extra or []):
         cmd.append("--yes")        # every gate has passed: go ahead without typing YES (publish --ask to be asked)
-    cmd += list(a.extra or [])
+    extra = list(a.extra or [])
+    res_json = rd / "publish_result.json"
+    if res_json.exists():
+        res_json.unlink()
+    cmd += ["--result-json", res_json, "--dictionary-backup-dir", DICT_BACKUPS]
+    dfile = rd / ("AFRO_admin_data_dictionary_v%d.xlsx" % n)
+    if "--no-dictionary" not in extra and "--dictionary" not in extra:
+        if dfile.is_file():
+            cmd += ["--dictionary", dfile]
+        else:
+            log("WARNING: %s is not in the run folder: the data dictionary will not be pushed." % dfile.name)
+    cmd += extra
     rc, _ = run_cmd(cmd, cwd=HERE, tee=rd / "publish.log")
-    if rc:
+    if rc and rc != DICT_FAILED_RC:
         die("the publish script stopped (exit %s). Nothing is marked as published; see %s." % (rc, rd / "publish.log"))
+    res = read_json(res_json, {})
     row2, _ = latest_snapshot()
-    m["published"] = {"at": now(), "backup_version": row2["version"] if row2 else None, "file": str(f)}
+    m["published"] = {"at": now(), "backup_version": row2["version"] if row2 else None, "file": str(f),
+                      "dictionary": res.get("dictionary", "failed" if rc else "unknown"),
+                      "dictionary_message": res.get("dictionary_message", "")}
     save_manifest(rd, m)
     st = read_json(STATE, {})
     st["published"] = {"version": n, "at": m["published"]["at"], "backup_version": m["published"]["backup_version"]}
     write_json(STATE, st)
     log("v%d is live. Local backup of the new live file: version %s." % (n, m["published"]["backup_version"]))
+    dstat = m["published"]["dictionary"]
+    if dstat == "published":
+        log("The data dictionary on SharePoint is now AFRO_admin_data_dictionary_v%d.xlsx." % n)
+    elif dstat == "unchanged":
+        log("The data dictionary on SharePoint was already up to date.")
+    elif dstat == "failed":
+        log("WARNING: the data dictionary was NOT pushed (%s). The admin data is fine. Fix the cause, then run: "
+            "python admin.py dictionary" % m["published"]["dictionary_message"])
+    else:
+        log("The data dictionary was not pushed (%s)." % dstat)
     log("Next: commit the code if it changed ('commit'), and tell the team the new version is live.")
+
+
+def cmd_dictionary(a):
+    """Push only the data dictionary of the last published build (or of the newest build if none was published)."""
+    pick = None
+    for n, d in reversed(run_dirs()):
+        m = read_json(d / "manifest.json", {})
+        if m.get("published"):
+            pick = (n, d, m)
+            break
+    if not pick:
+        n, d, m = latest_run()
+        pick = (n, d, m) if n else None
+    if not pick:
+        die("no build yet: run 'build' first.")
+    n, rd, m = pick
+    dfile = rd / ("AFRO_admin_data_dictionary_v%d.xlsx" % n)
+    if not dfile.is_file():
+        die("%s does not exist (the build of v%d produced no dictionary)." % (dfile.name, n))
+    log("Pushing %s to SharePoint ..." % dfile.name)
+    res_json = rd / "dictionary_result.json"
+    cmd = [sys.executable, P(S["publisher"]), "--dictionary-only", "--dictionary", dfile, "--yes",
+           "--result-json", res_json, "--dictionary-backup-dir", DICT_BACKUPS, "--backup-repo", BACKUP_REPO]
+    if getattr(a, "dry_run", False):
+        cmd.append("--dry-run")
+    cmd += list(a.extra or [])
+    rc, _ = run_cmd(cmd, cwd=HERE, tee=rd / "dictionary.log")
+    res = read_json(res_json, {})
+    if rc:
+        die("the dictionary was not pushed (see %s)." % (rd / "dictionary.log"))
+    if not getattr(a, "dry_run", False):
+        if m.get("published"):
+            m["published"]["dictionary"] = res.get("dictionary", "unknown")
+            m["published"]["dictionary_message"] = res.get("dictionary_message", "")
+        save_manifest(rd, m)
+        log("Dictionary: %s." % res.get("dictionary", "done"))
 
 
 # ----------------------------------------------------------------------------------------------- all
@@ -1133,6 +1203,7 @@ DECISIONS = [
     "Never guess: an answer is used only when it is unique; otherwise the record is left and listed.",
     "A build always starts from the live SharePoint file, so nobody's newer edits are lost.",
     "SharePoint keeps no version history (the local backup has it); one published file, replaced in place.",
+    "The data dictionary (AFRO_admin_data_dictionary.xlsx) is pushed with every publish, into the existing SharePoint file; the previous live one is kept in workspace/dictionary_backups. A dictionary problem never undoes the published data (exit 3, retry with `admin.py dictionary`).",
     "Data is never committed to git (only lookup.xlsx and geo_reference.csv). No attribution lines in commit messages.",
     "Each code change is its own commit, followed by its own push.",
     "Open questions kept visible: Addis Ababa round 2 and 4 sub-cities lack woreda names (need a woreda-level file); Tegedie exists in two zones of Amhara with the same name; about 1,460 Nigeria 2022-Jan 2023 records have no Response in the lookup.",
@@ -1184,6 +1255,8 @@ def main():
     s.add_argument("--use-excel", action="store_true", help="let desktop Excel store the values (default: written directly, no Excel)")
     s = sub.add_parser("publish"); s.add_argument("--ask", action="store_true", help="ask for YES before replacing the file")
     s.add_argument("extra", nargs="*", help="extra options for the publish script, after --")
+    s = sub.add_parser("dictionary", help="push only the data dictionary of the last published build")
+    s.add_argument("--dry-run", action="store_true"); s.add_argument("extra", nargs="*")
     s = sub.add_parser("all"); s.add_argument("extra", nargs="*")
     s = sub.add_parser("commit"); s.add_argument("-m", "--message", required=True); s.add_argument("--no-push", action="store_true")
     s.add_argument("files", nargs="*")
@@ -1204,7 +1277,7 @@ def main():
         ap.print_help()
         return
     fn = {"status": cmd_status, "runs": cmd_runs, "backup": cmd_backup, "build": cmd_build, "check": cmd_check,
-          "excel": cmd_excel, "publish": cmd_publish, "all": cmd_all, "commit": cmd_commit,
+          "excel": cmd_excel, "publish": cmd_publish, "dictionary": cmd_dictionary, "all": cmd_all, "commit": cmd_commit,
           "sync-scope": cmd_sync_scope, "doctor": cmd_doctor, "inspect": cmd_inspect, "find": cmd_find,
           "compare": cmd_compare, "rules": cmd_rules}[a.cmd]
     log("admin.py %s" % " ".join(sys.argv[1:]), quiet=True)
