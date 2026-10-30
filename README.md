@@ -157,6 +157,23 @@ What the lookup cannot fix stays an Error ("Missing key field") for the countrie
 (before the lookup starts), Ethiopia records with a blank District (no other identifier in the record or in any backup), and the
 few records with a blank Province that has no match.
 
+## Filling an empty District from a recovered file
+
+`--district-source FILE` fills empty `District` values from a recovered or original file (a country template with
+`Prov_Name` / `Dist_Name`, or an older admin file; xlsx or csv, first sheet). Records with an empty District are grouped by
+country, Response, round and province and matched one to one with the records of the file in the same group:
+
+1. same `PopPolio` and same vaccinated total (confidence high);
+2. same `PopPolio` and a vaccinated total within 10%, only if unique (confidence medium);
+3. same vaccinated total and a different `PopPolio`, only if unique (high from 1,000 vaccinated, otherwise medium);
+4. one record and one district of the file left unmatched in the same province (medium).
+
+Each record of the file is used once; what does not match stays empty. The district written is the file's `Dist_Name` (the woreda,
+which is what the data uses as District for Ethiopia; `Zone_Name` is the level above), in capitals, and in the spelling the data
+already uses for that district when there is one (the same name once WORHO / TOWN / CITY are ignored, or at least 90% alike).
+Every fill is in the audit sheet `Repairs` (`Source` starts with `recovered file:`). Example: the Ethiopia file `AFRO-ETH FIVE REGIONS R1`
+filled 279 of the 282 records of `ETH-2024-08-nOPV2` round 1.
+
 ## Publishing to SharePoint (`publish_admin_data.py`)
 
 A separate script puts the latest corrected file on SharePoint, in place of the one that is there. Double-click
