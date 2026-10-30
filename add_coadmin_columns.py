@@ -136,6 +136,8 @@ def main():
                          "give countries (e.g. --align-response-names MALAWI) to restrict it to them")
     ap.add_argument("--no-align-response-names", action="store_true",
                     help="keep the Response names as reported even when the lookup spells them differently")
+    ap.add_argument("--no-clean-text", action="store_true",
+                    help="keep control characters and extra spaces in the names as they are")
     ap.add_argument("--district-source", metavar="FILE",
                     help="a recovered or original file (e.g. a country template with Prov_Name / Dist_Name, or an older admin file) "
                          "used to fill empty District values: records of the same Response and round are matched on province "
@@ -259,6 +261,30 @@ def main():
     # copy / drag-fill errors (Response from another country, nOPV3..nOPV15): restored from the backups
     repairs = []
     repl = {}
+
+    # text clean-up: carriage-return codes, line breaks and extra spaces in the key text columns
+    if not a.no_clean_text:
+        n_clean = 0
+        for col in ("Country", "Province", "District", "Admin_3", "Response", "Vaccine_type", "Round_Add"):
+            if col not in df.columns:
+                continue
+            ser = df[col]
+            dirty = ser.map(lambda v: isinstance(v, str) and bool(re.search(r"_x000D_|\s\s|^\s|\s$|[\r\n\t]", v)))
+            for i in ser.index[dirty]:
+                old_v = ser[i]
+                new_v = re.sub(r"\s+", " ", re.sub(r"_x000D_", " ", old_v)).strip()
+                if new_v == old_v:
+                    continue
+                df.at[i, col] = new_v
+                repl[(i, col)] = new_v
+                repairs.append({"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "Province": df.at[i, "Province"],
+                                "District": df.at[i, "District"], "SIA_date": _dkey(df.at[i, "SIA_date"]), "Column": col,
+                                "Found": old_v, "Rule": "Stray characters or spaces in the name", "Restored": new_v,
+                                "Source": "text clean-up", "Confidence": "high", "Check": ""})
+                n_clean += 1
+        if n_clean:
+            print("text clean-up (control characters, extra spaces): %d cells" % n_clean, flush=True)
+
     if not a.no_repair:
         repairs = repair_copy_errors(df, find_backups(a.backups, a.src), a.src, os.path.join(a.out_dir, "_backup_cache"),
                                      infer=not a.no_infer, lk=lk)
