@@ -130,6 +130,10 @@ def main():
     ap.add_argument("--keep-copied-rounds", action="store_true",
                     help="do not remove the rounds that the lookup does not have and that copy another round of the "
                          "same Response and date (they are removed by default and listed in the audit)")
+    ap.add_argument("--district-source", metavar="FILE",
+                    help="a recovered or original file (e.g. a country template with Prov_Name / Dist_Name, or an older admin file) "
+                         "used to fill empty District values: records of the same Response and round are matched on province "
+                         "and the target / vaccinated figures, and only a unique answer is used")
     ap.add_argument("--geo", help="geography reference (country, province, district) for the province / country check "
                                   "(default: geo_reference.csv next to this script)")
     ap.add_argument("--no-quality", action="store_true", help="do not run the quality checks (merged from the admin portal)")
@@ -300,6 +304,27 @@ def main():
             print("empty Response filled from the lookup: %d records (%d exact, %d within a few days)" %
                   (len(fills), sum(1 for v in fills.values() if v["confidence"] == "high"),
                    sum(1 for v in fills.values() if v["confidence"] != "high")), flush=True)
+
+    # an empty District is filled from a recovered file (only when its figures match the record exactly or nearly)
+    if getattr(a, "district_source", None):
+        try:
+            dfills = fill_blank_district(df, a.district_source)
+        except Exception as e:
+            dfills = {}
+            print("district source not used (%s): %s" % (a.district_source, e), flush=True)
+        for i, inf in dfills.items():
+            val = inf["set"]["District"]
+            df.at[i, "District"] = val
+            repl[(i, "District")] = val
+            repairs.append({"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "Province": df.at[i, "Province"],
+                            "District": val, "SIA_date": _dkey(df.at[i, "SIA_date"]), "Column": "District",
+                            "Found": "", "Rule": "District is empty", "Restored": val,
+                            "Source": "recovered file: " + inf["why"], "Confidence": inf["confidence"], "Check": ""})
+        if dfills:
+            print("empty District filled from %s: %d records (%d with an exact vaccinated total, %d less certain)" %
+                  (os.path.basename(a.district_source), len(dfills),
+                   sum(1 for v in dfills.values() if v["confidence"] == "high"),
+                   sum(1 for v in dfills.values() if v["confidence"] != "high")), flush=True)
 
     # SIA_date written as text ("18-sept-20", "2020-09-18 00:00:00 UTC" ...) is turned into a real date
     date_log = []
@@ -940,6 +965,132 @@ def existing_in_repository(df, repo_path):
     rk = set(portal_key(rp))
     nk = portal_key(df)
     return nk.isin(rk), rp
+
+
+def _dist_core(z):
+    z = str(z).upper()
+    z = re.sub(r"\b(WORHO|WOREDA|WEREDA|TOWN|CITY|ADMIN|SPECIAL|URBAN|RURAL|REFUGEE|CAMP|ZONE)\b", " ", z)
+    return re.sub(r"[^A-Z0-9]", "", z)
+
+
+def _align_spelling(nm, existing):
+    """Use the spelling the data already has for this district: the same name once WORHO / TOWN / CITY ... are
+    ignored, or a name that is at least 90% alike (LAY ARMACHEHO -> LAY ARMACHO). `existing` = names used in the
+    province by other records. Only a unique answer is used."""
+    ex = [e for e in existing if e]
+    if nm in ex:
+        return nm, ""
+    k = _dist_core(nm)
+    same = sorted({e for e in ex if k and _dist_core(e) == k})
+    if len(same) == 1:
+        return same[0], same[0]
+    if not same and k:
+        import difflib
+        close = sorted({e for e in ex if difflib.SequenceMatcher(None, k, _dist_core(e)).ratio() >= 0.90})
+        if len(close) == 1:
+            return close[0], close[0]
+    return nm, ""
+
+
+def fill_blank_district(df, src_path):
+    """Fill an empty District from a recovered file.
+
+    The source (xlsx or csv, first sheet) may use the template names (Ctry_Name, Prov_Name, Dist_Name, PopPolio,
+    TotalNbrVacPolio, SIA Code, Round Number) or the admin names (Country, Province, District, TotalNbrVaccPolio,
+    Response, Round_Add). Records with an empty District are grouped by country, Response, round and province, and
+    matched one to one with the source records of the same group:
+      1. the same PopPolio and the same vaccinated total (confidence high);
+      2. the same PopPolio and a vaccinated total within 10% (the total was edited later), only a unique answer;
+      3. the same vaccinated total and a different PopPolio, only a unique answer (confidence high from 1,000 vaccinated);
+      4. one record and one district of the file left unmatched in the same province (confidence medium).
+    Each source record is used once. Records that do not match stay empty. The district is written in capitals,
+    like the rest of the file. Returns {row index: {set, why, confidence, check}}."""
+    out = {}
+    blank = df["District"].isna() | (df["District"].astype(str).str.strip() == "")
+    if not blank.any():
+        return out
+    if str(src_path).lower().endswith((".csv", ".txt")):
+        src = pd.read_csv(src_path, dtype=str, keep_default_na=False, na_values=[""])
+    else:
+        src = pd.read_excel(src_path, dtype=str, keep_default_na=False, na_values=[""])
+
+    def pick(*names):
+        for n in names:
+            if n in src.columns:
+                return n
+        return None
+    cc, pc, dc = pick("Country", "Ctry_Name"), pick("Province", "Prov_Name"), pick("District", "Dist_Name")
+    pp, tc = pick("PopPolio"), pick("TotalNbrVaccPolio", "TotalNbrVacPolio")
+    rc, nc = pick("Response", "SIA Code"), pick("Round_Add", "Round Number")
+    if not (pc and dc and pp and tc and rc):
+        raise ValueError("the file needs Province/Prov_Name, District/Dist_Name, PopPolio, the vaccinated total and Response/SIA Code")
+    S = pd.DataFrame({"country": src[cc].map(_lkc) if cc else "", "prov": src[pc].map(_pk_prov), "dist": src[dc],
+                      "pop": pd.to_numeric(src[pp], errors="coerce"), "tot": pd.to_numeric(src[tc], errors="coerce"),
+                      "resp": src[rc].map(_rk), "rnd": src[nc].map(_s) if nc else ""})
+    S = S[S["dist"].notna() & S["resp"].astype(bool)]
+    pop = pd.to_numeric(df["PopPolio"], errors="coerce")
+    tot = pd.to_numeric(df["TotalNbrVaccPolio"], errors="coerce")
+    ck, rk_, rd, pk = df["Country"].map(_lkc), df["Response"].map(_rk), df["Round_Add"].map(_s), df["Province"].map(_pk_prov)
+    named = df[~blank]
+    used_names = {}
+    for (c_, p_), grp in named.groupby([ck[~blank], pk[~blank]]):
+        used_names[(c_, p_)] = sorted(set(grp["District"].astype(str).str.strip()))
+    for (c, r_, n_, p_), g in df[blank].groupby([ck[blank], rk_[blank], rd[blank], pk[blank]], dropna=False):
+        cand = S[(S["resp"] == r_) & (S["prov"] == p_) & ((S["country"] == c) | (S["country"] == ""))]
+        if nc:
+            cand = cand[(cand["rnd"] == n_) | (cand["rnd"] == "")]
+        if cand.empty:
+            continue
+        free_c, free_g = set(cand.index), set(g.index)
+        # stage 1: exact on PopPolio and total, only when the pair is unique on both sides
+        for stage in (1, 2, 3):
+            keyfn = {1: lambda p, t: (p, t), 2: lambda p, t: (p,), 3: lambda p, t: (t,)}[stage]
+            for i in sorted(free_g):
+                if pd.isna(pop[i]) and stage != 3:
+                    continue
+                if stage == 3 and pd.isna(tot[i]):
+                    continue
+                if stage == 1:
+                    m = [j for j in free_c if cand.at[j, "pop"] == pop[i] and cand.at[j, "tot"] == tot[i]]
+                    twin = [k for k in free_g if pop[k] == pop[i] and tot[k] == tot[i]]
+                elif stage == 2:
+                    m = [j for j in free_c if cand.at[j, "pop"] == pop[i] and
+                         (pd.notna(tot[i]) and pd.notna(cand.at[j, "tot"]) and
+                          abs(cand.at[j, "tot"] - tot[i]) <= 0.10 * max(tot[i], 1))]
+                    twin = [k for k in free_g if pop[k] == pop[i]]
+                else:
+                    m = [j for j in free_c if cand.at[j, "tot"] == tot[i]]
+                    twin = [k for k in free_g if tot[k] == tot[i]]
+                if len(m) != 1 or len(twin) != 1:
+                    continue
+                j = m[0]
+                nm = re.sub(r"\s+", " ", str(cand.at[j, "dist"]).strip()).upper()
+                why = {1: "same province, PopPolio and vaccinated total",
+                       2: "same province and PopPolio; vaccinated total %d here, %d in the file" % (tot[i], cand.at[j, "tot"]),
+                       3: "same province and vaccinated total; PopPolio %s here, %s in the file" %
+                          (int(pop[i]) if pd.notna(pop[i]) else "empty", int(cand.at[j, "pop"]) if pd.notna(cand.at[j, "pop"]) else "empty")}[stage]
+                conf = "high" if (stage == 1 or (stage == 3 and tot[i] >= 1000)) else "medium"
+                nm, al = _align_spelling(nm, used_names.get((c, p_), []))
+                if al:
+                    why += "; spelling as already used in the data (" + str(cand.at[j, "dist"]).strip() + " in the file)"
+                out[i] = {"set": {"District": nm}, "why": why, "confidence": conf, "check": ""}
+                free_c.discard(j)
+                free_g.discard(i)
+        # stage 4: one record and one source district left in the group: they belong together
+        if len(free_g) == 1 and len(free_c) == 1:
+            i, j = next(iter(free_g)), next(iter(free_c))
+            nm = re.sub(r"\s+", " ", str(cand.at[j, "dist"]).strip()).upper()
+            nm, _al = _align_spelling(nm, used_names.get((c, p_), []))
+            out[i] = {"set": {"District": nm}, "confidence": "medium", "check": "",
+                      "why": "the only record and the only district of the file left in this province (all others matched)"}
+    return out
+
+
+def _pk_prov(x):
+    """Province key for matching a recovered file: capitals, no accents, no trailing CITY, a few spellings merged."""
+    k = _qn(x)
+    k = re.sub(r"\s+CITY$", "", k)
+    return {"OROMIYA": "OROMIA", "GAMBELA": "GAMBELLA", "GAMBELLA": "GAMBELLA"}.get(k, k)
 
 
 def fill_blank_response(df, lk):
