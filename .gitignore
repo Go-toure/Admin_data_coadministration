@@ -15,3 +15,6 @@ _history/
 !geo_reference.csv
 
 logs/
+
+workspace/
+inputs/

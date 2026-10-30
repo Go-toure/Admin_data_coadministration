@@ -1,0 +1,15 @@
+{
+  "backup_repo": "../SharePoint_version_backup",
+  "workspace": "workspace",
+  "version_floor": 23,
+  "builder": "add_coadmin_columns.py",
+  "publisher": "publish_admin_data.py",
+  "lookup": "lookup.xlsx",
+  "geo": "geo_reference.csv",
+  "district_source": "inputs/AFRO-ETH_FIVE_REGIONS_R1.xlsx",
+  "build_extra_args": [],
+  "max_row_drop_pct": 2.0,
+  "scope_script_dir": "C:/Users/TOURE/Documents/REPOSITORIES/input/scope/scripts",
+  "scope_data_dir": "C:/Users/TOURE/Documents/REPOSITORIES/input/scope/data/co_administration",
+  "excel_timeout_min": 20
+}
