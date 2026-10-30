@@ -326,6 +326,27 @@ def main():
                    sum(1 for v in dfills.values() if v["confidence"] == "high"),
                    sum(1 for v in dfills.values() if v["confidence"] != "high")), flush=True)
 
+    # Addis Ababa: repeated sub-city names become "<sub-city> WOREDA NN" (rows the recovered file can identify)
+    if getattr(a, "district_source", None):
+        try:
+            rfills = rename_addis_districts(df, a.district_source)
+        except Exception as e:
+            rfills = {}
+            print("Addis Ababa rename not done (%s)" % e, flush=True)
+        for i, inf in rfills.items():
+            val = inf["set"]["District"]
+            df.at[i, "District"] = val
+            repl[(i, "District")] = val
+            repairs.append({"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "Province": df.at[i, "Province"],
+                            "District": val, "SIA_date": _dkey(df.at[i, "SIA_date"]), "Column": "District",
+                            "Found": inf["old"], "Rule": "Addis Ababa: sub-city name repeated, woreda missing", "Restored": val,
+                            "Source": "recovered file: " + inf["why"], "Confidence": inf["confidence"], "Check": ""})
+        if rfills:
+            print("Addis Ababa districts renamed to sub-city + woreda from %s: %d records (%d high confidence, %d medium)" %
+                  (os.path.basename(a.district_source), len(rfills),
+                   sum(1 for v in rfills.values() if v["confidence"] == "high"),
+                   sum(1 for v in rfills.values() if v["confidence"] != "high")), flush=True)
+
     # SIA_date written as text ("18-sept-20", "2020-09-18 00:00:00 UTC" ...) is turned into a real date
     date_log = []
     for i in df.index[df["SIA_date"].map(lambda x: isinstance(x, str))]:
@@ -1076,6 +1097,29 @@ def fill_blank_district(df, src_path):
                 out[i] = {"set": {"District": nm}, "why": why, "confidence": conf, "check": ""}
                 free_c.discard(j)
                 free_g.discard(i)
+        # stage 3b: several districts of the file have this vaccinated total, but the target implied by the record's own
+        # coverage (vaccinated / CVPolio) is within 2% of the target of only one of them
+        cvn = pd.to_numeric(df["CVPolio"], errors="coerce") if "CVPolio" in df.columns else None
+        for i in sorted(free_g):
+            if cvn is None or pd.isna(tot[i]) or pd.isna(cvn[i]) or cvn[i] <= 0:
+                continue
+            imp = tot[i] / cvn[i]
+            m = [j for j in free_c if cand.at[j, "tot"] == tot[i] and pd.notna(cand.at[j, "pop"]) and
+                 abs(cand.at[j, "pop"] - imp) <= 0.02 * imp]
+            twin = [k for k in free_g if tot[k] == tot[i]]
+            if len(m) != 1 or len(twin) != 1:
+                continue
+            j = m[0]
+            nm = re.sub(r"\s+", " ", str(cand.at[j, "dist"]).strip()).upper()
+            nm, al = _align_spelling(nm, used_names.get((c, p_), []))
+            why = ("same province and vaccinated total; PopPolio is %s here, but the target implied by the coverage "
+                   "(%d / CVPolio = %d) is the file's target of this district (%d)" %
+                   ("" if pd.isna(pop[i]) else int(pop[i]), tot[i], round(imp), cand.at[j, "pop"]))
+            if al:
+                why += "; spelling as already used in the data (" + str(cand.at[j, "dist"]).strip() + " in the file)"
+            out[i] = {"set": {"District": nm}, "why": why, "confidence": "high" if tot[i] >= 1000 else "medium", "check": ""}
+            free_c.discard(j)
+            free_g.discard(i)
         # stage 4: one record and one source district left in the group: they belong together
         if len(free_g) == 1 and len(free_c) == 1:
             i, j = next(iter(free_g)), next(iter(free_c))
@@ -1083,6 +1127,122 @@ def fill_blank_district(df, src_path):
             nm, _al = _align_spelling(nm, used_names.get((c, p_), []))
             out[i] = {"set": {"District": nm}, "confidence": "medium", "check": "",
                       "why": "the only record and the only district of the file left in this province (all others matched)"}
+            free_c.discard(j)
+            free_g.discard(i)
+        # stage 5: records still unmatched and districts of the file still unused: a district is given to a record when
+        # they share the PopPolio or the vaccinated total and the pairing is unique on both sides (confidence medium)
+        for i in sorted(free_g):
+            m = [j for j in free_c if (pd.notna(pop[i]) and cand.at[j, "pop"] == pop[i]) or
+                 (pd.notna(tot[i]) and cand.at[j, "tot"] == tot[i])]
+            if len(m) != 1:
+                continue
+            j = m[0]
+            twin = [k for k in free_g if (pd.notna(pop[k]) and cand.at[j, "pop"] == pop[k]) or
+                    (pd.notna(tot[k]) and cand.at[j, "tot"] == tot[k])]
+            if len(twin) != 1:
+                continue
+            nm = re.sub(r"\s+", " ", str(cand.at[j, "dist"]).strip()).upper()
+            nm, _al = _align_spelling(nm, used_names.get((c, p_), []))
+            same = "PopPolio" if cand.at[j, "pop"] == pop[i] else "vaccinated total"
+            out[i] = {"set": {"District": nm}, "confidence": "medium", "check": "",
+                      "why": "same province and %s; the other figure was edited later (PopPolio %s / vaccinated %s here, %s / %s in the file); "
+                             "the only district of the file left" % (same,
+                             "" if pd.isna(pop[i]) else int(pop[i]), "" if pd.isna(tot[i]) else int(tot[i]),
+                             "" if pd.isna(cand.at[j, "pop"]) else int(cand.at[j, "pop"]),
+                             "" if pd.isna(cand.at[j, "tot"]) else int(cand.at[j, "tot"]))}
+            free_c.discard(j)
+            free_g.discard(i)
+    return out
+
+
+def rename_addis_districts(df, src_path):
+    """Addis Ababa: the data holds the sub-city name on every row (NIFAS SILK LAFTO x13), the recovered file lists the
+    woredas of each sub-city. Records that look like duplicates are renamed "<SUB-CITY> WOREDA NN".
+
+    Within a campaign, round and sub-city, every record is matched to the file by PopPolio + vaccinated total, or by the
+    vaccinated total alone, only when the answer is unique on both sides. A sub-city is renamed only when ALL its records
+    are matched to different woredas (all or nothing), and the new names must not already be used. Sub-cities or rounds
+    the file does not cover are left unchanged. Returns {row index: {set, why, confidence, check, old}}."""
+    import difflib
+    out = {}
+    if str(src_path).lower().endswith((".csv", ".txt")):
+        src = pd.read_csv(src_path, dtype=str, keep_default_na=False, na_values=[""])
+    else:
+        src = pd.read_excel(src_path, dtype=str, keep_default_na=False, na_values=[""])
+    need = ["Prov_Name", "Zone_Name", "Dist_Name", "PopPolio", "SIA Code"]
+    tc = "TotalNbrVacPolio" if "TotalNbrVacPolio" in src.columns else ("TotalNbrVaccPolio" if "TotalNbrVaccPolio" in src.columns else None)
+    if tc is None or any(n not in src.columns for n in need):
+        return out
+    cc = "Ctry_Name" if "Ctry_Name" in src.columns else None
+    nc = "Round Number" if "Round Number" in src.columns else None
+
+    def sub_key(x):
+        k = re.sub(r"\b(SUB\s*CITY|SUBCITY|SC)\b", " ", str(x).upper())
+        return re.sub(r"[^A-Z]", "", k)
+
+    def woreda_no(x):
+        m = re.findall(r"\d+", str(x))
+        return int(m[-1]) if m else None
+    S = pd.DataFrame({"country": src[cc].map(_lkc) if cc else "", "prov": src["Prov_Name"].map(_pk_prov),
+                      "sub": src["Zone_Name"].map(sub_key), "no": src["Dist_Name"].map(woreda_no),
+                      "pop": pd.to_numeric(src["PopPolio"], errors="coerce"), "tot": pd.to_numeric(src[tc], errors="coerce"),
+                      "resp": src["SIA Code"].map(_rk), "rnd": src[nc].map(_s) if nc else ""})
+    S = S[(S["prov"] == "ADDIS ABABA") & S["no"].notna() & S["sub"].astype(bool)]
+    if S.empty:
+        return out
+    pop = pd.to_numeric(df["PopPolio"], errors="coerce")
+    tot = pd.to_numeric(df["TotalNbrVaccPolio"], errors="coerce")
+    ck, rk_, rd, pk = df["Country"].map(_lkc), df["Response"].map(_rk), df["Round_Add"].map(_s), df["Province"].map(_pk_prov)
+    dist = df["District"].astype(str).str.strip()
+    is_a = (pk == "ADDIS ABABA") & df["District"].notna() & (dist != "")
+
+    def base_of(d):
+        b = re.sub(r"[\s\-_]*(WOREDA|WEREDA|WORHO)?[\s\-_]*\d+$", "", str(d).upper().strip())
+        return re.sub(r"\s+", " ", b).strip()
+    base = dist.map(base_of)
+    used_all = set(zip(ck[is_a], rk_[is_a], rd[is_a], dist[is_a].str.upper()))
+    for (c, r_, n_), grp in df[is_a].groupby([ck[is_a], rk_[is_a], rd[is_a]]):
+        cand = S[(S["resp"] == r_) & ((S["country"] == c) | (S["country"] == ""))]
+        if nc:
+            cand = cand[(cand["rnd"] == n_) | (cand["rnd"] == "")]
+        if cand.empty:
+            continue
+        for b, gb in grp.groupby(base[grp.index]):
+            sk = re.sub(r"[^A-Z]", "", b)
+            keys = sorted(cand["sub"].unique())
+            hit = [k for k in keys if k == sk or difflib.SequenceMatcher(None, k, sk).ratio() >= 0.88]
+            if len(hit) != 1:
+                continue
+            cs = cand[cand["sub"] == hit[0]]
+            free_c, got = set(cs.index), {}
+            for i in gb.index:
+                if pd.isna(tot[i]):
+                    continue
+                m = [j for j in free_c if cs.at[j, "tot"] == tot[i] and pd.notna(pop[i]) and cs.at[j, "pop"] == pop[i]]
+                twin = [k for k in gb.index if pop[k] == pop[i] and tot[k] == tot[i]]
+                how = "PopPolio and vaccinated total"
+                if len(m) != 1 or len(twin) != 1:
+                    m = [j for j in free_c if cs.at[j, "tot"] == tot[i]]
+                    twin = [k for k in gb.index if tot[k] == tot[i]]
+                    how = "vaccinated total"
+                if len(m) == 1 and len(twin) == 1:
+                    got[i] = (m[0], how)
+            # all or nothing: every record matched, to different woredas
+            if len(got) != len(gb) or len({j for j, _h in got.values()}) != len(got):
+                continue
+            news = {i: "%s WOREDA %02d" % (b, int(cs.at[j, "no"])) for i, (j, _h) in got.items()}
+            if len(set(news.values())) != len(news):
+                continue
+            # a new name must not collide with a name used by another record of the same campaign and round
+            if any((c, r_, nm) in used_all and (dist[i].upper() != nm) for i, nm in news.items()):
+                continue
+            for i, nm in news.items():
+                j, how = got[i]
+                if nm == dist[i].upper():
+                    continue
+                out[i] = {"set": {"District": nm}, "confidence": "high" if (how.startswith("PopPolio") or tot[i] >= 1000) else "medium",
+                          "check": "", "old": df.at[i, "District"],
+                          "why": "woreda %d of %s in the recovered file (same %s)" % (int(cs.at[j, "no"]), b, how)}
     return out
 
 
