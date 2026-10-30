@@ -157,6 +157,15 @@ What the lookup cannot fix stays an Error ("Missing key field") for the countrie
 (before the lookup starts), Ethiopia records with a blank District (no other identifier in the record or in any backup), and the
 few records with a blank Province that has no match.
 
+### Response written differently from the lookup (`--align-response-names`)
+
+Off by default. `--align-response-names MALAWI` (one or more countries; without a country it applies to all) renames a `Response`
+that is not a name of the lookup to the lookup's exact name when, in the same country, a lookup round starts within 7 days of the
+`SIA_date` and exactly one lookup name starts with the Response (or is at least 90% alike), for example `MLW-2026-02-1_nOPV` ->
+`MLW-2026-02-1_nOPV-NID`. Every rename is in the audit sheet `Repairs` (`Found` = old name, `Source` starts with `lookup:`).
+It is opt-in because for some countries the lookup name differs in more than spelling (another vaccine, another month): review
+the candidates first (workbook `Response_names_vs_lookup.xlsx`).
+
 ## Filling an empty District from a recovered file
 
 `--district-source FILE` fills empty `District` values from a recovered or original file (a country template with
@@ -243,7 +252,7 @@ New columns, placed right before `Response`:
 
 `Vaccine_type` and `TotalNbrVaccPolio` move here from their old position. `CVPolio` (as stored in the source,
 never recalculated) follows `TotalNbrVaccPolio` so the vaccinated total and its coverage sit together; the
-dashboards read it by name. A vaccine that was not used has a total of 0 (not a blank) and no coverage.
+dashboards read it by name. A vaccine that was not used has an empty total and an empty coverage (not 0).
 `check_dp` is rewritten as a live formula (Country, Province, District, SIA_date, TotalNbrVaccPolio, Response)
 on the new column letters. The file is written with Sheet1 only; open it in Excel and save once so the
 `check_dp` values are stored before it is uploaded.
