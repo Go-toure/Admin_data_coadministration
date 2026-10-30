@@ -17,7 +17,7 @@ Nothing else needs to be run from other directories. The only other folder invol
 | `backup` | Saves the live SharePoint file locally (every real version is kept) and lists the versions. | SharePoint cannot be read |
 | `build` | Backs up the live file, then builds the next version **starting from that live file**, so everyone's latest edits are kept. Writes `workspace/runs/vNN/`. | the builder fails |
 | `check` | Compares the build with the file it started from: columns, rows, empty key fields, Response of another country, duplicates, errors, cells changed. Writes `check_report.md`. | columns lost, > 2% rows lost, more empty key fields, more wrong-country Responses |
-| `excel` | Opens the build in desktop Excel, recalculates, saves, closes (this stores the `check_dp` values). `excel --verify-only` if you saved it yourself. | `check_dp` still empty |
+| `excel` | Stores the `check_dp` values in the build (the formulas stay): written straight into the file, no Excel needed, about 15 seconds. `excel --use-excel` lets desktop Excel do it instead (falls back to the direct method if Excel fails, for example when Office is not activated). `excel --verify-only` if you saved it yourself. | `check_dp` still empty |
 | `publish` | Re-reads SharePoint, confirms it is still the file the build started from, then runs the publish script (replaces the file, deletes the SharePoint versions, backs up again). Asks you to type YES. | not checked, not saved in Excel, **the live file changed since the build** |
 | `all` | backup -> build -> check -> excel -> publish | any step above |
 | `runs` | One line per build | |

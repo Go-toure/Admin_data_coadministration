@@ -6,7 +6,7 @@ admin.py - one command for the whole AFRO admin data cycle.
     python admin.py backup            save the live SharePoint file locally (and list the versions)
     python admin.py build             build the next version from the LIVE file (backup first)
     python admin.py check             verify the newest build against the file it started from
-    python admin.py excel             open the build in Excel, recalculate, save (stores the check_dp values)
+    python admin.py excel             store the check_dp values in the build (written directly; --use-excel to use Excel)
     python admin.py publish           replace the file on SharePoint (all gates must be green)
     python admin.py all               backup -> build -> check -> excel -> publish
     python admin.py runs              list the builds
@@ -55,6 +55,7 @@ DEFAULTS = {
     "scope_script_dir": "",
     "scope_data_dir": "",
     "excel_timeout_min": 30,
+    "excel_method": "python",                 # "python": values written into the file, no Excel needed; "excel": desktop Excel
     "excel_visible": True,                    # show the Excel window while it saves (any pop-up can then be answered)
 }
 EXPECTED_CHANGE = {"Response", "Round_Add", "District", "Province", "Country", "SIA_date", "Vaccine_type", "PopPolio",
@@ -593,6 +594,80 @@ exit $code
 '''
 
 
+def store_check_dp_values(path):
+    """Store the value of every check_dp formula next to the formula, without Excel.
+
+    The builder writes check_dp as a live formula (Country & Province & District & SIA_date & total & Response) with no
+    stored result. Excel normally stores it when the file is saved once. This does the same thing directly in the file:
+    the formula stays, its result is written beside it (dates as Excel's serial number, numbers in General format),
+    so every reader (Excel, R, pandas) sees the value. Returns the number of cells filled."""
+    import zipfile
+    from xml.sax.saxutils import escape, unescape
+    path = Path(path)
+    tmp = path.with_name(path.stem + ".tmp_values.xlsx")
+    with zipfile.ZipFile(path) as zin:
+        sheets = sorted(n for n in zin.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
+        if not sheets:
+            raise ValueError("no worksheet found in the file")
+        name = sheets[0]
+        xml = zin.read(name).decode("utf-8")
+        if "<sharedStrings" in xml or 't="s"' in xml:
+            raise ValueError("this file uses shared strings: open it in Excel and save it instead")
+        cell_re = re.compile(r'<c r="([A-Z]+)(\d+)"([^>]*?)(?:/>|>(.*?)</c>)', re.S)
+        row_re = re.compile(r"(<row [^>]*>)(.*?)(</row>)", re.S)
+        n_done = 0
+
+        def text_of(attrs, inner):
+            if not inner:
+                return ""
+            if "inlineStr" in attrs:
+                m = re.search(r"<t[^>]*>(.*?)</t>", inner, re.S)
+                return unescape(m.group(1)) if m else ""
+            m = re.search(r"<v>(.*?)</v>", inner, re.S)
+            if not m or m.group(1) == "":
+                return ""
+            v = unescape(m.group(1))
+            if 't="b"' in attrs:
+                return "TRUE" if v in ("1", "true") else "FALSE"
+            if 't="str"' in attrs or 't="e"' in attrs:
+                return v
+            try:
+                x = float(v)
+                return str(int(x)) if x == int(x) and abs(x) < 1e15 else ("%.15g" % x)
+            except ValueError:
+                return v
+
+        def do_row(m):
+            nonlocal n_done
+            head, body, tail = m.group(1), m.group(2), m.group(3)
+            if "<f>" not in body:
+                return m.group(0)
+            cells = {}
+            for c in cell_re.finditer(body):
+                cells[c.group(1)] = text_of(c.group(3), c.group(4))
+
+            def fill(c):
+                nonlocal n_done
+                inner = c.group(4) or ""
+                f = re.match(r"<f>([^<]*)</f><v\s*/?>(?:</v>)?$", inner)
+                if not f:
+                    return c.group(0)
+                refs = re.findall(r"([A-Z]+)\d+", unescape(f.group(1)))
+                val = "".join(cells.get(r, "") for r in refs)
+                attrs = re.sub(r'\s+t="[^"]*"', "", c.group(3))
+                n_done += 1
+                return '<c r="%s%s"%s t="str"><f>%s</f><v>%s</v></c>' % (c.group(1), c.group(2), attrs, f.group(1), escape(val))
+            return head + cell_re.sub(fill, body) + tail
+        new_xml = row_re.sub(do_row, xml)
+        if n_done == 0:
+            raise ValueError("no formula without a stored value was found")
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                zout.writestr(item, new_xml.encode("utf-8") if item.filename == name else zin.read(item.filename))
+    os.replace(tmp, path)
+    return n_done
+
+
 def checkdp_filled(path):
     """True when the check_dp column holds stored values (not empty) at the top, the middle and the end."""
     import openpyxl
@@ -615,43 +690,70 @@ def checkdp_filled(path):
 
 
 def cmd_excel(a):
+    """Store the check_dp values. Default: written straight into the file, formula kept (no Excel needed).
+    --use-excel: desktop Excel opens, calculates and saves it (falls back to the direct method if Excel fails).
+    --verify-only: you saved the file yourself; only check the values."""
     n, rd, m = latest_run(unpublished=True)
     if not n:
         die("no build waiting: run 'build' first.")
     if not m.get("check", {}).get("ok"):
         die("v%d has not passed 'check' yet." % n)
     f = Path(m["build"]["file"])
+    method = "manual"
+
+    def verify():
+        try:
+            return checkdp_filled(f)
+        except Exception as e:
+            return False, "the file could not be read (%s): close any Excel window that still has it open" % type(e).__name__
+
+    def python_store():
+        log("Storing the check_dp values in the file (the formulas stay) ...")
+        try:
+            k = store_check_dp_values(f)
+        except Exception as e:
+            die("could not store the values: %s. Open the file in Excel, save once and run 'excel --verify-only'." % e)
+        log("check_dp: %d values stored." % k)
+
     if not a.verify_only:
-        if os.name != "nt":
-            die("the Excel step needs Windows with Excel. Open %s in Excel, save it once, then run: "
-                "python admin.py excel --verify-only" % f)
-        ps = rd / "_save_in_excel.ps1"
-        ps.write_text(PS_SAVE, encoding="utf-8")
-        log("Opening %s in Excel, recalculating and saving (a minute or two) ..." % f.name)
-        try:
-            r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps), str(f),
-                                "1" if S.get("excel_visible", True) else "0"],
-                               capture_output=True, text=True, errors="replace", timeout=int(S["excel_timeout_min"]) * 60)
-        except subprocess.TimeoutExpired:
-            die("Excel did not finish in %s minutes. Close any Excel window that is still open and try again, or open "
-                "the file yourself, save it and run 'excel --verify-only'." % S["excel_timeout_min"])
-        if r.returncode:
-            # the save may still have worked (Excel is sometimes slow to quit): the stored values decide
-            log("Excel reported a problem: %s" % (r.stdout.strip() or r.stderr.strip())[-300:].replace("\n", " | "))
-            log("Checking whether the file was saved anyway ...")
-        try:
-            ps.unlink()
-        except Exception:
-            pass
-    try:
-        ok, why = checkdp_filled(f)
-    except Exception as e:
-        ok, why = False, "the file could not be read (%s): close any Excel window that still has it open" % type(e).__name__
-    m["excel"] = {"ok": ok, "at": now(), "method": "manual" if a.verify_only else "excel automation", "detail": why}
+        want_excel = a.use_excel or str(S.get("excel_method", "python")).lower() == "excel"
+        if not want_excel:
+            ok, why = verify()
+            if not ok:
+                python_store()
+            method = "values stored by python (formulas kept)"
+        else:
+            if os.name != "nt":
+                die("the Excel method needs Windows with Excel.")
+            ps = rd / "_save_in_excel.ps1"
+            ps.write_text(PS_SAVE, encoding="utf-8")
+            log("Opening %s in Excel, recalculating and saving (a minute or two) ..." % f.name)
+            try:
+                r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps), str(f),
+                                    "1" if S.get("excel_visible", True) else "0"],
+                                   capture_output=True, text=True, errors="replace",
+                                   timeout=int(S["excel_timeout_min"]) * 60)
+                if r.returncode:
+                    log("Excel reported a problem: %s" % (r.stdout.strip() or r.stderr.strip())[-300:].replace("\n", " | "))
+            except subprocess.TimeoutExpired:
+                log("Excel did not finish in %s minutes." % S["excel_timeout_min"])
+            try:
+                ps.unlink()
+            except Exception:
+                pass
+            ok, why = verify()
+            method = "excel automation"
+            if not ok:
+                log("Excel did not store the values (a copy of Office that is not activated opens files read-only). "
+                    "Storing them directly instead.")
+                python_store()
+                method = "values stored by python (formulas kept) after Excel failed"
+    ok, why = verify()
+    m["excel"] = {"ok": ok, "at": now(), "method": method, "detail": why}
     save_manifest(rd, m)
     if not ok:
         die("the check_dp values are still empty (%s). Open the file in Excel, save it, and run 'excel --verify-only'." % why)
-    log("Excel step OK: the check_dp values are stored (%s)." % why)
+    log("check_dp OK: %s (%s)." % (why, method))
     log("Next: python admin.py publish")
 
 
@@ -1056,6 +1158,7 @@ def main():
     s.add_argument("extra", nargs="*", help="extra options for the builder, after --")
     s = sub.add_parser("check"); s.add_argument("--run", type=int, help="version number (default: the newest)")
     s = sub.add_parser("excel"); s.add_argument("--verify-only", action="store_true", help="you saved the file in Excel yourself")
+    s.add_argument("--use-excel", action="store_true", help="let desktop Excel store the values (default: written directly, no Excel)")
     s = sub.add_parser("publish"); s.add_argument("extra", nargs="*", help="extra options for the publish script, after --")
     s = sub.add_parser("all"); s.add_argument("extra", nargs="*")
     s = sub.add_parser("commit"); s.add_argument("-m", "--message", required=True); s.add_argument("--no-push", action="store_true")
