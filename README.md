@@ -157,14 +157,14 @@ What the lookup cannot fix stays an Error ("Missing key field") for the countrie
 (before the lookup starts), Ethiopia records with a blank District (no other identifier in the record or in any backup), and the
 few records with a blank Province that has no match.
 
-### Response written differently from the lookup (`--align-response-names`)
+### Response written differently from the lookup (default; `--no-align-response-names` to skip)
 
-Off by default. `--align-response-names MALAWI` (one or more countries; without a country it applies to all) renames a `Response`
-that is not a name of the lookup to the lookup's exact name when, in the same country, a lookup round starts within 7 days of the
-`SIA_date` and exactly one lookup name starts with the Response (or is at least 90% alike), for example `MLW-2026-02-1_nOPV` ->
-`MLW-2026-02-1_nOPV-NID`. Every rename is in the audit sheet `Repairs` (`Found` = old name, `Source` starts with `lookup:`).
-It is opt-in because for some countries the lookup name differs in more than spelling (another vaccine, another month): review
-the candidates first (workbook `Response_names_vs_lookup.xlsx`).
+A `Response` that is not a name of the lookup is renamed to the lookup's exact name when, in the same country, a lookup round starts
+within 7 days of the `SIA_date` and exactly one lookup name starts with the Response (or is at least 90% alike), for example
+`MLW-2026-02-1_nOPV` -> `MLW-2026-02-1_nOPV-NID` or `ETH-2024-11-nOPV2` -> `ETH-2024-11-nOPV2_sNID`. Every rename is in the audit
+sheet `Repairs` (`Found` = old name, `Source` starts with `lookup:`). `--align-response-names MALAWI` restricts it to the countries
+given. On the 26 Oct 2026 data it renamed about 3,100 records of 15 Response names in 10 countries; the vaccines of the data and of the
+lookup agree in every case.
 
 ## Filling an empty District from a recovered file
 
