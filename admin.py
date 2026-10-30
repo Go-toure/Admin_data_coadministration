@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -600,7 +601,8 @@ def store_check_dp_values(path):
     The builder writes check_dp as a live formula (Country & Province & District & SIA_date & total & Response) with no
     stored result. Excel normally stores it when the file is saved once. This does the same thing directly in the file:
     the formula stays, its result is written beside it (dates as Excel's serial number, numbers in General format),
-    so every reader (Excel, R, pandas) sees the value. Returns the number of cells filled."""
+    so every reader (Excel, R, pandas) sees the value. Returns (number of cells filled, the file written: the same
+    path, or '<name>_stored.xlsx' when Windows keeps the original locked)."""
     import zipfile
     from xml.sax.saxutils import escape, unescape
     path = Path(path)
@@ -664,8 +666,21 @@ def store_check_dp_values(path):
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
                 zout.writestr(item, new_xml.encode("utf-8") if item.filename == name else zin.read(item.filename))
-    os.replace(tmp, path)
-    return n_done
+    for _ in range(4):                       # the target can be held for a moment by Excel, a preview pane, a sync tool
+        try:
+            os.replace(tmp, path)
+            return n_done, path
+        except PermissionError:
+            time.sleep(2)
+    # still locked: keep the result under a new name next to it (the manifest then points to it)
+    alt = path.with_name(path.stem + "_stored.xlsx")
+    if alt.exists():
+        try:
+            alt.unlink()
+        except PermissionError:
+            alt = path.with_name(path.stem + "_stored_%s.xlsx" % dt.datetime.now().strftime("%H%M%S"))
+    os.replace(tmp, alt)
+    return n_done, alt
 
 
 def checkdp_filled(path):
@@ -699,21 +714,26 @@ def cmd_excel(a):
     if not m.get("check", {}).get("ok"):
         die("v%d has not passed 'check' yet." % n)
     f = Path(m["build"]["file"])
+    f_holder = [f]
     method = "manual"
 
     def verify():
         try:
-            return checkdp_filled(f)
+            return checkdp_filled(f_holder[0])
         except Exception as e:
             return False, "the file could not be read (%s): close any Excel window that still has it open" % type(e).__name__
 
     def python_store():
         log("Storing the check_dp values in the file (the formulas stay) ...")
         try:
-            k = store_check_dp_values(f)
+            k, newf = store_check_dp_values(f)
         except Exception as e:
             die("could not store the values: %s. Open the file in Excel, save once and run 'excel --verify-only'." % e)
         log("check_dp: %d values stored." % k)
+        if Path(newf) != f:
+            log("The original file is locked by another program, so the result is saved as %s." % Path(newf).name)
+            m["build"]["file"] = str(newf)
+            f_holder[0] = Path(newf)
 
     if not a.verify_only:
         want_excel = a.use_excel or str(S.get("excel_method", "python")).lower() == "excel"
