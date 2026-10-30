@@ -130,6 +130,11 @@ def main():
     ap.add_argument("--keep-copied-rounds", action="store_true",
                     help="do not remove the rounds that the lookup does not have and that copy another round of the "
                          "same Response and date (they are removed by default and listed in the audit)")
+    ap.add_argument("--align-response-names", nargs="*", metavar="COUNTRY", default=None,
+                    help="rename a Response to the exact name of the lookup when it is clearly the same campaign (same country, "
+                         "start date within 7 days, the lookup name starts with the Response); give the countries to apply it to "
+                         "(e.g. --align-response-names MALAWI) or none for all countries. Off by default: the list of candidate "
+                         "renames should be reviewed first")
     ap.add_argument("--district-source", metavar="FILE",
                     help="a recovered or original file (e.g. a country template with Prov_Name / Dist_Name, or an older admin file) "
                          "used to fill empty District values: records of the same Response and round are matched on province "
@@ -304,6 +309,22 @@ def main():
             print("empty Response filled from the lookup: %d records (%d exact, %d within a few days)" %
                   (len(fills), sum(1 for v in fills.values() if v["confidence"] == "high"),
                    sum(1 for v in fills.values() if v["confidence"] != "high")), flush=True)
+
+    # a Response that is not a name of the lookup but clearly is the same campaign gets the lookup's name
+    if lk is not None and a.align_response_names is not None:
+        afills = align_response_names(df, lk, a.align_response_names)
+        for i, inf in afills.items():
+            val = inf["set"]["Response"]
+            old_ = df.at[i, "Response"]
+            df.at[i, "Response"] = val
+            repl[(i, "Response")] = val
+            repairs.append({"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "Province": df.at[i, "Province"],
+                            "District": df.at[i, "District"], "SIA_date": _dkey(df.at[i, "SIA_date"]), "Column": "Response",
+                            "Found": old_, "Rule": "Response is not a name of the lookup", "Restored": val,
+                            "Source": "lookup: " + inf["why"], "Confidence": inf["confidence"], "Check": ""})
+        if afills:
+            print("Response renamed to the lookup's name: %d records (%s)" %
+                  (len(afills), ", ".join(sorted({v["set"]["Response"] for v in afills.values()}))), flush=True)
 
     # an empty District is filled from a recovered file (only when its figures match the record exactly or nearly)
     if getattr(a, "district_source", None):
@@ -623,10 +644,10 @@ def main():
             ws_new.column_dimensions[get_column_letter(j)].width = w
     ws_new.freeze_panes = ws.freeze_panes
 
-    # a vaccine that was not used has a total of 0, not a blank (the convention now used in the SharePoint file)
+    # a vaccine that was not used has an empty total (not 0)
     vals = {
-        "Tot_Vacc_nOPV2": out_tn.fillna(0), "CV_nOPV2": out_cvn,
-        "Total_Vacc_bOPV": out_tb.fillna(0), "CV_bOPV": out_cvb,
+        "Tot_Vacc_nOPV2": out_tn, "CV_nOPV2": out_cvn,
+        "Total_Vacc_bOPV": out_tb, "CV_bOPV": out_cvb,
         "Vaccine_type": out_vt, "TotalNbrVaccPolio": out_total,
     }
     total_style_src = tot_idx  # column index in original row tuples
@@ -1251,6 +1272,48 @@ def _pk_prov(x):
     k = _qn(x)
     k = re.sub(r"\s+CITY$", "", k)
     return {"OROMIYA": "OROMIA", "GAMBELA": "GAMBELLA", "GAMBELLA": "GAMBELLA"}.get(k, k)
+
+
+def align_response_names(df, lk, countries=None):
+    """Rename a Response to the exact name the lookup uses for the same campaign.
+
+    A (country, Response, SIA_date) group is renamed when the Response is not a name of the lookup, and the lookup has,
+    for the same country, a round starting within 7 days of the date whose name starts with the Response (or is at least
+    90% alike) - only when that is one single lookup name. Example: MLW-2026-02-1_nOPV -> MLW-2026-02-1_nOPV-NID.
+    Only for the countries given. Returns {row index: {set, why, confidence, check}}."""
+    import difflib
+    out = {}
+    names = set(lk["_rk"])
+    ck = df["Country"].map(_lkc)
+    rk_ = df["Response"].map(_rk)
+    dk = df["SIA_date"].map(_dkey)
+    ok = df["Response"].notna() & (rk_ != "") & ~rk_.isin(names) & (dk != "")
+    if countries:
+        ok &= ck.isin({_lkc(x) for x in countries})
+    if not ok.any():
+        return out
+    for (c, r_, d_), g in df[ok].groupby([ck[ok], rk_[ok], dk[ok]]):
+        e = lk[lk["_ck"] == c]
+        if e.empty:
+            continue
+        try:
+            days = (pd.to_datetime(e["_d"], errors="coerce") - pd.Timestamp(d_)).abs().dt.days
+        except Exception:
+            continue
+        e = e[days <= 7]
+        if e.empty:
+            continue
+        e = e[e["_rk"].map(lambda x: x.startswith(r_) or difflib.SequenceMatcher(None, r_, x).ratio() >= 0.90).astype(bool)]
+        if e.empty:
+            continue
+        nm = sorted(set(e["OBR Name"].astype(str)))
+        if len(nm) != 1:
+            continue
+        for i in g.index:
+            out[i] = {"set": {"Response": nm[0]}, "confidence": "high", "check": "",
+                      "why": "name used by the lookup for this round (%s, round starting %s)" %
+                             (nm[0], str(e.iloc[0]["Round Start Date"])[:10])}
+    return out
 
 
 def fill_blank_response(df, lk):
@@ -2772,9 +2835,9 @@ add("EpidNumber", "campaign", "EPID number of the outbreak case or environmental
 add("DateOfOnset", "campaign", "Date of onset of the case that triggered the response.", "Stored in mixed formats (dates and Excel serial numbers saved as text, for example 45828).")
 add("Year", "campaign", "Year of the campaign (year of SIA_date).")
 add("Round_Add", "campaign", "Campaign round: Rnd0 to Rnd6.", "Round of the response, not of the calendar year.")
-add("Tot_Vacc_nOPV2", "coadmin", "Children vaccinated with nOPV2 in the district and round.", "0 when no nOPV2 was given. Combined records: same value as TotalNbrVaccPolio unless the country gave a separate figure.")
+add("Tot_Vacc_nOPV2", "coadmin", "Children vaccinated with nOPV2 in the district and round.", "Empty when no nOPV2 was given. Combined records: same value as TotalNbrVaccPolio unless the country gave a separate figure.")
 add("CV_nOPV2", "coadmin", "nOPV2 coverage = Tot_Vacc_nOPV2 / PopPolio (ratio: 1.00 = 100%).", "Above 1.5 means the reported population is probably too low. Such records are listed for the countries.")
-add("Total_Vacc_bOPV", "coadmin", "Children vaccinated with bOPV in the district and round.", "0 when no bOPV was given. Combined records: same value as TotalNbrVaccPolio unless the country gave a separate figure.")
+add("Total_Vacc_bOPV", "coadmin", "Children vaccinated with bOPV in the district and round.", "Empty when no bOPV was given. Combined records: same value as TotalNbrVaccPolio unless the country gave a separate figure.")
 add("CV_bOPV", "coadmin", "bOPV coverage = Total_Vacc_bOPV / PopPolio (ratio).", "Same caution as CV_nOPV2.")
 add("Vaccine_type", "coadmin", "Vaccine used: nOPV2, bOPV, mOPV2, MR, or 'nOPV2 & bOPV' when both were given in the same campaign (co-administration).", "See sheet Vaccine_type. Placed just before Response.")
 add("Response", "campaign", "Name of the response / campaign, e.g. GUI-2025-01-NID_bOPV-nOPV (country code, year, number, type, vaccine).", "Empty for about 1,900 older records. A campaign is co-administered when the name contains both 'nOPV' and 'bOPV', or when a district has an nOPV2 and a bOPV record for the same Response, year and round (some DRC and South Sudan responses do not name both vaccines).")
