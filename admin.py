@@ -807,7 +807,10 @@ def cmd_publish(a):
             % (n, row["version"], row["modified_by"], (" New columns: %s." % ", ".join(extra)) if extra else ""))
     log("The live file is the one v%d started from (backup version %s)." % (n, row["version"]))
     pub = P(S["publisher"])
-    cmd = [sys.executable, pub, "--file", f, "--backup-repo", BACKUP_REPO] + list(a.extra or [])
+    cmd = [sys.executable, pub, "--file", f, "--backup-repo", BACKUP_REPO]
+    if not getattr(a, "ask", False) and "--yes" not in (a.extra or []):
+        cmd.append("--yes")        # every gate has passed: go ahead without typing YES (publish --ask to be asked)
+    cmd += list(a.extra or [])
     rc, _ = run_cmd(cmd, cwd=HERE, tee=rd / "publish.log")
     if rc:
         die("the publish script stopped (exit %s). Nothing is marked as published; see %s." % (rc, rd / "publish.log"))
@@ -831,7 +834,7 @@ def cmd_all(a):
     cmd_check(c)
     e = X(); e.verify_only = False
     cmd_excel(e)
-    p = X(); p.extra = []
+    p = X(); p.extra = []; p.ask = False
     cmd_publish(p)
 
 
@@ -1179,7 +1182,8 @@ def main():
     s = sub.add_parser("check"); s.add_argument("--run", type=int, help="version number (default: the newest)")
     s = sub.add_parser("excel"); s.add_argument("--verify-only", action="store_true", help="you saved the file in Excel yourself")
     s.add_argument("--use-excel", action="store_true", help="let desktop Excel store the values (default: written directly, no Excel)")
-    s = sub.add_parser("publish"); s.add_argument("extra", nargs="*", help="extra options for the publish script, after --")
+    s = sub.add_parser("publish"); s.add_argument("--ask", action="store_true", help="ask for YES before replacing the file")
+    s.add_argument("extra", nargs="*", help="extra options for the publish script, after --")
     s = sub.add_parser("all"); s.add_argument("extra", nargs="*")
     s = sub.add_parser("commit"); s.add_argument("-m", "--message", required=True); s.add_argument("--no-push", action="store_true")
     s.add_argument("files", nargs="*")
