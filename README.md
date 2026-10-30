@@ -166,13 +166,32 @@ country, Response, round and province and matched one to one with the records of
 1. same `PopPolio` and same vaccinated total (confidence high);
 2. same `PopPolio` and a vaccinated total within 10%, only if unique (confidence medium);
 3. same vaccinated total and a different `PopPolio`, only if unique (high from 1,000 vaccinated, otherwise medium);
-4. one record and one district of the file left unmatched in the same province (medium).
+3b. several districts of the file have this vaccinated total, but the target implied by the record's own coverage
+   (vaccinated / `CVPolio`) is within 2% of the target of only one of them (high from 1,000 vaccinated);
+4. one record and one district of the file left unmatched in the same province (medium);
+5. records and districts still unmatched: a district is given to a record when they share the `PopPolio` or the vaccinated
+   total and the pairing is unique on both sides (medium; the other figure was edited after the file was made).
 
 Each record of the file is used once; what does not match stays empty. The district written is the file's `Dist_Name` (the woreda,
 which is what the data uses as District for Ethiopia; `Zone_Name` is the level above), in capitals, and in the spelling the data
 already uses for that district when there is one (the same name once WORHO / TOWN / CITY are ignored, or at least 90% alike).
 Every fill is in the audit sheet `Repairs` (`Source` starts with `recovered file:`). Example: the Ethiopia file `AFRO-ETH FIVE REGIONS R1`
-filled 279 of the 282 records of `ETH-2024-08-nOPV2` round 1.
+filled all 282 records of `ETH-2024-08-nOPV2` round 1.
+
+### Addis Ababa: sub-city + woreda
+
+In Addis Ababa the data holds the sub-city name on every row (`NIFAS SILK LAFTO` x13) while the file lists the woredas of each
+sub-city (`Zone_Name` = sub-city, `Dist_Name` = woreda). These rows looked like duplicates, so with `--district-source` they are
+renamed `<SUB-CITY> WOREDA NN` (the format the 2026 campaign already uses, e.g. `ARADA WOREDA 01`):
+
+- within a campaign, round and sub-city every record is matched to a woreda of the file by `PopPolio` + vaccinated total, or by the
+  vaccinated total alone, only when the answer is unique on both sides;
+- a sub-city is renamed **only if all its records are matched, to different woredas** (all or nothing), and a new name must not
+  already be used in the same campaign and round;
+- sub-cities or rounds that the file does not cover are left as they are (the second round and Addis Ketema, Gulele, Kirkos and
+  Lideta of round 1 have no source in the Ethiopia file, so their repeated names remain until a file for them is provided).
+
+Every rename is in the audit sheet `Repairs` (`Found` = old name, `Source` = the woreda of the file).
 
 ## Publishing to SharePoint (`publish_admin_data.py`)
 
