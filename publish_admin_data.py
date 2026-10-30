@@ -19,12 +19,17 @@ What it does, in this order (nothing is written to SharePoint until every check 
      full extra copy; the local backup keeps the history instead) and, when permitted, empties the deleted copies
      from the site recycle bin so the space is really freed.
   8. Runs the local backup again so the new live file is recorded as the newest local version.
+  9. The data dictionary: the AFRO_admin_data_dictionary.xlsx that goes with the file is checked and pushed INTO THE
+     EXISTING SharePoint dictionary the same way (local copy of the old one kept, upload verified, version history
+     removed). A problem with the dictionary never undoes the admin data that is already published; the script
+     then ends with exit code 3 and tells you so. --no-dictionary skips it, --dictionary-only pushes only that.
 
 Usage (from this folder):
     python publish_admin_data.py                 # latest version, asks for confirmation
     python publish_admin_data.py --dry-run       # all checks, nothing written anywhere
     python publish_admin_data.py --file path\\to\\AFRO_admin_data_v18.xlsx
     python publish_admin_data.py --yes           # no question (all checks still apply)
+    python publish_admin_data.py --dictionary-only --dictionary AFRO_admin_data_dictionary_v24.xlsx
 
 Credentials: SHAREPOINT_TENANT_ID / SHAREPOINT_CLIENT_ID / SHAREPOINT_CLIENT_SECRET, taken from the environment or
 from a secrets.env file (--secrets FILE, config/secrets.env next to this script, or the SharePoint_version_backup /
@@ -67,6 +72,12 @@ ADMIN_SHARE_URL = ("https://worldhealthorg.sharepoint.com/:x:/r/sites/AF-pep/GIS
                    "?sourcedoc=%7BF9F9983C-76E8-4133-BF13-F69F9F320C15%7D&file=AFRO_admin_data.xlsx"
                    "&action=default&mobileredirect=true")
 BACKUP_KEY = "admin"
+DICT_NAME = "AFRO_admin_data_dictionary.xlsx"
+DICT_SHARE_URL = ("https://worldhealthorg.sharepoint.com/:x:/r/sites/AF-pep/GISWORKSPACE/_layouts/15/Doc.aspx"
+                  "?sourcedoc=%7B58972B92-BECE-4456-B465-DDFB95CCD411%7D&file=AFRO_admin_data_dictionary.xlsx"
+                  "&action=default&mobileredirect=true&wdwpf=doclib-t")
+DICT_SHEET = "Data dictionary"
+EXIT_DICT_FAILED = 3          # the admin data is published but the dictionary push failed
 
 # Where add_coadmin_columns.py leaves the upload files (the first existing folders are searched).
 DEFAULT_DIRS = [
@@ -105,7 +116,13 @@ def log(msg=""):
         pass
 
 
+class SoftStop(Exception):
+    """Raised instead of exiting while the dictionary is handled: the admin data is already published then."""
+
+
 def die(msg, code=1):
+    if STATE.get("soft"):
+        raise SoftStop(msg)
     log("")
     log("STOPPED - " + msg)
     log("Nothing was changed on SharePoint." if not STATE["uploaded"] else "The upload had already happened, see above.")
@@ -304,12 +321,19 @@ class Graph:
             return last
         raise RuntimeError(f"network error: {type(last).__name__ if last else 'unknown'}")
 
-    def live_item(self):
-        b64 = base64.b64encode(ADMIN_SHARE_URL.encode()).decode().rstrip("=").replace("/", "_").replace("+", "-")
-        r = self.request("GET", f"{GRAPH}/shares/u!{b64}/driveItem")
-        if r.status_code != 200:
-            die(f"cannot find the SharePoint file (HTTP {r.status_code}). Check the share link in the script.")
-        return r.json()
+    def live_item(self, share_url=None):
+        share_url = share_url or ADMIN_SHARE_URL
+        variants = [share_url]
+        if "&wdwpf=" in share_url:                       # the same link without the tracking parameter
+            variants.append(share_url.split("&wdwpf=")[0])
+        code = None
+        for u in variants:
+            b64 = base64.b64encode(u.encode()).decode().rstrip("=").replace("/", "_").replace("+", "-")
+            r = self.request("GET", f"{GRAPH}/shares/u!{b64}/driveItem")
+            if r.status_code == 200:
+                return r.json()
+            code = r.status_code
+        die(f"cannot find the SharePoint file (HTTP {code}). Check the share link in the script.")
 
     def download(self, item, dest):
         url = item.get("@microsoft.graph.downloadUrl")
@@ -372,17 +396,17 @@ def backup_holds(repo, sha, key=BACKUP_KEY):
 
 
 # ----------------------------------------------------------------------------------------------- upload
-def upload_replace(g, item, local, etag):
+def upload_replace(g, item, local, etag, name=TARGET_NAME, flag="uploaded"):
     """Replace the content of the existing item through an upload session. If-Match makes SharePoint refuse the
     upload when the file changed since we looked at it (HTTP 412)."""
     d, i = item["parentReference"]["driveId"], item["id"]
     r = g.request("POST", f"{GRAPH}/drives/{d}/items/{i}/createUploadSession",
                   headers={"If-Match": etag} if etag else None,
-                  json={"item": {"@microsoft.graph.conflictBehavior": "replace", "name": TARGET_NAME}})
+                  json={"item": {"@microsoft.graph.conflictBehavior": "replace", "name": name}})
     if r.status_code == 412:
         die("somebody changed the file on SharePoint after the checks. Nothing was replaced. Run the script again.")
     if r.status_code in (423, 409):
-        die("SharePoint says the file is locked (someone has AFRO_admin_data.xlsx open for editing). "
+        die(f"SharePoint says the file is locked (someone has {name} open for editing). "
             "Ask them to close it, then run the script again.")
     if r.status_code not in (200, 201):
         die(f"SharePoint refused the upload (HTTP {r.status_code}): {r.text[:200]}")
@@ -422,7 +446,7 @@ def upload_replace(g, item, local, etag):
             except Exception:
                 pass
             die(f"the upload failed (HTTP {code}). The file on SharePoint was not replaced.")
-    STATE["uploaded"] = True
+    STATE[flag] = True
 
 
 def item_now(g, item):
@@ -457,7 +481,7 @@ def delete_versions(g, item):
     return deleted, freed, failed
 
 
-def purge_recycle_bin(g, item, since_iso):
+def purge_recycle_bin(g, item, since_iso, name=TARGET_NAME):
     """Best effort: remove from the site recycle bin what the version clean-up just put there (same file name, deleted
     since the start of this run). Uses the Graph beta recycle bin API; needs a permission the app may not have."""
     try:
@@ -474,7 +498,7 @@ def purge_recycle_bin(g, item, since_iso):
             pages += 1
             body = r.json()
             for it in body.get("value", []):
-                if (it.get("name") or "").lower() == TARGET_NAME.lower() and (it.get("deletedDateTime") or "") >= since_iso:
+                if (it.get("name") or "").lower() == name.lower() and (it.get("deletedDateTime") or "") >= since_iso:
                     ids.append(it["id"])
                     freed += int(it.get("size") or 0)
             url = body.get("@odata.nextLink")
@@ -490,6 +514,220 @@ def purge_recycle_bin(g, item, since_iso):
         return removed, f"{removed} item(s), about {human(freed)}"
     except Exception as e:
         return None, f"{type(e).__name__}"
+
+
+# ----------------------------------------------------------------------------------------------- data dictionary
+DICT_VERSIONED = re.compile(r"^AFRO_admin_data_dictionary_v(\d+)\.xlsx$", re.I)
+
+
+def find_dictionary(src=None, dirs=None):
+    """The dictionary that goes with the data file: next to it (AFRO_admin_data_dictionary_vNN.xlsx for the same NN,
+    or the plain name, also in out/upload_to_sharepoint), else the newest one in the usual output folders."""
+    folders = []
+    if src is not None:
+        src = Path(src)
+        m = re.search(r"_v(\d+)", src.stem)
+        if m:
+            folders.append((src.parent, f"AFRO_admin_data_dictionary_v{m.group(1)}.xlsx"))
+        folders += [(src.parent, DICT_NAME), (src.parent / "out" / "upload_to_sharepoint", DICT_NAME)]
+        for d, n in folders:
+            if (d / n).is_file():
+                return d / n
+    found = []
+    for d in (dirs or DEFAULT_DIRS):
+        d = Path(d)
+        if d.is_dir():
+            for p in d.iterdir():
+                m = DICT_VERSIONED.match(p.name)
+                if m:
+                    found.append((int(m.group(1)), p))
+                elif p.name.lower() == DICT_NAME.lower():
+                    found.append((-1, p))
+    return max(found, key=lambda t: (t[0], t[1].stat().st_mtime))[1] if found else None
+
+
+def inspect_dictionary(path):
+    """Sheets and the documented column names of a dictionary workbook."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        info = {"sheets": list(wb.sheetnames), "columns": [], "entries": 0}
+        if DICT_SHEET in wb.sheetnames:
+            rows = wb[DICT_SHEET].iter_rows(values_only=True)
+            head = [("" if v is None else str(v)).strip() for v in next(rows, [])]
+            ci = head.index("Column") if "Column" in head else None
+            info["head"] = head
+            if ci is not None:
+                for r in rows:
+                    if len(r) > ci and r[ci] not in (None, ""):
+                        info["columns"].append(str(r[ci]).strip())
+            info["entries"] = len(info["columns"])
+        return info
+    finally:
+        wb.close()
+
+
+def content_key(path):
+    """A hash of the cell content of a workbook that does not change when SharePoint rewrites document properties."""
+    h = hashlib.sha256()
+    with zipfile.ZipFile(path) as z:
+        for n in sorted(z.namelist()):
+            if n.startswith("xl/worksheets/") or n in ("xl/sharedStrings.xml", "xl/workbook.xml"):
+                h.update(n.encode())
+                h.update(z.read(n))
+    return h.hexdigest()
+
+
+def read_json_file(p, default):
+    try:
+        return json.loads(Path(p).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def publish_dictionary(g, args, tmp, started_iso, dict_path, data_header=None, dry=False):
+    """Replace the SharePoint data dictionary with dict_path. Returns (status, message); status is one of
+    'published', 'unchanged', 'planned' (dry run), 'failed'. Never exits: the admin data may already be published."""
+    STATE["soft"] = True
+    try:
+        log("")
+        log("-" * 78)
+        log("Data dictionary" + ("  [DRY RUN]" if dry else ""))
+        dict_path = Path(dict_path)
+        if not dict_path.is_file():
+            die(f"the dictionary file {dict_path} does not exist.")
+        log(f"Dictionary file : {dict_path}  ({human(dict_path.stat().st_size)})")
+        try:
+            new = inspect_dictionary(dict_path)
+        except Exception as e:
+            die(f"the dictionary cannot be read ({type(e).__name__}). Is it a valid .xlsx?")
+        problems = []
+        if DICT_SHEET not in new["sheets"]:
+            problems.append(f"no sheet '{DICT_SHEET}' (sheets: {', '.join(new['sheets'])})")
+        elif new["entries"] < 50:
+            problems.append(f"only {new['entries']} columns documented - the dictionary looks incomplete")
+        if problems:
+            die("the dictionary did not pass the checks:\n   - " + "\n   - ".join(problems))
+        undocumented = [c for c in (data_header or []) if c and c not in new["columns"]]
+        missing_req = [c for c in REQUIRED_COLUMNS if c not in new["columns"]]
+        log(f"                  {len(new['sheets'])} sheets, {new['entries']} documented columns")
+        if undocumented:
+            log(f"   WARNING: {len(undocumented)} column(s) of the data are not in the dictionary: "
+                + ", ".join(undocumented[:12]) + (" ..." if len(undocumented) > 12 else ""))
+        elif missing_req:
+            log("   WARNING: key columns not documented: " + ", ".join(missing_req))
+
+        item = g.live_item(DICT_SHARE_URL)
+        if (item.get("name") or "").lower() != DICT_NAME.lower():
+            die(f"the file found through the dictionary share link is called '{item.get('name')}', not {DICT_NAME}.")
+        etag = item.get("eTag") or item.get("cTag")
+        mod_by = ((item.get("lastModifiedBy") or {}).get("user") or {}).get("displayName", "unknown")
+        log(f"On SharePoint   : {item['name']}, {human(item.get('size', 0))}, last modified "
+            f"{item.get('lastModifiedDateTime', '?')} by {mod_by}")
+        live_path = g.download(item, tmp / "dict_live.xlsx")
+        live_sha = sha256_file(live_path)
+        try:
+            live = inspect_dictionary(live_path)
+        except Exception:
+            live = None
+        if live:
+            log(f"Live dictionary : {len(live['sheets'])} sheets, {live['entries']} documented columns")
+            lost_sheets = [x for x in live["sheets"] if x not in new["sheets"]]
+            if lost_sheets and not args.force:
+                die("the new dictionary lacks sheets that the live one has: " + ", ".join(lost_sheets)
+                    + ". Use --force if that is intended.")
+            if live["entries"] and new["entries"] < 0.7 * live["entries"] and not args.force:
+                die(f"the new dictionary documents {new['entries']} columns, the live one {live['entries']}. "
+                    f"Use --force if that is intended.")
+            gone = [c for c in live["columns"] if c not in new["columns"]]
+            came = [c for c in new["columns"] if c not in live["columns"]]
+            if came:
+                log(f"   new in the dictionary    ({len(came)}): " + ", ".join(came[:10]) + (" ..." if len(came) > 10 else ""))
+            if gone:
+                log(f"   no longer in it          ({len(gone)}): " + ", ".join(gone[:10]) + (" ..." if len(gone) > 10 else ""))
+        same, why = same_content(live_path, dict_path)
+        bdir = Path(args.dictionary_backup_dir).expanduser()
+        state_file = bdir / "dictionary_state.json"
+        st = read_json_file(state_file, {})
+        edited = False
+        if st.get("content_key"):
+            try:
+                edited = content_key(live_path) != st["content_key"]
+            except Exception:
+                edited = False
+        if edited:
+            log(f"   NOTE: the live dictionary differs from the one this tool pushed last time ({st.get('at', '?')}): "
+                f"someone changed it on SharePoint. Its copy is kept in {bdir}.")
+        if same and not args.force:
+            log(f"The SharePoint dictionary already holds this version ({why}); it will not be uploaded again.")
+            return "unchanged", "already up to date"
+        log("Plan: " + ("(dry run) " if dry else "") + f"keep a local copy of the live dictionary in {bdir}; "
+            f"replace {DICT_NAME} on SharePoint; check it; "
+            + ("keep" if args.keep_versions else "delete") + " the SharePoint version history.")
+        if dry:
+            return "planned", "dictionary passes every check"
+
+        # local copy of what is live now (the backup tool does not track the dictionary)
+        bdir.mkdir(parents=True, exist_ok=True)
+        stamp = (item.get("lastModifiedDateTime") or "").replace("-", "").replace(":", "").replace("T", "_").rstrip("Z")
+        keep = bdir / f"AFRO_admin_data_dictionary_{stamp or 'live'}_{live_sha[:8]}.xlsx"
+        if not any(live_sha[:8] in f.name for f in bdir.glob("AFRO_admin_data_dictionary_*.xlsx")):
+            shutil.copyfile(live_path, keep)
+            if sha256_file(keep) != live_sha:
+                die("the local copy of the live dictionary could not be verified, so the upload was not started.")
+            log(f"Local copy of the live dictionary: {keep.name}")
+        else:
+            log("The live dictionary is already in the local copies.")
+
+        staged = tmp / DICT_NAME
+        shutil.copyfile(dict_path, staged)
+        log(f"Uploading {DICT_NAME} ({human(staged.stat().st_size)}) ...")
+        upload_replace(g, item, staged, etag, name=DICT_NAME, flag="dict_uploaded")
+        now = item_now(g, item)
+        got, want = int(now.get("size", -1)), staged.stat().st_size
+        if abs(got - want) > max(0.02 * want, 16384):
+            die(f"after the upload SharePoint reports {got} bytes, expected about {want}. The previous dictionary is in {bdir}.")
+        back = g.download(now if now.get("@microsoft.graph.downloadUrl") else item, tmp / "dict_check.xlsx")
+        ok_same, why = same_content(back, staged)
+        if not ok_same:
+            try:
+                x, y = inspect_dictionary(back), inspect_dictionary(staged)
+                if x["sheets"] == y["sheets"] and x["columns"] == y["columns"]:
+                    ok_same, why = True, "same sheets and documented columns (file repackaged by SharePoint)"
+            except Exception:
+                pass
+        if not ok_same:
+            die(f"the dictionary on SharePoint is not the uploaded one. The previous dictionary is in {bdir}.")
+        log(f"Upload checked: SharePoint holds the new dictionary ({why}).")
+        try:
+            write = {"content_key": content_key(back), "sha256": sha256_file(back), "at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                     "source": dict_path.name}
+            state_file.write_text(json.dumps(write, indent=1), encoding="utf-8")
+        except Exception:
+            pass
+        if args.keep_versions:
+            log("Dictionary version history kept (--keep-versions).")
+        else:
+            deleted, freed, failed = delete_versions(g, item)
+            if failed == -1:
+                log("WARNING: could not read the dictionary version history.")
+            else:
+                log(f"Dictionary version history: {deleted} old version(s) deleted"
+                    + (f", {failed} could not be deleted" if failed else ""))
+                if deleted and not args.no_purge_bin:
+                    n, info = purge_recycle_bin(g, item, started_iso, name=DICT_NAME)
+                    log("Recycle bin: " + (info if n is not None else f"not emptied ({info})"))
+        log(f"DONE. {DICT_NAME} on SharePoint is {dict_path.name}.")
+        return "published", dict_path.name
+    except SoftStop as e:
+        log("")
+        log("DICTIONARY NOT PUSHED - " + str(e))
+        if STATE.get("dict_uploaded"):
+            log("The upload had already happened, see above.")
+        else:
+            log("The dictionary on SharePoint was not changed.")
+        return "failed", str(e).splitlines()[0]
+    finally:
+        STATE["soft"] = False
 
 
 # ----------------------------------------------------------------------------------------------- main
@@ -510,13 +748,41 @@ def main():
     ap.add_argument("--max-row-drop", type=float, default=MAX_ROW_DROP,
                     help="largest accepted drop in rows versus the live file (default 0.10 = 10%%)")
     ap.add_argument("--force", action="store_true", help="accept a row drop or an identical file (use with care)")
+    ap.add_argument("--dictionary", help="the data dictionary to push (default: the one next to the data file)")
+    ap.add_argument("--no-dictionary", action="store_true", help="do not push the data dictionary")
+    ap.add_argument("--dictionary-only", action="store_true", help="push only the data dictionary, not the admin data")
+    ap.add_argument("--dictionary-backup-dir", default=str(HERE / "dictionary_backups"),
+                    help="where the previous live dictionary is kept before it is replaced")
+    ap.add_argument("--result-json", help="write what happened (admin / dictionary status) to this file")
     args = ap.parse_args()
     args.backup_repo = str(Path(args.backup_repo).expanduser().resolve())
 
     started = dt.datetime.now(dt.timezone.utc)
     started_iso = started.strftime("%Y-%m-%dT%H:%M:%SZ")
+    result = {"admin": "not run", "dictionary": "not run", "dictionary_message": "", "started": started_iso}
+
+    def save_result():
+        if args.result_json:
+            try:
+                Path(args.result_json).write_text(json.dumps(result, indent=1), encoding="utf-8")
+            except OSError:
+                pass
     log("=" * 78)
     log("Publish the admin data to SharePoint" + ("  [DRY RUN - nothing will be written]" if args.dry_run else ""))
+
+    if args.dictionary_only:
+        dp = Path(args.dictionary) if args.dictionary else find_dictionary()
+        if not dp or not dp.is_file():
+            die("no dictionary file found: give it with --dictionary FILE.")
+        g = Graph(args.secrets)
+        tmp = Path(tempfile.mkdtemp(prefix="publish_dict_"))
+        try:
+            status, msg = publish_dictionary(g, args, tmp, started_iso, dp, dry=args.dry_run)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        result.update({"admin": "skipped", "dictionary": status, "dictionary_message": msg})
+        save_result()
+        return EXIT_DICT_FAILED if status == "failed" else 0
 
     # 1. the file
     src, cands = choose_file(args)
@@ -534,6 +800,15 @@ def main():
         log("   WARNING: " + w)
     if problems:
         die("the file did not pass the checks:\n   - " + "\n   - ".join(problems))
+    dict_path = None
+    if not args.no_dictionary:
+        dict_path = Path(args.dictionary) if args.dictionary else find_dictionary(src)
+        if args.dictionary and not dict_path.is_file():
+            die(f"the dictionary file {dict_path} does not exist.")
+        if dict_path:
+            log(f"Dictionary      : {dict_path}")
+        else:
+            log("Dictionary      : none found next to the data file - it will not be pushed (give it with --dictionary FILE)")
 
     # 2. the live file
     g = Graph(args.secrets)
@@ -594,6 +869,8 @@ def main():
         log("   3. delete the SharePoint version history of the file" + (" (skipped)" if args.keep_versions else ""))
         log("   4. back up again, so the new file is the newest local version")
         if args.dry_run:
+            if dict_path:
+                publish_dictionary(g, args, tmp, started_iso, dict_path, data_header=new["header"], dry=True)
             log("")
             log("Dry run finished: the file passes every check. Run again without --dry-run to publish.")
             return 0
@@ -638,6 +915,9 @@ def main():
                 die("the file on SharePoint is not the uploaded one. Restore the previous file from the local backup.")
             log(f"Upload checked: SharePoint holds the new file ({why}).")
 
+        result["admin"] = "unchanged" if skip_upload else "published"
+        save_result()
+
         # 6. storage
         if args.keep_versions:
             log("Version history kept (--keep-versions).")
@@ -663,8 +943,24 @@ def main():
 
         log("")
         log("DONE. AFRO_admin_data.xlsx on SharePoint is " + src.name + ".")
-        log("Next: tell the countries/focal points if needed, and send the feedback workbook.")
-        return 0
+
+        # 8. the data dictionary
+        rc = 0
+        if dict_path:
+            status, msg = publish_dictionary(g, args, tmp, started_iso, dict_path, data_header=new["header"])
+            result.update({"dictionary": status, "dictionary_message": msg})
+            if status == "failed":
+                rc = EXIT_DICT_FAILED
+        else:
+            result["dictionary"] = "skipped" if args.no_dictionary else "none found"
+        save_result()
+        log("")
+        if rc:
+            log("The admin data is published, but the dictionary is not: fix the cause above, then run "
+                "'python admin.py dictionary' (or publish_admin_data.py --dictionary-only --dictionary FILE).")
+        else:
+            log("Next: tell the countries/focal points if needed, and send the feedback workbook.")
+        return rc
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
