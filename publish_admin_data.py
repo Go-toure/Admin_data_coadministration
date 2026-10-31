@@ -71,11 +71,15 @@ TARGET_NAME = "AFRO_admin_data.xlsx"
 ADMIN_SHARE_URL = ("https://worldhealthorg.sharepoint.com/:x:/r/sites/AF-pep/GISWORKSPACE/_layouts/15/Doc.aspx"
                    "?sourcedoc=%7BF9F9983C-76E8-4133-BF13-F69F9F320C15%7D&file=AFRO_admin_data.xlsx"
                    "&action=default&mobileredirect=true")
+# The share links can also be given in the environment (OPS_ADMIN_SHARE_URL / OPS_DICT_SHARE_URL), which wins over the
+# links above: that is how the Operations Center app, which keeps no links in its code, uses this script.
+ADMIN_SHARE_URL = os.environ.get("OPS_ADMIN_SHARE_URL") or ADMIN_SHARE_URL
 BACKUP_KEY = "admin"
 DICT_NAME = "AFRO_admin_data_dictionary.xlsx"
 DICT_SHARE_URL = ("https://worldhealthorg.sharepoint.com/:x:/r/sites/AF-pep/GISWORKSPACE/_layouts/15/Doc.aspx"
                   "?sourcedoc=%7B58972B92-BECE-4456-B465-DDFB95CCD411%7D&file=AFRO_admin_data_dictionary.xlsx"
                   "&action=default&mobileredirect=true&wdwpf=doclib-t")
+DICT_SHARE_URL = os.environ.get("OPS_DICT_SHARE_URL") or DICT_SHARE_URL
 DICT_SHEET = "Data dictionary"
 EXIT_DICT_FAILED = 3          # the admin data is published but the dictionary push failed
 
@@ -566,6 +570,32 @@ def inspect_dictionary(path):
         wb.close()
 
 
+def same_cell_values(a, b):
+    """True when two workbooks hold the same sheets with the same cell values (formatting and the way the file was
+    packed are ignored). Used for the small dictionary: a file that was only re-saved is not a change."""
+    def sheets(path):
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=False)
+        try:
+            out = {}
+            for ws in wb.worksheets:
+                rows = []
+                for r in ws.iter_rows(values_only=True):
+                    r = list(r)
+                    while r and r[-1] in (None, ""):
+                        r.pop()
+                    rows.append(r)
+                while rows and not rows[-1]:
+                    rows.pop()
+                out[ws.title] = rows
+            return out
+        finally:
+            wb.close()
+    try:
+        return sheets(a) == sheets(b)
+    except Exception:
+        return False
+
+
 def content_key(path):
     """A hash of the cell content of a workbook that does not change when SharePoint rewrites document properties."""
     h = hashlib.sha256()
@@ -645,6 +675,8 @@ def publish_dictionary(g, args, tmp, started_iso, dict_path, data_header=None, d
             if gone:
                 log(f"   no longer in it          ({len(gone)}): " + ", ".join(gone[:10]) + (" ..." if len(gone) > 10 else ""))
         same, why = same_content(live_path, dict_path)
+        if not same and same_cell_values(live_path, dict_path):
+            same, why = True, "same sheets and cell values"
         bdir = Path(args.dictionary_backup_dir).expanduser()
         state_file = bdir / "dictionary_state.json"
         st = read_json_file(state_file, {})
@@ -658,8 +690,8 @@ def publish_dictionary(g, args, tmp, started_iso, dict_path, data_header=None, d
             log(f"   NOTE: the live dictionary differs from the one this tool pushed last time ({st.get('at', '?')}): "
                 f"someone changed it on SharePoint. Its copy is kept in {bdir}.")
         if same and not args.force:
-            log(f"The SharePoint dictionary already holds this version ({why}); it will not be uploaded again.")
-            return "unchanged", "already up to date"
+            log(f"No change in the dictionary ({why}): it is not pushed, SharePoint is left as it is.")
+            return "unchanged", "no change, not pushed"
         log("Plan: " + ("(dry run) " if dry else "") + f"keep a local copy of the live dictionary in {bdir}; "
             f"replace {DICT_NAME} on SharePoint; check it; "
             + ("keep" if args.keep_versions else "delete") + " the SharePoint version history.")
