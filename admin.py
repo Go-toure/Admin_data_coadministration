@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SETTINGS_FILE = HERE / "admin_settings.json"
+SETTINGS_FILE = Path(os.environ["ADMIN_SETTINGS"]) if os.environ.get("ADMIN_SETTINGS") else HERE / "admin_settings.json"
 DEFAULTS = {
     "backup_repo": "../SharePoint_version_backup",
     "workspace": "workspace",
@@ -93,8 +93,37 @@ RUNS = WORK / "runs"
 STATE = WORK / "state.json"
 DICT_BACKUPS = WORK / "dictionary_backups"      # the previous live dictionary is kept here before it is replaced
 DICT_FAILED_RC = 3                              # publish script: admin data published, dictionary push failed
-LOGDIR = HERE / "logs"
+LOGDIR = Path(os.environ["ADMIN_LOGDIR"]) if os.environ.get("ADMIN_LOGDIR") else HERE / "logs"
 BACKUP_REPO = P(S["backup_repo"])
+
+
+def _last_part(recorded):
+    return re.split(r"[\\/]", str(recorded))[-1]
+
+
+def run_path(rd, recorded):
+    """A file named in a manifest. The manifest may have been written on another computer (an absolute path that
+    does not exist here), so the file is also looked for by name in the run folder."""
+    p = Path(str(recorded))
+    if p.is_file():
+        return p
+    return Path(rd) / _last_part(recorded)
+
+
+def base_path_of(m):
+    """The file a build started from: the recorded path, else the same file name in the local backups, else the
+    backup version recorded in the manifest. None when it is not here."""
+    b = m.get("base", {})
+    p = Path(str(b.get("path", "")))
+    if b.get("path") and p.is_file():
+        return p
+    snaps = BACKUP_REPO / "snapshots" / "admin"
+    if b.get("path") and (snaps / _last_part(b["path"])).is_file():
+        return snaps / _last_part(b["path"])
+    for r in catalog_rows("admin"):
+        if b.get("backup_version") and str(r["version"]) == str(b["backup_version"]) and (BACKUP_REPO / r["snapshot"]).is_file():
+            return BACKUP_REPO / r["snapshot"]
+    return None
 
 
 def log(msg="", quiet=False):
@@ -461,10 +490,12 @@ def cmd_check(a):
         n, rd, m = latest_run()
     if not n or not m.get("build", {}).get("ok"):
         die("no finished build to check: run 'build' first.")
-    final = Path(m["build"]["file"])
+    final = run_path(rd, m["build"]["file"])
     log("Checking v%d (%s) against the file it started from ..." % (n, final.name))
     pd = _pd()
-    base_path = Path(m["base"]["path"])
+    base_path = base_path_of(m)
+    if base_path is None:
+        die("the file v%d started from is not available here (backup version %s)." % (n, m["base"].get("backup_version")))
     base = load_norm(base_path)
     new = load_norm(final)
     builder = import_builder()
@@ -723,7 +754,7 @@ def cmd_excel(a):
         die("no build waiting: run 'build' first.")
     if not m.get("check", {}).get("ok"):
         die("v%d has not passed 'check' yet." % n)
-    f = Path(m["build"]["file"])
+    f = run_path(rd, m["build"]["file"])
     f_holder = [f]
     method = "manual"
 
@@ -792,7 +823,7 @@ def cmd_publish(a):
     n, rd, m = latest_run(unpublished=True)
     if not n:
         die("no build waiting to be published.")
-    f = Path(m["build"]["file"])
+    f = run_path(rd, m["build"]["file"])
     if not m.get("check", {}).get("ok"):
         die("v%d has not passed 'check' (run it, and fix what it stops on)." % n)
     if not m.get("excel", {}).get("ok"):
@@ -806,8 +837,8 @@ def cmd_publish(a):
     row, snap = do_backup(show=False)
     log("Comparing the live file with the one v%d started from ..." % n)
     live = load_norm(snap)
-    bp = Path(m["base"]["path"])
-    base_fp = fingerprint(load_norm(bp)) if bp.is_file() else m["base"]["fingerprint"]   # same normalisation on both sides
+    bp = base_path_of(m)
+    base_fp = fingerprint(load_norm(bp)) if bp else m["base"]["fingerprint"]   # same normalisation on both sides
     same = fingerprint(live) == base_fp
     if not same:
         base_cols = m["base"]["columns"]
@@ -888,8 +919,12 @@ def cmd_dictionary(a):
         die("the dictionary was not pushed (see %s)." % (rd / "dictionary.log"))
     if not getattr(a, "dry_run", False):
         if m.get("published"):
-            m["published"]["dictionary"] = res.get("dictionary", "unknown")
-            m["published"]["dictionary_message"] = res.get("dictionary_message", "")
+            new_state = res.get("dictionary", "unknown")
+            old_state = m["published"].get("dictionary")
+            # "unchanged" only says the dictionary was already current: keep "published" if that is what was recorded
+            if not (new_state == "unchanged" and old_state in ("published", "unchanged")):
+                m["published"]["dictionary"] = new_state
+                m["published"]["dictionary_message"] = res.get("dictionary_message", "")
         save_manifest(rd, m)
         log("Dictionary: %s." % res.get("dictionary", "done"))
 
@@ -1010,7 +1045,7 @@ def resolve_source(spec):
         mf = read_json(d / "manifest.json", {})
         if not mf.get("build", {}).get("file"):
             die("build %s not found." % spec)
-        return Path(mf["build"]["file"]), "build %s" % spec
+        return run_path(d, mf["build"]["file"]), "build %s" % spec
     m = re.match(r"^b(\d+)$", spec)
     if m:
         for r in catalog_rows("admin"):
@@ -1203,7 +1238,8 @@ DECISIONS = [
     "Never guess: an answer is used only when it is unique; otherwise the record is left and listed.",
     "A build always starts from the live SharePoint file, so nobody's newer edits are lost.",
     "SharePoint keeps no version history (the local backup has it); one published file, replaced in place.",
-    "The data dictionary (AFRO_admin_data_dictionary.xlsx) is pushed with every publish, into the existing SharePoint file; the previous live one is kept in workspace/dictionary_backups. A dictionary problem never undoes the published data (exit 3, retry with `admin.py dictionary`).",
+    "The data dictionary (AFRO_admin_data_dictionary.xlsx) is pushed with a publish only when its content changed (compared cell by cell); then it replaces the existing SharePoint file, and the previous live one is kept in workspace/dictionary_backups. A dictionary problem never undoes the published data (exit 3, retry with `admin.py dictionary`).",
+    "The Operations Center app keeps only the newest 3 backups of the live file on SharePoint (the PC keeps all of them); the dictionary is pushed only when it changed.",
     "Data is never committed to git (only lookup.xlsx and geo_reference.csv). No attribution lines in commit messages.",
     "Each code change is its own commit, followed by its own push.",
     "Open questions kept visible: Addis Ababa round 2 and 4 sub-cities lack woreda names (need a woreda-level file); Tegedie exists in two zones of Amhara with the same name; about 1,460 Nigeria 2022-Jan 2023 records have no Response in the lookup.",
