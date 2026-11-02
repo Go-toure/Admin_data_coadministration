@@ -104,7 +104,86 @@ def num(s):
     return pd.to_numeric(s, errors="coerce")
 
 
+def _memwatch_start(step_mb=300):
+    """Memory watch (stdlib only). Prints a '[memory]' line each time the memory in use grows by step_mb, with the last
+    line the builder printed before it (so the log shows which step is heavy), and the peak when the builder ends."""
+    import atexit
+    import threading
+    import time
+
+    def _read():
+        """(current MB, peak MB) of this process, or None when it cannot be read."""
+        try:
+            if sys.platform.startswith("win"):
+                import ctypes
+                from ctypes import wintypes
+
+                class _PMC(ctypes.Structure):
+                    _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+                k32, ps = ctypes.windll.kernel32, ctypes.windll.psapi
+                k32.GetCurrentProcess.restype = wintypes.HANDLE
+                ps.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PMC), wintypes.DWORD]
+                pmc = _PMC()
+                pmc.cb = ctypes.sizeof(pmc)
+                if not ps.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
+                    return None
+                return pmc.WorkingSetSize / 1048576.0, pmc.PeakWorkingSetSize / 1048576.0
+            cur = peak = None
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        cur = int(line.split()[1]) / 1024.0
+                    elif line.startswith("VmHWM:"):
+                        peak = int(line.split()[1]) / 1024.0
+            return (cur, peak) if cur is not None and peak is not None else None
+        except Exception:
+            return None
+
+    if _read() is None:
+        return
+    real = sys.stdout
+    state = {"last": "", "shown": 0.0}
+
+    class _Tee(object):
+        def __init__(self, out):
+            self._out = out
+
+        def write(self, s):
+            for part in str(s).splitlines():
+                if part.strip():
+                    state["last"] = part.strip()[:90]
+            return self._out.write(s)
+
+        def __getattr__(self, name):
+            return getattr(self._out, name)
+
+    sys.stdout = _Tee(real)
+
+    def _say(text):
+        try:
+            real.write(text + "\n")
+            real.flush()
+        except Exception:
+            pass
+
+    def _loop():
+        while True:
+            m = _read()
+            if m and m[1] >= state["shown"] + step_mb:
+                state["shown"] = m[1]
+                _say("  [memory] %.0f MB in use, peak %.0f MB, after: %s" % (m[0], m[1], state["last"] or "(start)"))
+            time.sleep(0.3)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    atexit.register(lambda: _say("  [memory] the builder's peak memory was %.0f MB" % (_read() or (0, 0))[1]))
+
+
 def main():
+    _memwatch_start()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("src", help="the admin data workbook (AFRO_admin_data.xlsx)")
     ap.add_argument("--out-dir", default="coadmin_output", help="folder for all the outputs (default: coadmin_output)")
