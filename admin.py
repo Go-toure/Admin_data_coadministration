@@ -4,7 +4,8 @@ admin.py - one command for the whole AFRO admin data cycle.
 
     python admin.py status            where everything stands (runs, backups, git, folders)
     python admin.py backup            save the live SharePoint file locally (and list the versions)
-    python admin.py build             build the next version from the LIVE file (backup first)
+    python admin.py lookup            refresh lookup.xlsx from the GPEI API (also done at the start of build and inspect)
+    python admin.py build             build the next version from the LIVE file (lookup refreshed, then backup first)
     python admin.py check             verify the newest build against the file it started from
     python admin.py excel             store the check_dp values in the build (written directly; --use-excel to use Excel)
     python admin.py publish           replace the file AND the data dictionary on SharePoint (all gates must be green)
@@ -49,6 +50,8 @@ DEFAULTS = {
     "builder": "add_coadmin_columns.py",
     "publisher": "publish_admin_data.py",
     "lookup": "lookup.xlsx",
+    "refresh_lookup": True,                   # refresh lookup.xlsx from the GPEI API at the start of build and inspect
+    "gpei_env_file": "",                      # secrets.env holding GPEI_API_TOKEN (default: the scope folder's config/secrets.env)
     "geo": "geo_reference.csv",
     "district_source": "",                    # optional recovered file used by --district-source
     "build_extra_args": [],
@@ -395,8 +398,65 @@ def cmd_backup(a):
     do_backup(show=True)
 
 
+# ----------------------------------------------------------------------------------------------- lookup refresh
+def lookup_env_file():
+    f = S.get("gpei_env_file")
+    if f:
+        return P(f)
+    sd = S.get("scope_script_dir")
+    return (Path(sd).parent / "config" / "secrets.env") if sd else None
+
+
+def lookup_stamp():
+    """rows + sha256 of the lookup in place (recorded in the manifest of a build)."""
+    try:
+        import refresh_lookup as rl
+        return rl.describe(P(S["lookup"])) or {}
+    except Exception:
+        return {}
+
+
+def refresh_lookup_step(force=False, dry_run=False):
+    """Refresh lookup.xlsx from the GPEI API with the same rules and checks as the scope pipeline. It never stops the cycle:
+    if the API cannot be read, the lookup in place is used and the log says so loudly. Returns a dict for the manifest."""
+    lk = P(S["lookup"])
+    if not (force or S.get("refresh_lookup", True)):
+        return {"status": "off"}
+    try:
+        import refresh_lookup as rl
+    except Exception as e:
+        log("WARNING: the lookup was NOT refreshed (refresh_lookup.py cannot be loaded: %s). The lookup in place is used." % e)
+        return {"status": "failed", "reason": str(e)}
+    log("Refreshing the lookup from the GPEI API ...")
+    env = lookup_env_file()
+    r = rl.refresh(lk, rl.read_token(str(env) if env else None), str(WORK / "lookup_backups"), dry_run=dry_run,
+                   emit=lambda m: log(m))
+    if r["status"] == "failed":
+        have = rl.describe(lk)
+        when = dt.datetime.fromtimestamp(lk.stat().st_mtime).strftime("%Y-%m-%d %H:%M") if lk.is_file() else "none"
+        log("WARNING: the lookup was NOT refreshed (%s). The lookup in place is used (%s rounds, last changed %s)."
+            % (r["reason"], have["rows"] if have else "?", when))
+    elif r["status"] == "unchanged":
+        log("Lookup is up to date (%d rounds)." % r["rows"])
+    else:
+        log("Lookup %s: %d rounds (%d new or changed, %d gone)." %
+            ("would be refreshed" if dry_run else "refreshed from the GPEI API", r["rows"], r["added"], r["removed"]))
+    r.update(lookup_stamp() if r["status"] != "failed" or lk.is_file() else {})
+    return r
+
+
+def cmd_lookup(a):
+    r = refresh_lookup_step(force=True, dry_run=a.dry_run)
+    if r["status"] == "failed":
+        sys.exit(1)
+
+
 # ----------------------------------------------------------------------------------------------- build
 def cmd_build(a):
+    if not getattr(a, "no_refresh_lookup", False):
+        lk_info = refresh_lookup_step()
+    else:
+        lk_info = {"status": "skipped"}
     for need in (P(S["builder"]), P(S["lookup"])):
         if not need.is_file():
             die("file not found: %s" % need)
@@ -422,6 +482,7 @@ def cmd_build(a):
          "base": {"path": str(base), "backup_version": row["version"] if row else None,
                   "sha256": row["sha256"] if row else None, "rows": len(base_df), "columns": list(base_df.columns),
                   "fingerprint": fingerprint(base_df), "modified_by": row["modified_by"] if row else None},
+         "lookup": dict(lk_info, **lookup_stamp()),
          "build": {}}
     del base_df
     save_manifest(rd, m)
@@ -492,6 +553,11 @@ def cmd_check(a):
         die("no finished build to check: run 'build' first.")
     final = run_path(rd, m["build"]["file"])
     log("Checking v%d (%s) against the file it started from ..." % (n, final.name))
+    was = (m.get("lookup") or {}).get("sha256")
+    now_ = lookup_stamp().get("sha256")
+    if was and now_ and was != now_:
+        log("NOTE: the lookup changed after v%d was built. The checks below use the lookup in place now; run 'build' again "
+            "if the new lookup should be used for the repairs." % n)
     pd = _pd()
     base_path = base_path_of(m)
     if base_path is None:
@@ -1081,6 +1147,8 @@ def hygiene(df, builder, lk):
 
 
 def cmd_inspect(a):
+    if not getattr(a, "no_refresh_lookup", False):
+        refresh_lookup_step()
     path, label = resolve_source(a.source)
     log("Inspecting %s" % label)
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1283,7 +1351,9 @@ def main():
     s = sub.add_parser("status"); s.add_argument("--live", action="store_true", help="read SharePoint first (runs the backup)")
     sub.add_parser("runs")
     sub.add_parser("backup")
+    s = sub.add_parser("lookup", help="refresh lookup.xlsx from the GPEI API"); s.add_argument("--dry-run", action="store_true")
     s = sub.add_parser("build"); s.add_argument("--base", help="start from this file instead of the latest backup of the live file")
+    s.add_argument("--no-refresh-lookup", action="store_true", help="use lookup.xlsx as it is (default: refreshed from the GPEI API first)")
     s.add_argument("--no-backup", action="store_true", help="do not read SharePoint, use the newest local backup")
     s.add_argument("extra", nargs="*", help="extra options for the builder, after --")
     s = sub.add_parser("check"); s.add_argument("--run", type=int, help="version number (default: the newest)")
@@ -1299,6 +1369,7 @@ def main():
     sub.add_parser("sync-scope")
     sub.add_parser("doctor")
     s = sub.add_parser("inspect"); s.add_argument("--source", help="live (default), vNN build, bN backup version, or a file")
+    s.add_argument("--no-refresh-lookup", action="store_true")
     s.add_argument("--country")
     s = sub.add_parser("find"); s.add_argument("--source"); s.add_argument("--country"); s.add_argument("--province")
     s.add_argument("--district"); s.add_argument("--response"); s.add_argument("--vaccine"); s.add_argument("--round")
@@ -1312,7 +1383,7 @@ def main():
     if not a.cmd:
         ap.print_help()
         return
-    fn = {"status": cmd_status, "runs": cmd_runs, "backup": cmd_backup, "build": cmd_build, "check": cmd_check,
+    fn = {"status": cmd_status, "runs": cmd_runs, "backup": cmd_backup, "lookup": cmd_lookup, "build": cmd_build, "check": cmd_check,
           "excel": cmd_excel, "publish": cmd_publish, "dictionary": cmd_dictionary, "all": cmd_all, "commit": cmd_commit,
           "sync-scope": cmd_sync_scope, "doctor": cmd_doctor, "inspect": cmd_inspect, "find": cmd_find,
           "compare": cmd_compare, "rules": cmd_rules}[a.cmd]
