@@ -452,6 +452,28 @@ def cmd_lookup(a):
 
 
 # ----------------------------------------------------------------------------------------------- build
+def base_info(path):
+    """Rows, columns and fingerprint of a workbook, read by a separate process: the table is large, and a Python process
+    does not give such memory back, which the builder started right after would have to share the machine with."""
+    try:
+        p = subprocess.run([sys.executable, str(Path(__file__).resolve()), "baseinfo", str(path)], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+        for line in p.stdout.splitlines():
+            if line.startswith("BASEINFO "):
+                return json.loads(line[len("BASEINFO "):])
+    except Exception:
+        pass
+    df = load_norm(Path(path))
+    info = {"rows": len(df), "columns": list(df.columns), "fingerprint": fingerprint(df)}
+    del df
+    return info
+
+
+def cmd_baseinfo(a):
+    df = load_norm(Path(a.path))
+    print("BASEINFO " + json.dumps({"rows": len(df), "columns": list(df.columns), "fingerprint": fingerprint(df)}), flush=True)
+
+
 def cmd_build(a):
     if not getattr(a, "no_refresh_lookup", False):
         lk_info = refresh_lookup_step()
@@ -477,14 +499,13 @@ def cmd_build(a):
     out = rd / "out"
     log("Build v%d, starting from %s" % (n, base.name))
     log("Reading the base file (for the check later) ...")
-    base_df = load_norm(base)
+    bi = base_info(base)
     m = {"version": n, "created": now(),
          "base": {"path": str(base), "backup_version": row["version"] if row else None,
-                  "sha256": row["sha256"] if row else None, "rows": len(base_df), "columns": list(base_df.columns),
-                  "fingerprint": fingerprint(base_df), "modified_by": row["modified_by"] if row else None},
+                  "sha256": row["sha256"] if row else None, "rows": bi["rows"], "columns": bi["columns"],
+                  "fingerprint": bi["fingerprint"], "modified_by": row["modified_by"] if row else None},
          "lookup": dict(lk_info, **lookup_stamp()),
          "build": {}}
-    del base_df
     save_manifest(rd, m)
     cmd = [sys.executable, P(S["builder"]), base, "--out-dir", out, "--lookup", P(S["lookup"])]
     geo = P(S["geo"])
@@ -1356,6 +1377,7 @@ def main():
     s.add_argument("--no-refresh-lookup", action="store_true", help="use lookup.xlsx as it is (default: refreshed from the GPEI API first)")
     s.add_argument("--no-backup", action="store_true", help="do not read SharePoint, use the newest local backup")
     s.add_argument("extra", nargs="*", help="extra options for the builder, after --")
+    s = sub.add_parser("baseinfo", help=argparse.SUPPRESS); s.add_argument("path")
     s = sub.add_parser("check"); s.add_argument("--run", type=int, help="version number (default: the newest)")
     s = sub.add_parser("excel"); s.add_argument("--verify-only", action="store_true", help="you saved the file in Excel yourself")
     s.add_argument("--use-excel", action="store_true", help="let desktop Excel store the values (default: written directly, no Excel)")
@@ -1386,7 +1408,7 @@ def main():
     fn = {"status": cmd_status, "runs": cmd_runs, "backup": cmd_backup, "lookup": cmd_lookup, "build": cmd_build, "check": cmd_check,
           "excel": cmd_excel, "publish": cmd_publish, "dictionary": cmd_dictionary, "all": cmd_all, "commit": cmd_commit,
           "sync-scope": cmd_sync_scope, "doctor": cmd_doctor, "inspect": cmd_inspect, "find": cmd_find,
-          "compare": cmd_compare, "rules": cmd_rules}[a.cmd]
+          "compare": cmd_compare, "rules": cmd_rules, "baseinfo": cmd_baseinfo}[a.cmd]
     log("admin.py %s" % " ".join(sys.argv[1:]), quiet=True)
     try:
         fn(a)

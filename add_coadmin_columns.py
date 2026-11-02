@@ -879,6 +879,7 @@ def main():
     # ------------------------------------------------------------ data dictionary
     if a.dictionary:
         build_dictionary(chk, a.dictionary)
+    chk = co = mx = None    # not needed any more: the quality step below reads the file again
 
     # ------------------------------------------------------------ quality checks (merged from the portal)
     qres = None
