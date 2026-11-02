@@ -805,6 +805,11 @@ def main():
                 c = ws_new.cell(row=r_out, column=j + 1, value=val)
                 c._style = copy(oc._style)
         r_out += 1
+        # the source cells of this row are not needed any more: release them, so the old sheet shrinks as the new one grows
+        # (both together were the memory peak of the build)
+        for oc_ in row_cells:
+            ws._cells.pop((oc_.row, oc_.column), None)
+        cells[i] = None
     last_row = r_out - 1
     ws_new.auto_filter.ref = "A1:%s%d" % (get_column_letter(ncol_new), last_row)
 
@@ -838,6 +843,10 @@ def main():
     wb.active = 0
     print("saving", a.dst, flush=True)
     wb.save(a.dst)
+    # the workbook is on disk now: free its memory before the checks, the dictionary and the quality report read it again
+    wb = ws = ws_new = cells = row_cells = None
+    import gc
+    gc.collect()
 
     # -------------------------------------------------------------- feedback
     if a.feedback:
