@@ -237,6 +237,13 @@ def main():
                     help="exit with code 2 when the quality checks still find records with an Error")
     ap.add_argument("--no-fill-response", action="store_true",
                     help="do not fill an empty Response from the campaign lookup (country, start date, round)")
+    ap.add_argument("--no-fix-country-names", action="store_true",
+                    help="do not replace a country spelled another way (CAMEROUN, TANZANIA ...) by the standard name of the geography reference")
+    ap.add_argument("--no-fix-province-spelling", action="store_true",
+                    help="do not correct a province that is the same name written differently (MAI NDOMBE = MAINDOMBE, PROVINCIA DE NAMPULA = NAMPULA)")
+    ap.add_argument("--no-fix-digit-error", action="store_true",
+                    help="do not correct a target population that is 10 or 100 times off when the reported coverage and the district's other campaigns agree")
+    ap.add_argument("--no-fix-list", action="store_true", help="do not write the per-country fix list (Fix_list_by_country.xlsx)")
     ap.add_argument("--no-fill-cvpolio", action="store_true",
                     help="do not fill an empty CVPolio with TotalNbrVaccPolio / PopPolio")
     ap.add_argument("--no-dedupe", action="store_true",
@@ -263,6 +270,7 @@ def main():
     a.audit = None if a.no_audit else os.path.join(rev_dir, "AFRO_admin_data_coadmin_audit.xlsx")
     a.feedback = None if a.no_feedback else os.path.join(rev_dir, "Feedback_suspicious_coverage.xlsx")
     a.quality = None if a.no_quality else os.path.join(rev_dir, "AFRO_admin_data_quality_report.xlsx")
+    a.fix_list = None if (a.no_fix_list or a.no_quality) else os.path.join(rev_dir, "Fix_list_by_country.xlsx")
     if a.check_only:
         run_check_only(a, rev_dir)
         return
@@ -388,8 +396,32 @@ def main():
                 print("geography reference not used (%s): %s" % (gp, e), flush=True)
         else:
             print("geography reference: not found (geo_reference.csv): the province / country check is skipped", flush=True)
+    if geo is not None and not a.no_fix_country_names:
+        cn_fix = standardise_country_names(df, geo)
+        for i, (old_, new_) in cn_fix.items():
+            df.at[i, "Country"] = new_
+            repl[(i, "Country")] = new_
+            prov_log.append({"Excel row": int(df.at[i, "_row"]), "Country": new_, "District": df.at[i, "District"],
+                             "Column": "Country", "Found": old_, "Restored": new_,
+                             "Source": "standard country name of the geography reference"})
+        if cn_fix:
+            print("country name standardised: %d records (%s)" %
+                  (len(cn_fix), "; ".join(sorted({"%s -> %s" % v for v in cn_fix.values()}))), flush=True)
+    if geo is not None and not a.no_fix_province_spelling:
+        ps_fix = fix_province_spelling(df, geo)
+        for i, (old_, new_) in ps_fix.items():
+            df.at[i, "Province"] = new_
+            repl[(i, "Province")] = new_
+            prov_log.append({"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "District": df.at[i, "District"],
+                             "Column": "Province", "Found": old_, "Restored": new_,
+                             "Source": "geography reference: same name, different spelling"})
+        if ps_fix:
+            print("province spelling corrected: %d records (%d names, e.g. %s)" %
+                  (len(ps_fix), len({v for v in ps_fix.values()}),
+                   "; ".join(sorted({"%s -> %s" % v for v in ps_fix.values()})[:4])), flush=True)
     if geo is not None and not a.no_fix_province:
         _, corr0, _ = qc_geo(qc_prepare(df), geo)
+        n_prov0 = len(prov_log)
         if corr0 is not None and len(corr0):
             for r in corr0[corr0["certain"]].itertuples():
                 i = int(r.idx)
@@ -398,8 +430,8 @@ def main():
                 prov_log.append({"Excel row": int(df.at[i, "_row"]), "Country": r.Country, "District": r.District,
                                  "Column": "Province", "Found": r.current_province, "Restored": r.suggested_province,
                                  "Source": r.source})
-            if prov_log:
-                print("province of another country corrected: %d records" % len(prov_log), flush=True)
+            if len(prov_log) > n_prov0:
+                print("province of another country corrected: %d records" % (len(prov_log) - n_prov0), flush=True)
 
     # an empty Response is filled from the campaign lookup (country + start date + round)
     if lk is not None and not a.no_fill_response:
@@ -641,6 +673,39 @@ def main():
         pop_new[cond3] = implied[cond3]
         pop_reason[cond3] = "Population implied by CVPolio (coverage was below %.1f)" % CV_LOW
         pop_fixed = pop_fixed | cond3
+        # a target that is 10 or 100 times off (a missing or an extra digit): corrected only when TWO independent pieces agree: the
+        # reported coverage (CVPolio) implies the corrected figure (vaccinated / CVPolio is 10x or 100x the stored target, within
+        # 10%) AND that figure is close to the median target of the same district's other campaigns (0.6 - 1.7 times)
+        n_digit = 0
+        if not a.no_fix_digit_error:
+            polio_d = out_vt.map(lambda x: isinstance(x, str) and "opv" in x.lower())
+            dk3 = pd.Series(["|".join(str(v) for v in t) for t in df[["Country", "Province", "District"]].itertuples(index=False)], index=df.index)
+            sk = df["SIA_date"].map(lambda x: str(x)[:10])
+            base_pop = pop_new.copy()
+            by_d = {}
+            for j in df.index[polio_d & ~drop & (base_pop > 0)]:
+                by_d.setdefault(dk3.iat[j], []).append(j)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                imp2 = out_total / cvp.where(cvp > 0)
+                rat = imp2 / base_pop.where(base_pop > 0)
+            for i in df.index[polio_d & ~drop & ~pop_fixed & (cvp > 0) & (out_total > 0) & (base_pop > 0) & rat.notna()]:
+                f = next((f for f in (10, 100, 0.1, 0.01) if abs(rat.iat[i] / f - 1) <= 0.10), None)
+                if f is None:
+                    continue
+                others = [base_pop.iat[j] for j in by_d.get(dk3.iat[i], []) if j != i and sk.iat[j] != sk.iat[i]]
+                if not others:
+                    continue
+                med = float(np.median(others))
+                new_t = float(np.floor(imp2.iat[i] + 0.5))
+                if med > 0 and new_t > 0 and 0.6 <= new_t / med <= 1.7:
+                    pop_new.iat[i] = new_t
+                    pop_reason.iat[i] = ("Digit error: target was %s the figure the reported coverage implies; confirmed by the district's "
+                                         "other campaigns (median %s)" % ("%gx below" % f if f > 1 else "%gx above" % (1 / f), "{:,.0f}".format(med)))
+                    pop_fixed.iat[i] = True
+                    n_digit += 1
+            if n_digit:
+                print("target population with a digit error corrected: %d records (reported coverage and the district's other campaigns agree)"
+                      % n_digit, flush=True)
         # populations are counts of children: whole numbers only
         frac = pop_new.notna() & ((pop_new % 1) != 0)
         pop_new[frac] = np.floor(pop_new[frac] + 0.5)
@@ -891,6 +956,8 @@ def main():
         qres["dup_log"], qres["dup_groups"], qres["existing"] = dup_log, dup_groups, existing_rows
         qc_print(qres)
         qc_write(qres, a.quality)
+        if a.fix_list:
+            write_fix_list(a.fix_list, qres, geo)
 
     print("\nDone. Files written under", a.out_dir)
     print("  upload_to_sharepoint/ : AFRO_admin_data.xlsx" + (" + the data dictionary" if a.dictionary else ""))
@@ -1609,6 +1676,65 @@ def load_geo(path):
     return g.reset_index(drop=True)
 
 
+_PROV_STOP = {"PROVINCIA", "PROVINCE", "REGION", "DE", "DA", "DO", "DU", "DES", "DEL", "LA", "LE", "L", "D"}
+
+
+def _prov_compact(x):
+    """A province name for spelling comparison: no accents, punctuation, spaces or filler words (PROVINCIA DE, REGION, DU ...)."""
+    return "".join(t for t in _qn(x).split() if t not in _PROV_STOP)
+
+
+def standardise_country_names(df, geo):
+    """Country written another way (CAMEROUN, REPUBLIQUE CENTRAFRIQUE, TANZANIA ...) -> the standard name of the geography reference.
+    Returns {row index: (old, new)}. Only names listed in QC_COUNTRY_ALIAS whose standard name is in the reference."""
+    std = geo.drop_duplicates("c_key").set_index("c_key")["country"].to_dict()
+    out = {}
+    for val in df["Country"].dropna().unique():
+        if not isinstance(val, str) or not val.strip():
+            continue
+        raw, ck = _qn(val), _qcountry(val)
+        if raw in QC_COUNTRY_ALIAS and raw != ck and ck in std and std[ck] != val:
+            for i in df.index[df["Country"] == val]:
+                out[i] = (val, std[ck])
+    return out
+
+
+def fix_province_spelling(df, geo):
+    """A province that is the same name as an Admin1 of the geography reference written differently (spaces, accents, punctuation,
+    filler words: MAI NDOMBE = MAINDOMBE, PROVINCIA DE NAMPULA = NAMPULA, WADIFIRA = WADI FIRA, RS 3 = RS3) gets the reference's
+    spelling. Only an exact match once those differences are ignored, and only when the record's district does not belong to another
+    province of the reference. Near matches and new Admin1s are left alone (they are listed in the fix list).
+    Returns {row index: (old, new)}."""
+    ref = {}
+    for c, p in geo[["c_key", "province"]].drop_duplicates().itertuples(index=False):
+        ref.setdefault(c, {}).setdefault(_prov_compact(p), set()).add(p)
+    okp = set(zip(geo["c_key"], geo["p_key"]))
+    cd = geo.drop_duplicates(["c_key", "d_key", "province"]).groupby(["c_key", "d_key"])["province"].agg(["nunique", "first"])
+    uniq = cd[cd["nunique"] == 1]["first"].to_dict()
+    out = {}
+    pairs = df[["Country", "Province"]].dropna().drop_duplicates()
+    for country, prov in pairs.itertuples(index=False):
+        if not isinstance(prov, str) or not prov.strip():
+            continue
+        ck, pk = _qcountry(country), _qn(prov)
+        if ck not in ref or (ck, pk) in okp:
+            continue
+        comp = _prov_compact(prov)
+        cand = ref[ck].get(comp) if comp else None
+        if not cand or len(cand) != 1:
+            continue
+        target = next(iter(cand))
+        if target == prov:
+            continue
+        rows = df.index[(df["Country"] == country) & (df["Province"] == prov)]
+        for i in rows:
+            rp = uniq.get((ck, _qn(df.at[i, "District"])))
+            if rp and _qn(rp) != _qn(target):
+                continue          # the district belongs to another province of the reference: not a spelling difference
+            out[i] = (prov, target)
+    return out
+
+
 def qc_prepare(df):
     def col(name):
         return df[name] if name in df.columns else pd.Series(np.nan, index=df.index)
@@ -1957,6 +2083,78 @@ def qc_write(res, path, country=None):
             if res.get(key_) is not None and len(res[key_]):
                 res[key_].to_excel(xw, sheet_name=sheet, index=False)
     print("quality report written:", path, flush=True)
+
+
+FIX_SHEETS = [
+    ("Missing_key_field", ["missing_key"], "Error", None, "Fill the empty field (Response: the campaign name of the lookup, if the campaign is in it)"),
+    ("Report_date", ["report_date"], "Warning", "Date_Report", "The report date is before the SIA start or in the future: correct Date_Report, or SIA_date if that is the wrong one"),
+    ("Target_above_total_pop", ["target_gt_total"], "Warning", "PopPolio or TotPop", "The target population is larger than the total population: one of the two is wrong"),
+    ("Coverage_above_ceiling", ["coverage_ceiling"], "Warning", "TotalNbrVaccPolio or PopPolio", "Vaccinated / target is above the ceiling: check the vaccinated total and the target"),
+    ("Target_very_different", ["target_jump"], "Warning", "PopPolio", "The target population is very different from the district's other campaigns: confirm it (the usual figure is in Suggested_value)"),
+    ("Coverage_differs", ["coverage_mismatch"], "Warning", "CVPolio", "The reported coverage differs from vaccinated / target: confirm which of the three figures is right"),
+    ("Province_to_confirm", ["geo_unknown", "geo_province"], None, "Province", "The province is not an Admin1 of the geography reference: confirm the spelling, or tell us it is a new Admin1"),
+    ("Combined_and_separate", ["coadmin_mixed"], "Warning", "Vaccine_type", "The same district and start date is reported as a combined record and as separate vaccine records: keep one form only"),
+    ("Record_entered_twice", ["duplicate_key"], "Warning", "(the whole record)", "The same record appears twice: remove one of them"),
+]
+
+
+def write_fix_list(path, res, geo=None):
+    """What cannot be corrected safely by the script, in one sheet per kind of problem with the exact row, the column to correct, the
+    current value and (when there is one) a suggested value. Every sheet has a Country column, so it can be cut per country."""
+    import difflib
+    iss = res["issues"]
+    cols = ["Country", "Province", "District", "SIA_date", "Round", "Vaccine", "Response", "Excel_row", "Column_to_correct",
+            "Current_value", "Suggested_value", "What_to_check", "Corrected_value (to fill in)", "Comment"]
+    ref = {}
+    if geo is not None:
+        for c, pv in geo[["c_key", "province"]].drop_duplicates().itertuples(index=False):
+            ref.setdefault(c, {})[_prov_compact(pv)] = pv
+    sheets, counts = {}, {}
+    for name, checks, sev, column, todo in FIX_SHEETS:
+        d = iss[iss["check"].isin(checks)].copy()
+        if sev:
+            d = d[d["severity"] == sev]
+        if not len(d):
+            continue
+        if name == "Province_to_confirm":
+            # where the reference has no answer for the district, a very similar province name is suggested (never applied)
+            def near(r):
+                if str(r["suggested"]).strip():
+                    return r["suggested"]
+                cands = ref.get(_qcountry(r["Country"]), {})
+                m = difflib.get_close_matches(_prov_compact(r["current"]), list(cands), n=1, cutoff=0.85)
+                return cands[m[0]] if m else ""
+            d["suggested"] = d.apply(near, axis=1)
+            d = d[d["suggested"].astype(str).str.strip() != ""]
+            if not len(d):
+                continue
+        d["Column_to_correct"] = d["message"].str.replace(r" is empty.*$", "", regex=True) if column is None else column
+        d["What_to_check"] = todo + " | " + d["message"]
+        d = d.rename(columns={"current": "Current_value", "suggested": "Suggested_value"})
+        d["Corrected_value (to fill in)"] = ""
+        d["Comment"] = ""
+        sheets[name] = d[cols].reset_index(drop=True)
+        counts[name] = d.groupby("Country").size()
+    readme = pd.DataFrame({"Read me": [
+        "Records the build could not correct safely, for the countries and focal points to check at the source.",
+        "One sheet per kind of problem. Excel_row is the row in the published AFRO_admin_data.xlsx of this build.",
+        "Column_to_correct is the column to change; Suggested_value is shown only when there is one (it is never applied by the script).",
+        "Fill Corrected_value (to fill in) and send the workbook back, or correct the SharePoint file directly.",
+        "Everything the script already corrected is listed in the audit workbook and in the Fixes applied sheet of the quality report."]})
+    by_country = pd.DataFrame(counts).fillna(0).astype(int)
+    by_country.insert(0, "Total", by_country.sum(axis=1))
+    by_country = by_country.reset_index().rename(columns={"index": "Country"}).sort_values("Total", ascending=False)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        readme.to_excel(xw, sheet_name="Read_me", index=False)
+        by_country.to_excel(xw, sheet_name="By_country", index=False)
+        for name, d in sheets.items():
+            d.to_excel(xw, sheet_name=name[:31], index=False)
+        for ws_ in xw.book.worksheets:
+            ws_.freeze_panes = "A2"
+            for k, c in enumerate(ws_[1], 1):
+                ws_.column_dimensions[c.column_letter].width = 60 if str(c.value) in ("What_to_check", "Read me") else 22
+    print("fix list written: %s (%d records in %d sheets)" % (path, int(sum(len(d) for d in sheets.values())), len(sheets)), flush=True)
 
 
 def qc_print(res):
