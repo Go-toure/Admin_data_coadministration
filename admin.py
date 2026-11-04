@@ -621,13 +621,17 @@ def cmd_check(a):
         elif m1:
             warn.append("still %d record(s) with another country's Response: %s"
                         % (sum(m1.values()), "; ".join("%s / %s (%d)" % (k[0], k[1], v) for k, v in list(m1.items())[:6])))
-    # 5. duplicates on the portal key
-    if keys:
-        d0 = int(base.duplicated(keys, keep=False).sum())
-        d1 = int(new.duplicated(keys, keep=False).sum())
-        info.append("records sharing the portal key with another record: %d -> %d" % (d0, d1))
-        if d1 > d0:
-            warn.append("more duplicate keys than before (%d -> %d)" % (d0, d1))
+    # 5. duplicates: a record entered twice (same names, same population and results) is a duplicate; records with the same names
+    #    but other figures are different units (the file records no sub-district), counted apart and never a warning
+    c0 = builder.classify_duplicates(base)["cls"].value_counts()
+    c1 = builder.classify_duplicates(new)["cls"].value_counts()
+    d0 = int(c0.get("exact", 0) + c0.get("same_record", 0))
+    d1 = int(c1.get("exact", 0) + c1.get("same_record", 0))
+    info.append("duplicate records (the same record entered twice): %d -> %d" % (d0, d1))
+    info.append("records with the same names but other figures (different units, not duplicates): %d -> %d"
+                % (int(c0.get("other_figures", 0)), int(c1.get("other_figures", 0))))
+    if d1 > d0:
+        warn.append("more duplicate records than before (%d -> %d)" % (d0, d1))
     # 6. errors reported by the build
     prev = None
     for k, d in reversed(run_dirs()):
@@ -1319,7 +1323,7 @@ RULES = [
     ("province", "Geography", "A Province that belongs to another country (per geo_reference.csv) is corrected when certain.", "Admin portal checks", "--no-fix-province"),
     ("text-clean", "Hygiene", "Stray control characters (carriage returns), line breaks and double / edge spaces in Country, Province, District, Response, Vaccine_type and Round_Add are removed.", "Found in District (KAJIADO EAST) 30 Oct 2026", "--no-clean-text"),
     ("dates", "Hygiene", "SIA_date written as text ('18-sept-20') becomes a real date.", "Admin portal", "(always)"),
-    ("duplicates", "Hygiene", "Exact copies are removed; records with the same key but different values are NOT removed, only reported (Duplicate record). Key = Country, Province, District, [Admin_3], SIA_date, Round_Add, Vaccine_type, Response.", "Admin portal", "--no-dedupe, --resolve-duplicates"),
+    ("duplicates", "Hygiene", "Exact copies are removed. A record entered twice (same key AND the same population and results) is reported as Duplicate record and removed only with --resolve-duplicates. Records with the same key but other population or results are different units (most records have no sub-district): never removed, reported only as information (Same names, other figures). Key = Country, Province, District, [Admin_3], SIA_date, Round_Add, Vaccine_type, Response, compared without accents, case or punctuation.", "Admin portal", "--no-dedupe, --resolve-duplicates"),
     ("quality", "Checks", "The portal quality checks (missing key field, coverage above the ceiling, target jumps, report date, province/country, co-administration consistency, vaccine spelling, duplicates) produce a report with Errors / Warnings / Info.", "Admin portal (run_admin_quality_check.R)", "--no-quality"),
 ]
 DECISIONS = [

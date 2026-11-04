@@ -242,8 +242,9 @@ def main():
     ap.add_argument("--no-dedupe", action="store_true",
                     help="do not remove exact duplicates (same key and every other value the same); they are removed by default")
     ap.add_argument("--resolve-duplicates", choices=["none", "complete", "first"], default="none",
-                    help="records with the same key but different values: none = only list them in the quality report "
-                         "(default), complete = keep the most complete record, first = keep the first one (the portal's rule)")
+                    help="the same record entered twice (same names, same population and results): none = only list them in the "
+                         "quality report (default), complete = keep the most complete record, first = keep the first one. "
+                         "Records with the same names but other figures are different units and are never removed")
     ap.add_argument("--repository", help="the portal repository (AFRO_admin_data_repository.xlsx): records whose key is already "
                                          "in it are listed (Already_in_repository) and its rows give context to the target population check")
     ap.add_argument("--skip-existing", action="store_true",
@@ -494,11 +495,7 @@ def main():
     dup_log, dup_groups = pd.DataFrame(), pd.DataFrame()
     if not a.no_dedupe:
         dup_drop, dup_log, dup_groups = find_duplicates(df, a.resolve_duplicates)
-        n_ex = len(dup_log)
-        n_conf = int(dup_groups["duplicate_group"].nunique()) if len(dup_groups) else 0
-        print("duplicates: %d exact copies removed; %d groups of records with the same key but different values (%s)" %
-              (n_ex, n_conf, "removed as asked" if a.resolve_duplicates != "none" else "listed in the quality report, not removed"),
-              flush=True)
+        print(dup_summary(dup_log, dup_groups, a.resolve_duplicates), flush=True)
     exist_drop = pd.Series(False, index=df.index)
     repo_ctx = None
     existing_rows = pd.DataFrame()
@@ -940,6 +937,7 @@ QC_LABELS = {
     "coadmin_combined": "Combined co-administration record", "coadmin_identical": "Identical figures for both vaccines",
     "coadmin_total": "Combined total is not the larger of the two vaccines",
     "vaccine_spelling": "Vaccine type spelling", "duplicate_key": "Duplicate record",
+    "same_key_other_figures": "Same names, other figures (not a duplicate)",
 }
 QC_SEV = ["Error", "Warning", "Info"]
 QC_OWN_USE_MIN = 5   # a province name used by this many records of the country itself is not a stray copy
@@ -1048,19 +1046,36 @@ def portal_key(df, with_admin3=False):
     return parts[0].str.cat(parts[1:], sep="|") if parts else pd.Series("", index=df.index)
 
 
-def find_duplicates(df, resolve="none"):
-    """Duplicate check and fix of the portal.
-    - exact duplicates (same key AND every other value the same): the extra copies are removed (the first is kept);
-    - conflicting duplicates (same key, other values differ): listed with a suggestion (the most complete record, then
-      the first one) and removed only with resolve='complete' or 'first';
-    - records with an empty key field are not treated as duplicates (they are reported as missing key fields).
-    Returns (mask of rows to remove, log of the removed exact copies, table of the duplicate groups)."""
-    key = portal_key(df, with_admin3=True)
-    need = [c for c in ("Country", "Province", "District", "Round_Add", "Vaccine_type", "Response") if c in df.columns]
-    blank = pd.Series(False, index=df.index)
-    for c in need:
-        blank |= df[c].isna() | (df[c].astype(str).str.strip() == "")
-    blank |= df["SIA_date"].map(parse_sia_text).isna()
+DUP_CORE_COLS = ["TotPop", "PopPolio", "TotalNbrVaccPolio", "Tot_Vacc_nOPV2", "Total_Vacc_bOPV"]
+
+
+def _dup_norm(s):
+    """A name for the duplicate key: upper case, no accents, '-', '_', '.' and spaces alike, no other punctuation."""
+    v = s.where(s.notna(), "").astype(str).str.strip().str.upper()
+    v = v.str.normalize("NFKD").str.encode("ascii", "ignore").str.decode("ascii")
+    v = v.str.replace(r"[\s\-_\.]+", "_", regex=True).str.replace(r"[^A-Z0-9_]", "", regex=True)
+    return v.str.strip("_")
+
+
+def dup_key(df):
+    """The key of the duplicate check: Country | Province | District | [Admin_3] | SIA_date | Round_Add | Vaccine_type | Response.
+    Names are compared without accents, case or punctuation ('DRC-2025_nOPV' = 'DRC_2025-nOPV'). Returns (key, blank): blank is
+    True for a record with an empty key field (it is reported as a missing key field, never as a duplicate); an empty Admin_3 is normal."""
+    parts, blank = [], pd.Series(False, index=df.index)
+    for c in ("Country", "Province", "District", "Admin_3", "SIA_date", "Round_Add", "Vaccine_type", "Response"):
+        if c not in df.columns:
+            continue
+        if c == "SIA_date":
+            p = df[c].map(parse_sia_text).dt.strftime("%Y-%m-%d").fillna("")
+        else:
+            p = _dup_norm(df[c])
+        if c != "Admin_3":
+            blank |= (p == "")
+        parts.append(p)
+    return parts[0].str.cat(parts[1:], sep="|"), blank
+
+
+def _dup_value_cols(df):
     cols = []
     for c in df.columns:
         if str(c).startswith("_") or c in ("check_dp", "prov_candidates"):
@@ -1069,26 +1084,77 @@ def find_duplicates(df, resolve="none"):
         if len(first) and isinstance(first.iloc[0], str) and first.iloc[0].startswith("="):
             continue
         cols.append(c)
-    sig = pd.util.hash_pandas_object(df[cols].astype(str), index=False)
-    d = pd.DataFrame({"key": key, "sig": sig, "blank": blank}, index=df.index)
-    d["n"] = d["key"].map(d["key"].value_counts())
-    cand = (d["n"] > 1) & ~d["blank"]
+    return cols
+
+
+def _dup_text(col, decimals=6):
+    """A column as comparable text: numbers written the same way (rounded to `decimals`), empty cells (None / NaN) alike."""
+    n = pd.to_numeric(col, errors="coerce")
+    t = col.where(col.notna(), "").astype(str)
+    fmt = "%%.%df" % decimals
+    return t.where(n.isna(), n.round(decimals).map(lambda x: (fmt % x).rstrip("0").rstrip(".")))
+
+
+def classify_duplicates(df):
+    """Records that share the duplicate key with another record, in three classes (column cls; '' = shares it with nobody):
+      exact          every value is the same: the extra copies are removed by the build;
+      same_record    the same population and results (TotPop, PopPolio, TotalNbrVaccPolio, Tot_Vacc_nOPV2, Total_Vacc_bOPV) with
+                     another cell different (report date, spelling of the Response ...): the same record entered twice;
+      other_figures  the same names but other population / results: different units (the file records no sub-district for most
+                     records), NOT duplicates. Reported as information so nothing is hidden.
+    Also returns key, n (records with that key), sig (every value) and core (the figures) of the candidates."""
+    key, blank = dup_key(df)
+    n = key.map(key.value_counts())
+    cand = (n > 1) & ~blank
+    out = pd.DataFrame({"key": key, "cls": "", "n": np.where(cand, n, 1), "sig": 0, "core": ""}, index=df.index)
+    if not cand.any():
+        return out
+    sub = df.index[cand.values]
+    cols = _dup_value_cols(df)
+    sig = pd.util.hash_pandas_object(pd.DataFrame({c: _dup_text(df.loc[sub, c]) for c in cols}), index=False)
+    core_cols = [c for c in DUP_CORE_COLS if c in df.columns]
+    core = pd.Series("", index=sub)
+    for c in core_cols:
+        core = core + "|" + _dup_text(df.loc[sub, c], 2)
+    d = pd.DataFrame({"key": key[sub].values, "sig": sig.values, "core": core.values}, index=sub)
+    exact = d.duplicated(["key", "sig"], keep=False)
+    same = d.duplicated(["key", "core"], keep=False) if core_cols else pd.Series(False, index=sub)
+    out.loc[sub, "cls"] = np.where(exact, "exact", np.where(same, "same_record", "other_figures"))
+    out.loc[sub, "sig"] = d["sig"].values
+    out.loc[sub, "core"] = d["core"].values
+    return out
+
+
+def find_duplicates(df, resolve="none"):
+    """Duplicate check and fix (the portal's rule, made stricter about what is a duplicate; see classify_duplicates).
+    - exact duplicates (same key AND every other value the same): the extra copies are removed (the first is kept);
+    - the same record entered twice (same key, same population and results, another cell different): listed with a suggestion
+      (the most complete record, then the first one) and removed only with resolve='complete' or 'first';
+    - records with the same names but other figures are different units: listed for information (class 'different figures'),
+      NEVER removed, whatever resolve says;
+    - records with an empty key field are not treated as duplicates (they are reported as missing key fields).
+    Returns (mask of rows to remove, log of the removed exact copies, table of the duplicate groups)."""
+    cd = classify_duplicates(df)
     drop = pd.Series(False, index=df.index)
     log_rows, grp_rows = [], []
-    if not cand.any():
+    sub = cd[cd["cls"] != ""]
+    if not len(sub):
         return drop, pd.DataFrame(), pd.DataFrame()
-    sub = d[cand]
+    cols = _dup_value_cols(df)
     extra = sub.groupby(["key", "sig"]).cumcount() > 0
-    first_of = sub[~extra].drop_duplicates(["key", "sig"]).set_index(["key", "sig"]).index
-    first_row = {ks: i for i, ks in zip(sub[~extra].index, zip(sub[~extra]["key"], sub[~extra]["sig"]))}
+    extra &= (sub["cls"] == "exact")
+    first_row = {}
+    for i in sub.index[~extra]:
+        first_row.setdefault((sub.at[i, "key"], sub.at[i, "sig"]), i)
     for i in sub.index[extra]:
         drop[i] = True
-        log_rows.append({"Excel_row": int(df.at[i, "_row"]), "Kept_row": int(df.at[first_row[(d.at[i, "key"], d.at[i, "sig"])], "_row"]),
+        kept = first_row[(sub.at[i, "key"], sub.at[i, "sig"])]
+        log_rows.append({"Excel_row": int(df.at[i, "_row"]), "Kept_row": int(df.at[kept, "_row"]),
                          "Country": df.at[i, "Country"], "Province": df.at[i, "Province"], "District": df.at[i, "District"],
                          "SIA_date": parse_sia_text(df.at[i, "SIA_date"]).strftime("%Y-%m-%d"),
                          "Round_Add": df.at[i, "Round_Add"], "Vaccine_type": df.at[i, "Vaccine_type"],
                          "Response": df.at[i, "Response"], "Reason": "exact duplicate: every value is the same as in row %d"
-                                                                  % int(df.at[first_row[(d.at[i, "key"], d.at[i, "sig"])], "_row"])})
+                                                                  % int(df.at[kept, "_row"])})
     rest = sub[~extra]
     rest = rest[rest["key"].map(rest["key"].value_counts()) > 1]
     filled = df[cols].notna() & (df[cols].astype(str) != "")
@@ -1097,22 +1163,48 @@ def find_duplicates(df, resolve="none"):
     for key_, g in rest.groupby("key", sort=False):
         gid += 1
         idx = list(g.index)
-        keeper = max(idx, key=lambda i: (score[i], -idx.index(i))) if resolve != "first" else idx[0]
-        suggested = max(idx, key=lambda i: (score[i], -idx.index(i)))
+        core_n = g["core"].map(g["core"].value_counts())
+        keep_set = set()
+        for core_, gg in g.groupby("core"):
+            ids = list(gg.index)
+            if len(ids) > 1:
+                best = max(ids, key=lambda i: (score[i], -idx.index(i)))
+                keep_set.add(best if resolve != "first" else ids[0])
         differ = [c for c in cols if df.loc[idx, c].astype(str).nunique() > 1]
         for n_, i in enumerate(idx, 1):
-            applied = resolve in ("complete", "first") and i != keeper
-            if applied:
-                drop[i] = True
+            same_rec = core_n[i] > 1
+            if not same_rec:
+                sugg, applied = "keep (different unit)", False
+            else:
+                best = max([j for j in idx if g.at[j, "core"] == g.at[i, "core"]], key=lambda j: (score[j], -idx.index(j)))
+                sugg = "keep" if i == best else "remove"
+                applied = resolve in ("complete", "first") and i not in keep_set
+                if applied:
+                    drop[i] = True
             grp_rows.append({"duplicate_group": gid, "record_num": n_, "Excel_row": int(df.at[i, "_row"]),
+                             "Class": "same record entered twice" if same_rec else "different figures (not a duplicate)",
                              "Country": df.at[i, "Country"], "Province": df.at[i, "Province"], "District": df.at[i, "District"],
                              "SIA_date": parse_sia_text(df.at[i, "SIA_date"]).strftime("%Y-%m-%d"),
                              "Round_Add": df.at[i, "Round_Add"], "Vaccine_type": df.at[i, "Vaccine_type"],
                              "Response": df.at[i, "Response"], "TotalNbrVaccPolio": df.at[i, "TotalNbrVaccPolio"],
                              "PopPolio": df.at[i, "PopPolio"], "Filled_cells": int(score[i]),
-                             "Suggested": "keep" if i == suggested else "remove", "Applied": "removed" if applied else "",
+                             "Suggested": sugg, "Applied": "removed" if applied else "",
                              "Columns_that_differ": ", ".join(differ[:12]) + (" ..." if len(differ) > 12 else "")})
     return drop, pd.DataFrame(log_rows), pd.DataFrame(grp_rows)
+
+
+def dup_summary(dup_log, dup_groups, resolve, check_only=False):
+    n_ex = len(dup_log)
+    if len(dup_groups):
+        same = dup_groups["Class"].str.startswith("same record")
+        n_same, n_oth = int(same.sum()), int((~same).sum())
+        n_rem = int((dup_groups["Applied"] == "removed").sum())
+    else:
+        n_same = n_oth = n_rem = 0
+    return ("duplicates: %d exact copies %s; %d records entered twice (same names, same population and results: %s); "
+            "%d records with the same names but different figures (different units, NOT duplicates, listed for information)" %
+            (n_ex, "(would be removed by the update)" if check_only else "removed", n_same,
+             "%d removed as asked" % n_rem if n_rem else "listed in the quality report, not removed", n_oth))
 
 
 def existing_in_repository(df, repo_path):
@@ -1786,15 +1878,21 @@ def qc_run(df, geo=None, cfg=None, today=None, context=None):
     add(_qi(i, "vaccine_spelling", "Info", ["Vaccine type '%s' is spelled differently from '%s'" % (vtrim.iat[k], canon.iat[k]) for k in i],
             current=vtrim.iloc[i].values, suggested=canon.iloc[i].values))
     # --- duplicates
-    dup = w["key_id"].duplicated(keep=False)
-    i = np.where(dup.values)[0]
-    cnt = w["key_id"].map(w["key_id"].value_counts())
+    # Only a record entered twice is a duplicate: same names AND the same population and results. Records with the same names
+    # but other figures are different units (the file records no sub-district for most records): information, not a duplicate.
+    cd = classify_duplicates(df).reset_index(drop=True)
+    i = np.where(cd["cls"].isin(["exact", "same_record"]).values)[0]
     add(_qi(i, "duplicate_key", "Warning",
-            ["Same country, province, district, SIA date, round, vaccine and response appears %d times" % cnt.iat[k] for k in i]))
+            ["The same record appears %d times: same country, province, district, SIA date, round, vaccine and response, "
+             "and the same population and results" % cd["n"].iat[k] for k in i]))
+    i = np.where((cd["cls"] == "other_figures").values)[0]
+    add(_qi(i, "same_key_other_figures", "Info",
+            ["%d records have the same country, province, district, SIA date, round, vaccine and response but other population "
+             "or results: probably different units (no sub-district recorded), not duplicates" % cd["n"].iat[k] for k in i]))
 
     iss = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["idx", "check", "severity", "message", "current", "suggested"])
     if n_ctx:
-        iss = iss[(iss["idx"] >= n_ctx) & (iss["check"] != "duplicate_key")].copy()
+        iss = iss[(iss["idx"] >= n_ctx) & (~iss["check"].isin(["duplicate_key", "same_key_other_figures"]))].copy()
         iss["idx"] = iss["idx"] - n_ctx
         w = w.iloc[n_ctx:].copy()
         w["idx"] = w["idx"] - n_ctx
@@ -1893,8 +1991,7 @@ def run_check_only(a, rev_dir):
         print("geo_reference.csv not found: the province / country check is skipped", flush=True)
     x["_row"] = orig + 2
     dup_drop, dup_log, dup_groups = find_duplicates(x, "none")
-    print("duplicates: %d exact copies (would be removed by the update); %d groups with the same key but different values" %
-          (len(dup_log), int(dup_groups["duplicate_group"].nunique()) if len(dup_groups) else 0), flush=True)
+    print(dup_summary(dup_log, dup_groups, "none", check_only=True), flush=True)
     ctx_, existing_rows = None, pd.DataFrame()
     if a.repository:
         try:
