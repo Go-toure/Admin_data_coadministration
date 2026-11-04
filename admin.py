@@ -1211,6 +1211,55 @@ def cmd_inspect(a):
     print("  AFRO_admin_data_quality_report.xlsx (portal checks), lookup_check.xlsx, inspect.log\n")
 
 
+# ----------------------------------------------------------------------------------------------- duplicates
+def cmd_duplicates(a):
+    """List the duplicates of a file and what a build with --resolve-duplicates would do with each, so the fix can be decided
+    before it is made. Nothing is changed."""
+    path, label = resolve_source(a.source)
+    log("Looking for duplicates in %s" % label)
+    pd = _pd()
+    builder = import_builder()
+    df = load_norm(path)
+    if a.country:
+        df = df[df["Country"].map(builder._qcountry) == builder._qcountry(a.country)]
+    df = df.copy()
+    df["_row"] = df.index + 2          # the Excel row number
+    drop, exact, groups = builder.find_duplicates(df, "complete" if a.keep != "first" else "first")
+    n_exact = len(exact)
+    same = groups[groups["Class"].str.startswith("same record")] if len(groups) else groups
+    other = groups[~groups["Class"].str.startswith("same record")] if len(groups) else groups
+    print()
+    print("%s: %d records%s" % (label, len(df), (" of %s" % a.country) if a.country else ""))
+    print("  exact copies (every value the same; removed by every build):        %d" % n_exact)
+    print("  records entered twice (same names, same population and results):    %d records in %d groups"
+          % (len(same), same["duplicate_group"].nunique() if len(same) else 0))
+    print("  same names but other figures (different units, NOT duplicates):     %d records in %d groups"
+          % (len(other), other["duplicate_group"].nunique() if len(other) else 0))
+    if len(same):
+        print("\nRecords entered twice (kept = the %s):" % ("most complete record, then the first" if a.keep != "first" else "first record"))
+        for gid, g in same.groupby("duplicate_group", sort=False):
+            r0 = g.iloc[0]
+            print("\n  %s | %s | %s | %s | %s | %s | %s" % (r0["Country"], r0["Province"], r0["District"], r0["SIA_date"],
+                                                         r0["Round_Add"], r0["Vaccine_type"], r0["Response"]))
+            for r in g[g["Class"].str.startswith("same record")].itertuples():
+                print("     row %-6s vaccinated %-8s target %-8s filled cells %-4s -> %s" %
+                      (r.Excel_row, r.TotalNbrVaccPolio, r.PopPolio, r.Filled_cells, "KEEP" if r.Suggested == "keep" else "REMOVE"))
+            print("     cells that differ: %s" % (g.iloc[0]["Columns_that_differ"] or "none"))
+        print("\nTo remove them: build with the option 'remove the extra copy' (admin.py build -- --resolve-duplicates complete).")
+        print("Or correct the rows listed above in the SharePoint file and publish again.")
+    elif not n_exact:
+        print("\nNo record is entered twice. Nothing to fix.")
+    if not a.no_file:
+        od = WORK / "inspect" / dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        od.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(od / "Duplicates.xlsx") as w:
+            (groups if len(groups) else pd.DataFrame({"note": ["no duplicates"]})).to_excel(w, sheet_name="Duplicate_groups", index=False)
+            if n_exact:
+                exact.to_excel(w, sheet_name="Exact_copies", index=False)
+        print("\nThe list is in %s" % (od / "Duplicates.xlsx"))
+    print()
+
+
 # ----------------------------------------------------------------------------------------------- find
 def cmd_find(a):
     path, label = resolve_source(a.source)
@@ -1323,7 +1372,7 @@ RULES = [
     ("province", "Geography", "A Province that belongs to another country (per geo_reference.csv) is corrected when certain.", "Admin portal checks", "--no-fix-province"),
     ("text-clean", "Hygiene", "Stray control characters (carriage returns), line breaks and double / edge spaces in Country, Province, District, Response, Vaccine_type and Round_Add are removed.", "Found in District (KAJIADO EAST) 30 Oct 2026", "--no-clean-text"),
     ("dates", "Hygiene", "SIA_date written as text ('18-sept-20') becomes a real date.", "Admin portal", "(always)"),
-    ("duplicates", "Hygiene", "Exact copies are removed. A record entered twice (same key AND the same population and results) is reported as Duplicate record and removed only with --resolve-duplicates. Records with the same key but other population or results are different units (most records have no sub-district): never removed, reported only as information (Same names, other figures). Key = Country, Province, District, [Admin_3], SIA_date, Round_Add, Vaccine_type, Response, compared without accents, case or punctuation.", "Admin portal", "--no-dedupe, --resolve-duplicates"),
+    ("duplicates", "Hygiene", "Exact copies are removed. A record entered twice (same key AND the same population and results) is reported as Duplicate record and removed only with --resolve-duplicates. Records with the same key but other population or results are different units (most records have no sub-district): never removed, reported only as information (Same names, other figures). Key = Country, Province, District, [Admin_3], SIA_date, Round_Add, Vaccine_type, Response, compared without accents, case or punctuation.", "Admin portal", "--no-dedupe, --resolve-duplicates; admin.py duplicates lists them and what a fix would do; the Operations Center has the same choice on the Cycle tab"),
     ("quality", "Checks", "The portal quality checks (missing key field, coverage above the ceiling, target jumps, report date, province/country, co-administration consistency, vaccine spelling, duplicates) produce a report with Errors / Warnings / Info.", "Admin portal (run_admin_quality_check.R)", "--no-quality"),
 ]
 DECISIONS = [
@@ -1397,6 +1446,9 @@ def main():
     s = sub.add_parser("inspect"); s.add_argument("--source", help="live (default), vNN build, bN backup version, or a file")
     s.add_argument("--no-refresh-lookup", action="store_true")
     s.add_argument("--country")
+    s = sub.add_parser("duplicates", help="list the duplicates of a file and what removing them would do (nothing is changed)")
+    s.add_argument("--source", help="live (default), vNN build, bN backup version, or a file"); s.add_argument("--country")
+    s.add_argument("--keep", choices=["complete", "first"], default="complete"); s.add_argument("--no-file", action="store_true")
     s = sub.add_parser("find"); s.add_argument("--source"); s.add_argument("--country"); s.add_argument("--province")
     s.add_argument("--district"); s.add_argument("--response"); s.add_argument("--vaccine"); s.add_argument("--round")
     s.add_argument("--date", help="YYYY-MM-DD or YYYY-MM"); s.add_argument("--limit", type=int, default=40)
@@ -1412,7 +1464,7 @@ def main():
     fn = {"status": cmd_status, "runs": cmd_runs, "backup": cmd_backup, "lookup": cmd_lookup, "build": cmd_build, "check": cmd_check,
           "excel": cmd_excel, "publish": cmd_publish, "dictionary": cmd_dictionary, "all": cmd_all, "commit": cmd_commit,
           "sync-scope": cmd_sync_scope, "doctor": cmd_doctor, "inspect": cmd_inspect, "find": cmd_find,
-          "compare": cmd_compare, "rules": cmd_rules, "baseinfo": cmd_baseinfo}[a.cmd]
+          "compare": cmd_compare, "rules": cmd_rules, "baseinfo": cmd_baseinfo, "duplicates": cmd_duplicates}[a.cmd]
     log("admin.py %s" % " ".join(sys.argv[1:]), quiet=True)
     try:
         fn(a)
