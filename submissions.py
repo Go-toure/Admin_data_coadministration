@@ -17,7 +17,9 @@ What the inspection does for each file
   4. every record is compared with the live file: new / already there with the same figures / already there with other figures
      (those are only listed, they are never changed by a submission).
 Nothing is written to the live file here: the builder adds the accepted new records (add_coadmin_columns.py --add-records)."""
+import warnings
 import datetime as dt
+import difflib
 import hashlib
 import json
 import re
@@ -29,6 +31,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+warnings.filterwarnings("ignore", category=FutureWarning)
 KEY_COLS = ["Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response"]
 FIGURE_COLS = ["TotPop", "PopPolio", "TotalNbrVaccPolio", "Tot_Vacc_nOPV2", "Total_Vacc_bOPV", "CVPolio"]
 TEXT_COLS = ["Country", "Province", "District", "Admin_3", "Response", "Vaccine_type", "Round_Add"]
@@ -673,6 +676,133 @@ def population_from_live(ctx):
     return ctx._pop_live
 
 
+# ----------------------------------------------------------------------------------------------- district spelling, call-in workbooks
+def live_districts(ctx):
+    """{(country, province): {district key: spelling in the live file}}"""
+    if getattr(ctx, "_live_dist", None) is None:
+        b, L = ctx.builder, ctx.live
+        out = {}
+        for c, p_, d_ in zip(L["Country"].map(b._qcountry), L["Province"].map(cn), L["District"]):
+            if isinstance(d_, str) and d_.strip():
+                out.setdefault((c, p_), {}).setdefault(cn(d_), d_)
+        ctx._live_dist = out
+    return ctx._live_dist
+
+
+def align_districts(P, ctx, notes):
+    """A district that is not in the live file but has a close spelling there (GIREI / GIRIE) takes the live spelling. Only when exactly one
+    live name is close, that live name is not also a district of the file, and the province has live records."""
+    b, ld = ctx.builder, live_districts(ctx)
+    n = 0
+    keys = pd.DataFrame({"c": P["Country"].map(lambda v: "" if is_empty(v) else b._qcountry(v)), "p": P["Province"].map(lambda v: "" if is_empty(v) else cn(v))})
+    for (c, p_), g in keys.groupby(["c", "p"]):
+        live = ld.get((c, p_))
+        if not live:
+            continue
+        mine = {cn(x) for x in P.loc[g.index, "District"].dropna()}
+        free = [x for x in live if x not in mine]
+        for dname in sorted({x for x in P.loc[g.index, "District"].dropna()}):
+            k = cn(dname)
+            if k in live or not free:
+                continue
+            best = difflib.get_close_matches(k, free, n=2, cutoff=0.8)
+            if len(best) == 2 and difflib.SequenceMatcher(None, k, best[0]).ratio() - difflib.SequenceMatcher(None, k, best[1]).ratio() < 0.05:
+                continue
+            if best:
+                new = live[best[0]]
+                for i in P.index[(keys["c"] == c) & (keys["p"] == p_) & (P["District"] == dname)]:
+                    notes.add(rowref(P, i), "District", dname, new, "district spelling of the live file (close match)")
+                    P.at[i, "District"] = new
+                    n += 1
+    return n
+
+
+def read_callin(path):
+    """A daily call-in workbook (one sheet per state, nOPV and bOPV): {State, LGA, Target, Total, Used} per LGA."""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    out = []
+    try:
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(values_only=True, max_row=400))
+            hi = next((i for i, r in enumerate(rows[:6]) if r and any(isinstance(x, str) and x.strip() == "State" for x in r)), None)
+            if hi is None:
+                continue
+            h = [str(x).replace("\n", " ").strip().lower() if x is not None else "" for x in rows[hi]]
+            col = lambda pre: next((j for j, x in enumerate(h) if x.startswith(pre)), None)
+            cs, cl, ct, cc, cu = col("state"), col("lga"), col("target pop"), col("total children imm"), col("total vaccine us")
+            if None in (cs, cl, cc):
+                continue
+            for r in rows[hi + 1:]:
+                if r and isinstance(r[cl], str) and r[cl].strip() and isinstance(r[cs], str) and r[cs].strip().lower() != "total":
+                    g = lambda c: (r[c] if c is not None and c < len(r) and isinstance(r[c], (int, float)) else np.nan)
+                    out.append({"State": r[cs].strip(), "LGA": re.sub(r"\s+lga$", "", r[cl].strip(), flags=re.I), "Target": g(ct), "Total": g(cc), "Used": g(cu)})
+    finally:
+        wb.close()
+    c = pd.DataFrame(out)
+    if not len(c):
+        return c
+    c = c.groupby(["State", "LGA"], as_index=False).agg(Target=("Target", "max"), Total=("Total", lambda x: x.sum(min_count=1)), Used=("Used", lambda x: x.sum(min_count=1)))
+    c["k"] = [(cn(a), cn(b_)) for a, b_ in zip(c["State"], c["LGA"])]
+    return c
+
+
+def use_callin(P, ctx, notes, det, name):
+    """eTally records: the target population and a cross-check come from the country's call-in workbook for the same campaign (the one whose
+    figures agree with the eTally for at least half of the LGAs). Rule: children vaccinated = eTally, target population = call-in."""
+    allf = getattr(ctx, "_callin_files", None) or {}
+    ctry = P["Country"].dropna().mode()
+    files = allf.get(ctry.iat[0], []) if len(ctry) else []
+    want = ((getattr(ctx, "_campaign_hints", None) or {}).get(name) or {}).get("callin")
+    if want:
+        files = [f for f in files if Path(f).name == want]
+    elif (getattr(ctx, "_etally_names", None) or {}).get(ctry.iat[0] if len(ctry) else None, 1) > 1:
+        return            # several eTally files in the folder: say which call-in workbook goes with this one in campaign_hints.json ("callin")
+    cache = getattr(ctx, "_callin_cache", None)
+    if cache is None:
+        cache = ctx._callin_cache = {}
+    k = [(cn(a), cn(b_)) for a, b_ in zip(P["Province"], P["District"])]
+    best = None
+    for cp in files:
+        if cp not in cache:
+            try:
+                cache[cp] = read_callin(cp)
+            except Exception:
+                cache[cp] = pd.DataFrame()
+        c = cache[cp]
+        if not len(c):
+            continue
+        m = pd.DataFrame({"k": k, "et": pd.to_numeric(P["TotalNbrVaccPolio"], errors="coerce").values}).merge(c[["k", "Target", "Total"]], on="k", how="left")
+        ok = m.dropna(subset=["et", "Total"])
+        ok = ok[ok["Total"] > 0]
+        if len(ok) < 20:
+            continue
+        agree = float(((ok["et"] / ok["Total"] - 1).abs() <= 0.2).mean())
+        if (agree >= 0.5 or want) and (best is None or agree > best[0]):
+            best = (agree, cp, c)
+    if best is None:
+        return
+    agree, cp, c = best
+    cmp_ = pd.DataFrame({"State": P["Province"].values, "LGA": P["District"].values, "k": k, "eTally": pd.to_numeric(P["TotalNbrVaccPolio"], errors="coerce").values}).merge(
+        c[["k", "Target", "Total"]].rename(columns={"Total": "Call_in", "Target": "Call_in_target"}), on="k", how="left")
+    cmp_["Gap_pct"] = ((cmp_["eTally"] / cmp_["Call_in"].where(cmp_["Call_in"] > 0) - 1) * 100).round(1)
+    cmp_["Verdict"] = np.where(cmp_["Call_in"].isna() | (cmp_["Call_in"] <= 0), "no call-in figure", np.where(cmp_["Gap_pct"].abs() <= 5, "agree (within 5%)",
+                               np.where(cmp_["Gap_pct"].abs() <= 20, "differ 5-20%", "differ more than 20%: confirm with the country")))
+    det["callin_check"] = cmp_.drop(columns="k")
+    det["callin_name"] = Path(cp).name
+    n = 0
+    for i in P.index:
+        t = cmp_.at[i, "Call_in_target"]
+        if not pd.isna(t) and t > 0:
+            old = P.at[i, "PopPolio"]
+            if is_empty(old) or pd.isna(old) or abs(float(old) - float(t)) > 0.5:
+                notes.add(rowref(P, i), "PopPolio", "" if is_empty(old) or pd.isna(old) else old, float(t), "target population of the call-in workbook %s (same campaign)" % Path(cp).name)
+            P.at[i, "PopPolio"] = float(t)
+            n += 1
+    det["callin_summary"] = "eTally against the call-in workbook %s: %d of %d LGAs within 20%%, %d differ by more than 20%%; target population of %d LGAs from the call-in" % (
+        Path(cp).name, int(round(agree * (cmp_["Call_in"] > 0).sum())), int((cmp_["Call_in"] > 0).sum()), int(cmp_["Verdict"].str.startswith("differ more").sum()), n)
+
+
 KINDS = (("lqas", "an LQAS file"), ("monitor", "a monitoring (IM) file"), ("_im_", "a monitoring (IM) file"), ("im_polio", "a monitoring (IM) file"),
          ("etally", "an eTally file"), ("tally", "a tally sheet"), ("aefi", "an AEFI file"), ("supplies", "a supplies file"), ("dqc", "a list of data-quality issues"),
          ("synthese", "a monitoring summary"), ("resultats", "a results summary"), ("daily call", "a call-in report"), ("vaccine utilization", "a vaccine utilisation summary"))
@@ -691,7 +821,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     b = ctx.builder
     name = Path(path).name
     s = {"name": name, "size": Path(path).stat().st_size, "hash": sha256_of(path), "layout": "", "sheet": "", "header_row": "",
-         "rows_read": 0, "rows_used": 0, "excluded": 0, "new": 0, "existing_same": 0, "existing_different": 0, "existing_units": 0, "in_file_duplicates_removed": 0,
+         "rows_read": 0, "rows_used": 0, "excluded": 0, "new": 0, "existing_same": 0, "existing_different": 0, "existing_units": 0, "possible_dup": 0, "in_file_duplicates_removed": 0,
          "qc_errors": 0, "qc_warnings": 0, "countries": "", "status": "blocked", "why": ""}
     det = {"layout": None, "notes": None, "excluded": [], "issues": None, "compare": None, "diffs": None, "campaigns": None, "dups": None}
     lay, et_raw = None, None
@@ -783,6 +913,12 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
                 P.at[i, "Province"] = new
         except Exception:
             pass
+    # a district with a close spelling in the live file (same province) takes the live spelling
+    if ctx.live is not None:
+        try:
+            align_districts(P, ctx, notes)
+        except Exception as e:
+            det.setdefault("warnings", []).append("District spelling check failed: %s" % e)
     # vaccine and round, in the spelling of the live file
     vmap = {cn(v): v for v in prof["values"].get("Vaccine_type", ())}
     for i, v in P["Vaccine_type"].items():
@@ -857,6 +993,10 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
                     nfill += 1
                     notes.add(rowref(P, i), "PopPolio", "", float(v), "target population of the latest live record of this LGA (an eTally file has none)")
         det.setdefault("warnings", []).append("%d of %d LGA(s) got their target population from the live file" % (nfill, len(P)))
+        try:
+            use_callin(P, ctx, notes, det, name)
+        except Exception as e:
+            det.setdefault("warnings", []).append("Call-in comparison failed: %s" % e)
     # campaign values the operator gave for this file (campaign_hints.json: {"file name": {"Response": .., "Round_Add": .., "Vaccine_type": .., "SIA_date": ..}})
     given = (getattr(ctx, "_campaign_hints", None) or {}).get(name)
     if given:
@@ -960,6 +1100,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     s["existing_same"] = int((cmp_["Status"] == "already in the live file, same figures").sum())
     s["existing_different"] = int((cmp_["Status"] == "already in the live file, other figures").sum())
     s["existing_units"] = int(cmp_["Status"].str.startswith("same names as several").sum())
+    s["possible_dup"] = int(cmp_["Status"].str.startswith("possible duplicate").sum())
     # derived columns and the live file's constants
     yr = P["SIA_date"].dt.year.astype(float)
     mo = P["SIA_date"].dt.month.astype(float)
@@ -1025,12 +1166,22 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("%d record(s) already in the live file with other figures (not changed)" % s["existing_different"])
     if s["existing_units"]:
         reasons.append("%d record(s) with the same names as several live records and none identical (not added)" % s["existing_units"])
+    if s.get("possible_dup"):
+        reasons.append("%d record(s) that look like live records under another campaign name, round or date (not added): see the Records sheet" % s["possible_dup"])
     if lay["class"] != "template":
         reasons.append("layout: " + lay["class"])
     if det.get("inferred"):
         reasons.append("campaign details taken from the lookup / the file name, not written in the file (please confirm): " + "; ".join(det["inferred"][:3]))
     if lay.get("etally"):
         reasons.append("; ".join(lay["notes"][:1]))
+    if det.get("callin_summary"):
+        reasons.append(det["callin_summary"])
+    # a file that is mostly another country's records than the folder it is in is in the wrong place
+    if folder_country and len(P) >= 50:
+        oc = P["Country"].map(lambda v: v != folder_country)
+        if oc.mean() > 0.5:
+            reasons.insert(0, "WRONG FILE OR WRONG FOLDER: %d of %d records are of other countries than the folder (%s); not usable, delete it from the folder" % (int(oc.sum()), len(P), folder_country))
+            s["wrong_place"] = True
     if lay.get("skipped_sheets"):
         reasons.append("sheet(s) with column names but not usable, not read: %s" % ", ".join(str(x) for x in lay["skipped_sheets"]))
     if folder_country and len(P):
@@ -1048,12 +1199,36 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     if s["new"] == 0:
         reasons.append("no new record")
     s["status"] = "ready" if not reasons else "review"
-    if reasons == ["no new record"] or (s["new"] == 0 and not s["qc_errors"] and not s["existing_different"] and not s["existing_units"]):
+    if s.get("wrong_place"):
+        s["status"] = "blocked"
+    if not s.get("wrong_place") and (reasons == ["no new record"] or (s["new"] == 0 and not s["qc_errors"] and not s["existing_different"] and not s["existing_units"] and not s.get("possible_dup"))):
         s["status"] = "nothing new"
     s["why"] = "; ".join(reasons)
+    P = P[(cmp_["Status"] == "new").values]                 # only the records the live file does not have go to the build
     P = P.drop(columns=["_src_row", "_sheet"])
     P = P[template_cols]
     return s, P, det
+
+
+def place_index(ctx):
+    """{(country, province, district): [(live label, date, vaccine family, total vaccinated, target population, Response, Round_Add)]}"""
+    if getattr(ctx, "_place_idx", None) is None:
+        b, L = ctx.builder, ctx.live
+        cc, pp, dd = L["Country"].map(b._qcountry), L["Province"].map(cn), L["District"].map(cn)
+        dts = pd.to_datetime(L["SIA_date"], errors="coerce")
+        tot = pd.to_numeric(L["TotalNbrVaccPolio"], errors="coerce")
+        pop = pd.to_numeric(L["PopPolio"], errors="coerce")
+        vf = L["Vaccine_type"].map(vaccine_family(b))
+        idx = {}
+        for lab, a, p_, d_, t_, tt, po, v, rs, ro in zip(L.index, cc, pp, dd, dts, tot, pop, vf, L["Response"], L["Round_Add"]):
+            if not pd.isna(t_):
+                idx.setdefault((a, p_, d_), []).append((lab, t_, v, tt, po, rs, ro))
+        ctx._place_idx = idx
+    return ctx._place_idx
+
+
+def vaccine_family(b):
+    return lambda v: frozenset(b._vset(v)) or frozenset({cn(v)}) if isinstance(v, str) and v.strip() else frozenset()
 
 
 def compare_with_live(P, ctx, prof):
@@ -1067,6 +1242,25 @@ def compare_with_live(P, ctx, prof):
         cand = ctx.live_index.get(k)
         if not cand:
             st, note = "new", ""
+            # same place, same vaccine, and the same figures (or the same date) in the live file under another campaign name, round or date
+            pl = place_index(ctx).get((b._qcountry(P.at[i, "Country"]), cn(P.at[i, "Province"]), cn(P.at[i, "District"])))
+            if pl and not pd.isna(P.at[i, "SIA_date"]):
+                fam = vaccine_family(b)(P.at[i, "Vaccine_type"])
+                tot, pop = P.at[i, "TotalNbrVaccPolio"] if "TotalNbrVaccPolio" in P.columns else np.nan, P.at[i, "PopPolio"] if "PopPolio" in P.columns else np.nan
+                for lab, d_, v, tt, po, rs, ro in pl:
+                    if not (fam & v if fam and v else False):
+                        continue
+                    gap = abs((pd.Timestamp(P.at[i, "SIA_date"]) - d_).days)
+                    same_fig = (not pd.isna(tot)) and (not pd.isna(tt)) and tot > 0 and abs(tot - tt) < 0.5
+                    if same_fig and gap <= 120:
+                        st = "possible duplicate: same figures as a live record of another campaign name, round or date"
+                        note = "live row %d (%s %s, %s, %d day(s) apart)" % (lab + 2, rs, ro, d_.strftime("%Y-%m-%d"), gap)
+                        if not (pd.isna(pop) or pd.isna(po)) and abs(pop - po) >= 0.5:
+                            note += "; same children vaccinated but the target population differs (file %d, live %d)" % (pop, po)
+                        break
+                    if gap <= 10 and not same_fig and st == "new":
+                        st = "possible duplicate: same place, date and vaccine as a live record of another campaign name or round, other figures"
+                        note = "live row %d (%s %s, %s)" % (lab + 2, rs, ro, d_.strftime("%Y-%m-%d"))
         else:
             best, best_d = None, None
             for j in cand:
@@ -1181,6 +1375,18 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
     scratch.mkdir(parents=True, exist_ok=True)
     files, not_read = list_files(folder, scratch)
     log("%d data file(s) in %s (%d other file(s) not read)" % (len(files), folder, len(not_read)))
+    ctx._callin_files = {}
+    for p0, rel0 in files:
+        if re.search(r"call[\s_\-]*in", Path(rel0).name, re.I) and str(p0).lower().endswith((".xlsx", ".xlsm")):
+            fc0 = folder_country_of(rel0, ctx.geo, ctx.builder)
+            if fc0:
+                ctx._callin_files.setdefault(fc0, []).append(p0)
+    ctx._etally_names = {}
+    for p0, rel0 in files:
+        if "etally" in Path(rel0).name.lower():
+            fc0 = folder_country_of(rel0, ctx.geo, ctx.builder)
+            ctx._etally_names.setdefault(fc0, set()).add(Path(rel0).name.lower())
+    ctx._etally_names = {k: len(v) for k, v in ctx._etally_names.items()}
     prof = learn_profile(ctx.live, ctx.builder, ctx.geo)
     rows, details = [], {}
     seen_hashes = set()
@@ -1200,6 +1406,7 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
         e = old or {"decision": None, "decided_by": "", "decided_at": "", "note": "", "first_seen": now}
         e.update({k: s[k] for k in ("name", "path", "size", "hash", "layout", "rows_read", "rows_used", "excluded", "new", "existing_same",
                                     "existing_different", "existing_units", "qc_errors", "qc_warnings", "countries", "status", "why")})
+        e["possible_dup"] = s.get("possible_dup", 0)
         e.update({"prepared": prepared, "last_inspected": now, "present": True})
         ledger["files"][h] = e
         rows.append(dict(s, decision=e["decision"] or "", decided_by=e["decided_by"]))
@@ -1223,10 +1430,10 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
 def write_report(path, rows, details, ctx, not_read=()):
     ov = pd.DataFrame(rows)
     cols = ["name", "path", "status", "decision", "layout", "countries", "rows_read", "rows_used", "excluded", "new", "existing_same",
-            "existing_different", "existing_units", "in_file_duplicates_removed", "qc_errors", "qc_warnings", "why", "hash"]
+            "existing_different", "existing_units", "possible_dup", "in_file_duplicates_removed", "qc_errors", "qc_warnings", "why", "hash"]
     ov = ov[[c for c in cols if c in ov.columns]].rename(columns={"name": "File", "path": "Path", "status": "Status", "decision": "Decision",
         "layout": "Layout", "countries": "Countries", "rows_read": "Rows read", "rows_used": "Rows used", "excluded": "Rows left out",
-        "new": "New records", "existing_same": "Already there (same)", "existing_different": "Already there (other figures)", "existing_units": "Same names as several live records (not added)",
+        "new": "New records", "existing_same": "Already there (same)", "existing_different": "Already there (other figures)", "existing_units": "Same names as several live records (not added)", "possible_dup": "Possible duplicates (not added)",
         "in_file_duplicates_removed": "Exact copies removed", "qc_errors": "Records with an Error", "qc_warnings": "Records with a Warning",
         "why": "Why not ready", "hash": "Content hash"})
     sheets = {"Overview": ov}
@@ -1269,7 +1476,7 @@ def write_report(path, rows, details, ctx, not_read=()):
             rows_h.append({"Header": x, "In files": len(c["files"]), "Example file": sorted(c["files"])[0],
                            "Closest template column": tcols[near[0]] if near else "", "To teach it": '"%s": "%s"' % (x, tcols[near[0]]) if near else ""})
         sheets["Headers_to_learn"] = pd.DataFrame(rows_h)
-    for name, key in (("Campaign_to_set", "to_set"), ("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
+    for name, key in (("Campaign_to_set", "to_set"), ("eTally_vs_callin", "callin_check"), ("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
                       ("Normalised_cells", "notes"), ("Defaults_from_live", "defaults"), ("Left_out", "excluded_df"), ("Not_numbers", "bad_numbers"),
                       ("Values_not_seen", "unseen"), ("Duplicates_in_file", "dups"), ("Campaigns_vs_lookup", "campaigns")):
         if key == "excluded_df":
