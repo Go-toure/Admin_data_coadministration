@@ -198,24 +198,10 @@ def _read_csv(path, nrows=None):
     raise last
 
 
-def detect_layout(path, template_cols):
-    """Find the sheet and the header row, and map the headers to the template. Returns a dict (see keys)."""
-    tn = {cn(c): c for c in template_cols}
-    best = None
-    for sn, raw in read_head(path).items():
-        for r in range(min(len(raw), 25)):
-            vals = [v for v in raw.iloc[r].tolist() if not is_empty(v)]
-            hits = sum(1 for v in vals if cn(v) in tn or cn(v) in SYNONYMS)
-            if best is None or hits > best[0]:
-                best = (hits, sn, r)
-    lay = {"sheet": None, "header_row": None, "map": {}, "synonym": [], "ignored": [], "missing_keys": list(KEY_COLS), "class": "not usable",
-           "template_columns_found": 0, "notes": []}
-    if best is None or best[0] < 3:
-        lay["notes"].append("no row with column names of the template was found in the first 25 rows of any sheet")
-        return lay
-    _, sn, r = best
-    lay["sheet"], lay["header_row"] = sn, r
-    raw = read_head(path)[sn]
+def _map_header(raw, r, tn, template_cols, assume):
+    """Map the header row r of one sheet to the template. Returns a layout dict."""
+    lay = {"sheet": None, "header_row": r, "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "class": "not usable",
+           "template_columns_found": 0, "notes": [], "extra": []}
     seen = {}
     for j, v in enumerate(raw.iloc[r].tolist()):
         if is_empty(v):
@@ -232,12 +218,13 @@ def detect_layout(path, template_cols):
             lay["map"][j] = tgt
             if not certain:
                 lay["synonym"].append("%s -> %s" % (v, tgt))
-    lay["missing_keys"] = [k for k in KEY_COLS if k not in seen]
+    lay["missing_keys"] = [k for k in KEY_COLS if k not in seen and k not in assume]
+    lay["country_from_folder"] = "Country" not in seen and "Country" in assume
     lay["template_columns_found"] = len(seen)
     if lay["missing_keys"]:
         lay["class"] = "not usable"
         lay["notes"].append("key columns missing: " + ", ".join(lay["missing_keys"]))
-    elif lay["synonym"]:
+    elif lay["synonym"] or lay["country_from_folder"]:
         lay["class"] = "mapped (headers differ)"
     elif len(seen) >= 0.9 * len(template_cols):
         lay["class"] = "template"
@@ -246,21 +233,75 @@ def detect_layout(path, template_cols):
     return lay
 
 
-def read_records(path, lay):
+def detect_layout(path, template_cols, assume=()):
+    """Find the sheets with records and their header rows, and map the headers to the template. Every sheet that has the columns of the
+    template (or certain synonyms) is read: the best one is the layout itself, the others are in lay['extra']. 'assume' = key columns
+    that may be missing because they are known from elsewhere (the Country of the folder)."""
+    tn = {cn(c): c for c in template_cols}
+    heads = read_head(path)
+    found = []                                   # (hits, sheet, header row) of the best header row of each sheet
+    for sn, raw in heads.items():
+        best = None
+        for r in range(min(len(raw), 25)):
+            vals = [v for v in raw.iloc[r].tolist() if not is_empty(v)]
+            hits = sum(1 for v in vals if cn(v) in tn or cn(v) in SYNONYMS)
+            if best is None or hits > best[0]:
+                best = (hits, sn, r)
+        if best and best[0] >= 3:
+            found.append(best)
+    lay = {"sheet": None, "header_row": None, "map": {}, "synonym": [], "ignored": [], "missing_keys": list(KEY_COLS), "class": "not usable",
+           "template_columns_found": 0, "notes": [], "extra": []}
+    if not found:
+        lay["notes"].append("no row with column names of the template was found in the first 25 rows of any sheet")
+        return lay
+    found.sort(key=lambda x: -x[0])
+    layouts = []
+    for hits, sn, r in found:
+        L = _map_header(heads[sn], r, tn, template_cols, assume)
+        L["sheet"] = sn
+        layouts.append(L)
+    usable = [L for L in layouts if L["class"] != "not usable"]
+    if not usable:
+        lay = layouts[0]
+        return lay
+    lay = usable[0]
+    lay["extra"] = usable[1:]
+    for L in layouts:
+        if L["class"] == "not usable":
+            lay["notes"].append("sheet '%s' not read: %s" % (L["sheet"], "; ".join(L["notes"])))
+            lay["skipped_sheets"] = lay.get("skipped_sheets", []) + [L["sheet"]]
+    if any(L["class"] == "mapped (headers differ)" for L in usable):
+        lay["class"] = "mapped (headers differ)"
+    return lay
+
+
+def _read_sheet(path, L):
     if str(path).lower().endswith(".csv"):
         raw = _read_csv(path)
     else:
-        raw = pd.read_excel(path, sheet_name=lay["sheet"], header=None, dtype=object)
-    r = lay["header_row"]
+        raw = pd.read_excel(path, sheet_name=L["sheet"], header=None, dtype=object)
+    r = L["header_row"]
     body = raw.iloc[r + 1:].copy()
-    body["_src_row"] = np.arange(r + 2, r + 2 + len(body))     # the row in the file as Excel shows it
-    keep = {j: t for j, t in lay["map"].items()}
-    out = pd.DataFrame({t: body.iloc[:, j].values for j, t in keep.items()}, index=body.index)
-    out["_src_row"] = body["_src_row"].values
+    src = np.arange(r + 2, r + 2 + len(body))     # the row in the file as Excel shows it
+    out = pd.DataFrame({t: body.iloc[:, j].values for j, t in L["map"].items()}, index=body.index)
+    out["_src_row"] = src
+    out["_sheet"] = L["sheet"]
     return out.reset_index(drop=True)
 
 
-# ----------------------------------------------------------------------------------------------- one file
+def read_records(path, lay):
+    parts = [_read_sheet(path, L) for L in [lay] + list(lay.get("extra") or [])]
+    return parts[0] if len(parts) == 1 else pd.concat(parts, ignore_index=True)
+
+
+def rowref(P, i):
+    """The row of record i in the file: 15, or 'Sheet2!15' when records come from several sheets."""
+    r = int(P["_src_row"].iat[i])
+    if "_sheet" in P.columns and P["_sheet"].nunique() > 1:
+        return "%s!%d" % (P["_sheet"].iat[i], r)
+    return r
+
+
 class Notes:
     def __init__(self, cap=30000):
         self.rows, self.counts, self.cap = [], Counter(), cap
@@ -271,7 +312,7 @@ class Notes:
             self.rows.append({"Row_in_file": src_row, "Column": col, "Found": found, "Set_to": new, "Rule": rule})
 
 
-def prepare_file(path, ctx, prof, template_cols):
+def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     """Inspect one file. Returns (summary dict, prepared DataFrame in template layout or None, detail dict of frames)."""
     b = ctx.builder
     name = Path(path).name
@@ -280,13 +321,14 @@ def prepare_file(path, ctx, prof, template_cols):
          "qc_errors": 0, "qc_warnings": 0, "countries": "", "status": "blocked", "why": ""}
     det = {"layout": None, "notes": None, "excluded": [], "issues": None, "compare": None, "diffs": None, "campaigns": None, "dups": None}
     try:
-        lay = detect_layout(path, template_cols)
+        lay = detect_layout(path, template_cols, assume=("Country",) if folder_country else ())
     except Exception as e:
         s["why"] = "the file could not be opened (%s)" % type(e).__name__
         det["layout"] = {"class": "not readable", "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "notes": [str(e)[:200]]}
         return s, None, det
     det["layout"] = lay
-    s["layout"], s["sheet"], s["header_row"] = lay["class"], lay["sheet"], (lay["header_row"] + 1) if lay["header_row"] is not None else ""
+    s["layout"], s["header_row"] = lay["class"], (lay["header_row"] + 1) if lay["header_row"] is not None else ""
+    s["sheet"] = ", ".join(str(x) for x in ([lay["sheet"]] + [L["sheet"] for L in lay.get("extra") or []]) if x is not None)
     if lay["class"] == "not usable":
         s["why"] = "; ".join(lay["notes"])
         return s, None, det
@@ -295,6 +337,7 @@ def prepare_file(path, ctx, prof, template_cols):
     notes = Notes()
     P = pd.DataFrame({c: raw[c] if c in raw.columns else None for c in template_cols}, dtype=object)
     P["_src_row"] = raw["_src_row"].values
+    P["_sheet"] = raw["_sheet"].values
     # rows with nothing in the key and figure columns are empty lines; a "TOTAL" line is not a record
     core = [c for c in KEY_COLS + ["PopPolio", "TotalNbrVaccPolio"] if c in raw.columns]
     empty_line = raw[core].map(is_empty).all(axis=1).values
@@ -302,8 +345,13 @@ def prepare_file(path, ctx, prof, template_cols):
     for c in ("Country", "Province", "District"):
         totals |= P[c].map(lambda v: isinstance(v, str) and bool(re.match(r"^\s*(grand\s+)?total\b", v, re.I))).values
     for i in np.where(totals & ~empty_line)[0]:
-        det["excluded"].append({"Row_in_file": int(P["_src_row"].iat[i]), "Reason": "a total line, not a record"})
+        det["excluded"].append({"Row_in_file": rowref(P, i), "Reason": "a total line, not a record"})
     P = P[~empty_line & ~totals].reset_index(drop=True)
+    # the Country of the folder fills a Country column that is missing or empty
+    if folder_country:
+        for i in P.index[P["Country"].map(is_empty)]:
+            P.at[i, "Country"] = folder_country
+            notes.add(rowref(P, i), "Country", "", folder_country, "country of the folder the file is in")
     # text
     for c in TEXT_COLS:
         for i, v in P[c].items():
@@ -312,7 +360,7 @@ def prepare_file(path, ctx, prof, template_cols):
                 continue
             t = re.sub(r"\s+", " ", re.sub(r"_x000D_", " ", str(v))).strip()
             if t != v:
-                notes.add(P["_src_row"].iat[i], c, v, t, "spaces / control characters")
+                notes.add(rowref(P, i), c, v, t, "spaces / control characters")
             P.at[i, c] = t
     # country and province: the geography reference's spelling
     if ctx.geo is not None:
@@ -322,17 +370,17 @@ def prepare_file(path, ctx, prof, template_cols):
                 continue
             t = std.get(b._qcountry(v))
             if t and t != v:
-                notes.add(P["_src_row"].iat[i], "Country", v, t, "country name of the geography reference")
+                notes.add(rowref(P, i), "Country", v, t, "country name of the geography reference")
                 P.at[i, "Country"] = t
     for c in prof["upper"]:
         for i, v in P[c].items():
             if isinstance(v, str) and v != v.upper():
-                notes.add(P["_src_row"].iat[i], c, v, v.upper(), "capitals, like the live file")
+                notes.add(rowref(P, i), c, v, v.upper(), "capitals, like the live file")
                 P.at[i, c] = v.upper()
     if ctx.geo is not None:
         try:
             for i, (old, new) in b.fix_province_spelling(P, ctx.geo).items():
-                notes.add(P["_src_row"].iat[i], "Province", old, new, "province spelling of the geography reference")
+                notes.add(rowref(P, i), "Province", old, new, "province spelling of the geography reference")
                 P.at[i, "Province"] = new
         except Exception:
             pass
@@ -342,7 +390,7 @@ def prepare_file(path, ctx, prof, template_cols):
         if isinstance(v, str):
             t = vmap.get(cn(v))
             if t and t != v:
-                notes.add(P["_src_row"].iat[i], "Vaccine_type", v, t, "vaccine spelling of the live file")
+                notes.add(rowref(P, i), "Vaccine_type", v, t, "vaccine spelling of the live file")
                 P.at[i, "Vaccine_type"] = t
     for i, v in P["Round_Add"].items():
         if v is None:
@@ -351,7 +399,7 @@ def prepare_file(path, ctx, prof, template_cols):
         if m:
             t = "Rnd%d" % int(m.group(1))
             if t != v:
-                notes.add(P["_src_row"].iat[i], "Round_Add", v, t, "round written as Rnd<number>")
+                notes.add(rowref(P, i), "Round_Add", v, t, "round written as Rnd<number>")
                 P.at[i, "Round_Add"] = t
     # dates
     for c in DATE_COLS:
@@ -369,7 +417,7 @@ def prepare_file(path, ctx, prof, template_cols):
                     cache[key] = b.parse_sia_text(v)
             t = cache[key]
             if not isinstance(v, (pd.Timestamp, dt.datetime, dt.date)) and t is not pd.NaT and not pd.isna(t):
-                notes.add(P["_src_row"].iat[i], c, v, t.strftime("%Y-%m-%d"), "date written as text or as a number")
+                notes.add(rowref(P, i), c, v, t.strftime("%Y-%m-%d"), "date written as text or as a number")
             vals.append(t)
         P[c] = pd.to_datetime(pd.Series(vals, index=P.index), errors="coerce")
     # numbers
@@ -382,12 +430,12 @@ def prepare_file(path, ctx, prof, template_cols):
         for i, v in P[c].items():
             x, how = num_value(v, pct_ok)
             if how is None:
-                bad_num.append({"Row_in_file": int(P["_src_row"].iat[i]), "Column": c, "Value": v})
+                bad_num.append({"Row_in_file": rowref(P, i), "Column": c, "Value": v})
                 x = np.nan
             elif how and how != "percent sign kept as it is":
-                notes.add(P["_src_row"].iat[i], c, v, x, how)
+                notes.add(rowref(P, i), c, v, x, how)
             elif how:
-                notes.add(P["_src_row"].iat[i], c, v, x, how)
+                notes.add(rowref(P, i), c, v, x, how)
             out.append(x)
         P[c] = pd.Series(out, index=P.index, dtype=float)
     det["bad_numbers"] = pd.DataFrame(bad_num)
@@ -396,11 +444,11 @@ def prepare_file(path, ctx, prof, template_cols):
         try:
             for i, inf in b.fill_blank_response(P, ctx.lookup).items():
                 P.at[i, "Response"] = inf["set"]["Response"]
-                notes.add(P["_src_row"].iat[i], "Response", "", inf["set"]["Response"], inf["why"])
+                notes.add(rowref(P, i), "Response", "", inf["set"]["Response"], inf["why"])
             for i, inf in b.align_response_names(P, ctx.lookup, None).items():
                 old = P.at[i, "Response"]
                 P.at[i, "Response"] = inf["set"]["Response"]
-                notes.add(P["_src_row"].iat[i], "Response", old, inf["set"]["Response"], inf["why"])
+                notes.add(rowref(P, i), "Response", old, inf["set"]["Response"], inf["why"])
         except Exception as e:
             det.setdefault("warnings", []).append("Response filling from the lookup failed: %s" % e)
     # rows that cannot be used
@@ -410,19 +458,19 @@ def prepare_file(path, ctx, prof, template_cols):
         if miss:
             bad.append((i, "key field empty or unreadable: " + ", ".join(miss)))
     for i, why in bad:
-        det["excluded"].append({"Row_in_file": int(P["_src_row"].iat[i]), "Reason": why})
+        det["excluded"].append({"Row_in_file": rowref(P, i), "Reason": why})
     P = P.drop(index=[i for i, _ in bad]).reset_index(drop=True)
     # duplicates inside the file: exact copies are dropped
     if len(P):
-        T = to_text(P.drop(columns="_src_row"), prof["numeric"])
+        T = to_text(P.drop(columns=["_src_row", "_sheet"]), prof["numeric"])
         cd = b.classify_duplicates(T)
         ex = cd["cls"] == "exact"
         drop = ex & (cd.groupby(["key", "sig"]).cumcount() > 0)
-        det["dups"] = pd.DataFrame({"Row_in_file": P["_src_row"].values, "Class": cd["cls"].values, "Records_with_this_key": cd["n"].values})
+        det["dups"] = pd.DataFrame({"Row_in_file": [rowref(P, j) for j in range(len(P))], "Class": cd["cls"].values, "Records_with_this_key": cd["n"].values})
         det["dups"] = det["dups"][det["dups"]["Class"] != ""]
         s["in_file_duplicates_removed"] = int(drop.sum())
         for i in np.where(drop.values)[0]:
-            det["excluded"].append({"Row_in_file": int(P["_src_row"].iat[i]), "Reason": "exact copy of another record of the file"})
+            det["excluded"].append({"Row_in_file": rowref(P, i), "Reason": "exact copy of another record of the file"})
         P = P[~drop.values].reset_index(drop=True)
     s["rows_used"] = len(P)
     s["excluded"] = s["rows_read"] - len(P)
@@ -445,7 +493,7 @@ def prepare_file(path, ctx, prof, template_cols):
         if col in P.columns:
             cur = pd.to_numeric(P[col], errors="coerce")
             for i in np.where((cur != ser).values)[0]:
-                notes.add(P["_src_row"].iat[i], col, None if pd.isna(cur.iat[i]) else cur.iat[i], ser.iat[i], "derived from SIA_date")
+                notes.add(rowref(P, i), col, None if pd.isna(cur.iat[i]) else cur.iat[i], ser.iat[i], "derived from SIA_date")
             P[col] = ser
     ckeys = P["Country"].map(b._qcountry)
     for col, mp in prof["country_map"].items():
@@ -457,10 +505,10 @@ def prepare_file(path, ctx, prof, template_cols):
                 cur = P.at[i, col]
                 if is_empty(cur):
                     P.at[i, col] = v
-                    notes.add(P["_src_row"].iat[i], col, "", v, "country code / block of the live file")
+                    notes.add(rowref(P, i), col, "", v, "country code / block of the live file")
                 elif str(cur).strip() != str(v):
                     P.at[i, col] = v
-                    notes.add(P["_src_row"].iat[i], col, cur, v, "code of another country replaced by the code of the live file")
+                    notes.add(rowref(P, i), col, cur, v, "code of another country replaced by the code of the live file")
     filled = Counter()
     for col in template_cols:
         if col not in prof["defaults"] and col not in prof["country_defaults"]:
@@ -505,6 +553,14 @@ def prepare_file(path, ctx, prof, template_cols):
         reasons.append("%d record(s) with the same names as several live records and none identical (not added)" % s["existing_units"])
     if lay["class"] != "template":
         reasons.append("layout: " + lay["class"])
+    if lay.get("skipped_sheets"):
+        reasons.append("sheet(s) with column names but not usable, not read: %s" % ", ".join(str(x) for x in lay["skipped_sheets"]))
+    if folder_country and len(P):
+        other = P["Country"].map(lambda v: v != folder_country)
+        if other.any():
+            others = P.loc[other, "Country"].value_counts().head(3)
+            reasons.append("%d record(s) of another country than the folder (%s): %s" % (
+                int(other.sum()), folder_country, ", ".join("%s %d" % (k, v) for k, v in others.items())))
     if len(det["unseen"]):
         reasons.append("values never seen in the live file")
     if det["bad_numbers"] is not None and len(det["bad_numbers"]):
@@ -515,14 +571,14 @@ def prepare_file(path, ctx, prof, template_cols):
         reasons.append("no new record")
     s["status"] = "ready" if not reasons else "review"
     s["why"] = "; ".join(reasons)
-    P = P.drop(columns="_src_row")
+    P = P.drop(columns=["_src_row", "_sheet"])
     P = P[template_cols]
     return s, P, det
 
 
 def compare_with_live(P, ctx, prof):
     b = ctx.builder
-    T = to_text(P.drop(columns="_src_row"), prof["numeric"])
+    T = to_text(P.drop(columns=["_src_row", "_sheet"]), prof["numeric"])
     key, blank = b.dup_key(T)
     rows, diffs = [], []
     cols = [c for c in FIGURE_COLS + ["Date_Report"] if c in P.columns]
@@ -558,10 +614,10 @@ def compare_with_live(P, ctx, prof):
                 st, note = "already in the live file, other figures", "live row %d" % (best + 2)
             if best_d and len(cand) == 1:
                 for c, lv, sv in best_d:
-                    diffs.append({"Row_in_file": int(P["_src_row"].iat[i]), "Country": P.at[i, "Country"], "District": P.at[i, "District"],
+                    diffs.append({"Row_in_file": rowref(P, i), "Country": P.at[i, "Country"], "District": P.at[i, "District"],
                                   "SIA_date": P.at[i, "SIA_date"].strftime("%Y-%m-%d"), "Response": P.at[i, "Response"],
                                   "Column": c, "Live_value": lv, "Submitted_value": sv, "Live_row": best + 2})
-        rows.append({"Row_in_file": int(P["_src_row"].iat[i]), "Country": P.at[i, "Country"], "Province": P.at[i, "Province"],
+        rows.append({"Row_in_file": rowref(P, i), "Country": P.at[i, "Country"], "Province": P.at[i, "Province"],
                      "District": P.at[i, "District"], "SIA_date": P.at[i, "SIA_date"].strftime("%Y-%m-%d"),
                      "Round_Add": P.at[i, "Round_Add"], "Vaccine_type": P.at[i, "Vaccine_type"], "Response": P.at[i, "Response"],
                      "Status": st, "Note": note})
@@ -573,14 +629,14 @@ def quality_issues(P, ctx, prof):
     ctry = set(P["Country"].dropna().unique())
     live_ctx = ctx.live[ctx.live["Country"].isin(ctry)].copy()
     live_ctx = typed(live_ctx, prof)
-    q = P.drop(columns="_src_row")
+    q = P.drop(columns=["_src_row", "_sheet"])
     try:
         res = b.qc_run(q, ctx.geo, b.qc_config(), context=live_ctx if len(live_ctx) else None)
     except Exception as e:
         return pd.DataFrame([{"severity": "Warning", "check": "inspection", "Country": "", "message": "quality checks could not run: %s" % e,
                               "Excel_row": ""}])
     iss = res["issues"].copy()
-    iss["Excel_row"] = iss["idx"].map(lambda i: int(P["_src_row"].iat[i]) if i < len(P) else "")
+    iss["Excel_row"] = iss["idx"].map(lambda i: rowref(P, i) if i < len(P) else "")
     iss = iss[~iss["check"].isin(["duplicate_key", "same_key_other_figures"])]
     return iss[["severity", "check", "check_label", "Country", "Province", "District", "SIA_date", "Round", "Vaccine", "Response",
                 "message", "current", "suggested", "Excel_row"]].reset_index(drop=True)
@@ -598,6 +654,25 @@ def typed(live_text, prof):
 
 
 # ----------------------------------------------------------------------------------------------- the folder
+def folder_country_of(rel_path, geo, b):
+    """The country a sub-folder is named after ('Chad Admin Data', 'Algeria Nov_Dec_2025 Admin Data', 'CAR Admin Data'): the standard
+    country name of the geography reference, or None."""
+    if geo is None:
+        return None
+    parts = Path(rel_path).parts[:-1]
+    if not parts:
+        return None
+    std = geo.drop_duplicates("c_key").set_index("c_key")["country"].to_dict()
+    alias = {"CAR": "CENTRAL AFRICAN REPUBLIC", "DRC": "DEMOCRATIC REPUBLIC OF THE CONGO", "TANZANIA": "UNITED REPUBLIC OF TANZANIA",
+             "COTE D IVOIRE": "COTE D IVOIRE", "IVORY COAST": "COTE D IVOIRE", "CAPE VERDE": "CABO VERDE", "SWAZILAND": "ESWATINI"}
+    name = re.sub(r"[^A-Z]+", " ", str(parts[0]).upper().replace("'", " ")).strip()
+    cands = sorted(set(list(std) + list(alias)), key=lambda k: -len(k))
+    for k in cands:
+        if re.search(r"(^| )%s( |$)" % re.escape(k), name):
+            return std.get(k) or std.get(b._qcountry(alias[k]))
+    return None
+
+
 def inspect_folder(ctx, folder, out_root, template_cols, log=print):
     """Inspect every file of a folder. Writes out_root/Submissions_report.xlsx, out_root/prepared/<hash>.xlsx and updates the ledger."""
     out_root = Path(out_root)
@@ -609,13 +684,15 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
     rows, details = [], {}
     seen_hashes = set()
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    for p in files:
+    for n_file, p in enumerate(files, 1):
         h = sha256_of(p)
         seen_hashes.add(h)
         old = ledger["files"].get(h)
-        log("  inspecting %s" % p.name)
-        s, P, det = prepare_file(p, ctx, prof, template_cols)
-        s["path"] = str(Path(p).relative_to(folder)).replace("\\", "/")
+        rel = str(Path(p).relative_to(folder)).replace("\\", "/")
+        fc = folder_country_of(rel, ctx.geo, ctx.builder)
+        log("  [%d/%d] inspecting %s%s" % (n_file, len(files), rel, ("  (folder country: %s)" % fc) if fc else ""))
+        s, P, det = prepare_file(p, ctx, prof, template_cols, folder_country=fc)
+        s["path"] = rel
         prepared = None
         if P is not None:
             prepared = "prepared/%s.xlsx" % h[:12]
@@ -633,7 +710,7 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
     # files that were seen before and are not in the folder any more; a newer version of the same name supersedes the older one
     for h, e in ledger["files"].items():
         e["present"] = h in seen_hashes
-        newer = [x for k, x in ledger["files"].items() if k != h and x.get("name") == e.get("name") and x.get("last_inspected", "") > e.get("last_inspected", "")
+        newer = [x for k, x in ledger["files"].items() if k != h and x.get("path", x.get("name")) == e.get("path", e.get("name")) and x.get("last_inspected", "") > e.get("last_inspected", "")
                  and k in seen_hashes]
         e["superseded"] = bool(newer) and h not in seen_hashes
     save_ledger(out_root, ledger)
@@ -665,7 +742,7 @@ def write_report(path, rows, details, ctx):
     lay = []
     for h, (s, det) in details.items():
         L = det["layout"] or {}
-        lay.append({"File": s["name"], "Layout": L.get("class", ""), "Sheet": L.get("sheet", ""), "Header row": s["header_row"],
+        lay.append({"File": s["name"], "Layout": L.get("class", ""), "Sheet": s.get("sheet", L.get("sheet", "")), "Header row": s["header_row"],
                     "Template columns found": L.get("template_columns_found", ""), "Missing key columns": ", ".join(L.get("missing_keys", [])),
                     "Mapped by synonym (verify)": "; ".join(L.get("synonym", [])), "Columns not in the template (ignored)": "; ".join(L.get("ignored", [])[:40]),
                     "Notes": "; ".join(L.get("notes", []))})
