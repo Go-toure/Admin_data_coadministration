@@ -1767,6 +1767,7 @@ def append_records(ws, header, files):
         if isinstance(v, str) and v.startswith("="):
             formulas[h] = (v, ws.cell(row=last, column=idx[h] + 1).coordinate)
     out, skipped = [], 0
+    added_key, skipped_other = {}, 0
     for f in files:
         sub = pd.read_excel(f, sheet_name=0, dtype=object)
         sub = sub[[c for c in sub.columns if c in idx]]
@@ -1781,6 +1782,11 @@ def append_records(ws, header, files):
             if blank.iat[i] or keys.iat[i] in have or sigs.iat[i] in seen_sig:
                 skipped += 1
                 continue
+            if added_key.get(keys.iat[i], f) != f:      # the same record already came from an earlier accepted file, with other figures: the first copy stays
+                skipped += 1
+                skipped_other += 1
+                continue
+            added_key.setdefault(keys.iat[i], f)
             seen_sig.add(sigs.iat[i])
             last += 1
             for h, j in idx.items():
@@ -1802,7 +1808,7 @@ def append_records(ws, header, files):
                     ws.cell(row=last, column=idx[h] + 1).coordinate)
             out.append({"Excel row": last, "Country": sub.iloc[i]["Country"], "Province": sub.iloc[i]["Province"],
                         "District": sub.iloc[i]["District"], "Response": sub.iloc[i]["Response"], "file": Path(f).name})
-    print("records added from submissions: %d (%d already in the file or without a key, skipped)" % (len(out), skipped), flush=True)
+    print("records added from submissions: %d (%d already in the file or without a key, skipped; %d of them the same record as one of an earlier accepted file, with other figures)" % (len(out), skipped, skipped_other), flush=True)
     return out
 
 

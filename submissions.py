@@ -1496,8 +1496,11 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         return s, None, det
     s["countries"] = ", ".join(sorted(P["Country"].dropna().unique()))
     # comparison with the live file (before the defaults are filled in: only what the country reported is compared)
+    det["date_check"] = date_year_check(P, notes)
     cmp_, diffs = compare_with_live(P, ctx, prof)
     det["compare"], det["diffs"] = cmp_, diffs
+    det["older"] = older_campaign_check(P, cmp_)
+    det["_builder"] = b
     if det.get("facility"):
         cmp_["Status"] = "already in the live file, same figures"
         cmp_["Note"] = "health-facility line; its district total equals the live file's " + det["facility"]["Response"] + " " + det["facility"]["Round_Add"]
@@ -1573,6 +1576,12 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("%d record(s) with the same names as several live records and none identical (not added)" % s["existing_units"])
     if s.get("possible_dup"):
         reasons.append("%d record(s) that look like live records under another campaign name, round or date (not added): see the Records sheet" % s["possible_dup"])
+    for m_ in det.get("date_check", {}).get("fixed", []):
+        reasons.append("year of the date corrected (please confirm): " + m_)
+    for m_ in det.get("date_check", {}).get("far", []):
+        reasons.append(m_ + ": check")
+    for m_ in det.get("older", []):
+        reasons.append(m_)
     if lay["class"] != "template":
         reasons.append("layout: " + lay["class"])
     if det.get("from_live"):
@@ -1605,6 +1614,10 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("values never seen in the live file")
     if det["bad_numbers"] is not None and len(det["bad_numbers"]):
         reasons.append("%d cell(s) that are not numbers" % len(det["bad_numbers"]))
+    if len(iss) and "check" in iss.columns:
+        nc_ = int(iss.loc[iss["check"] == "coverage_ceiling", "Excel_row"].nunique())
+        if nc_:
+            reasons.append("%d record(s) with coverage above the ceiling (more vaccinated than the target allows): check the figures with the country" % nc_)
     if s["qc_warnings"] > 0.25 * s["rows_used"]:
         reasons.append("more than 25% of the records have a warning")
     if s["new"] == 0:
@@ -1624,6 +1637,117 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     P = P.drop(columns=["_src_row", "_sheet"])
     P = P[template_cols]
     return s, P, det
+
+
+def date_year_check(P, notes):
+    """The date of a record one year away from the date of its campaign round (typing 2025 for 2026): when the day and month are
+    within 3 days of the date most records of that round have, the year is corrected (listed, to confirm); other dates far from
+    the round's date are only reported."""
+    out = {"fixed": [], "far": []}
+    if not {"SIA_date", "Response", "Round_Add"} <= set(P.columns) or not len(P):
+        return out
+    keys = P["Response"].fillna("").astype(str) + "|" + P["Round_Add"].fillna("").astype(str)
+    for k, g in P.groupby(keys):
+        gd = g["SIA_date"].dropna()
+        if len(gd) < 5:
+            continue
+        vc = gd.value_counts()
+        mode = vc.index[0]
+        if vc.iat[0] < 0.6 * len(gd):
+            continue
+        fixed, far = [], []
+        for i in gd.index[gd != mode]:
+            d = P.at[i, "SIA_date"]
+            delta = abs((d - mode).days)
+            if delta <= 45:
+                continue
+            new = None
+            try:
+                new = d.replace(year=mode.year)
+            except ValueError:
+                pass
+            if new is not None and d.year != mode.year and abs((new - mode).days) <= 3:
+                P.at[i, "SIA_date"] = new
+                notes.add(rowref(P, i), "SIA_date", d.strftime("%Y-%m-%d"), new.strftime("%Y-%m-%d"), "year of the date corrected (the day and month are those of the campaign round)")
+                fixed.append(i)
+            elif delta > 45:
+                far.append(i)
+        resp = k.split("|")[0] + " " + k.split("|")[1]
+        if fixed:
+            out["fixed"].append("%d record(s) of %s had the year of their date changed to %d, the year of the round (%s)" % (
+                len(fixed), resp, mode.year, mode.strftime("%Y-%m-%d")))
+        if far:
+            out["far"].append("%d record(s) of %s dated more than 45 days from the date of the round (%s)" % (len(far), resp, mode.strftime("%Y-%m-%d")))
+    return out
+
+
+def older_campaign_check(P, cmp_):
+    """New records of a round dated much earlier than the rest of the file: usually an older round pasted into the workbook."""
+    msgs = []
+    if not {"SIA_date", "Response", "Round_Add"} <= set(P.columns) or not len(P):
+        return msgs
+    new = (cmp_["Status"] == "new").values
+    keys = P["Response"].fillna("").astype(str) + "|" + P["Round_Add"].fillna("").astype(str)
+    med = P.groupby(keys)["SIA_date"].median().dropna()
+    if len(med) < 2:
+        return msgs
+    last = med.max()
+    for k, d in med.items():
+        n = int(((keys == k).values & new).sum())
+        if n >= 5 and (last - d).days >= 150:
+            msgs.append("%d new record(s) of %s dated %s, %d days before the rest of the file (%s): check that they belong in this file" % (
+                n, k.replace("|", " "), d.strftime("%Y-%m-%d"), (last - d).days, last.strftime("%Y-%m-%d")))
+    return msgs
+
+
+def overlap_between_files(details, out_root, rows, ledger, log=print):
+    """The new records that two files both carry: the build keeps the first accepted file's copy, so the report says which files repeat each other."""
+    import itertools
+    seen, parts = {}, []
+    order = [(h, sd) for h, sd in details.items() if sd[0].get("new")]
+    for h, (s, det) in order:
+        pth = Path(out_root) / ("prepared/%s.xlsx" % h[:12])
+        if not pth.is_file():
+            continue
+        try:
+            d = pd.read_excel(pth, dtype=object)
+        except Exception:
+            continue
+        keys, blank = None, None
+        try:
+            keys, blank = det["_builder"].dup_key(d[[c for c in ("Country", "Province", "District", "Admin_3", "SIA_date", "Round_Add", "Vaccine_type", "Response") if c in d.columns]].copy())
+        except Exception:
+            continue
+        figs = pd.Series("", index=d.index)
+        for c in ("PopPolio", "TotalNbrVaccPolio"):
+            if c in d.columns:
+                figs = figs + "|" + pd.to_numeric(d[c], errors="coerce").round(2).astype(str)
+        cnt = {}
+        for k, f in zip(keys[~blank], figs[~blank]):
+            o = seen.get(k)
+            if o is not None and o[0] != h:
+                c = cnt.setdefault(o[0], [0, 0])
+                c[0] += 1
+                c[1] += int(o[1] == f)
+        for k, f in zip(keys[~blank], figs[~blank]):
+            seen.setdefault(k, (h, f))
+        tot = sum(v[0] for v in cnt.values())
+        s["overlap"] = tot
+        for h2, (n, same) in cnt.items():
+            parts.append({"File": s["name"], "Also_in_earlier_file": details[h2][0]["name"], "New_records_in_both": n, "Same_figures": same, "Other_figures": n - same})
+        if tot:
+            msg = "%d of its %d new record(s) are also new in %s (the build keeps the first accepted copy)" % (
+                tot, s["new"], "; ".join("%s (%d)" % (details[h2][0]["name"], v[0]) for h2, v in sorted(cnt.items(), key=lambda kv: -kv[1][0])[:3]))
+            s["why"] = (s["why"] + "; " if s["why"] else "") + msg
+            if s["status"] == "ready":
+                s["status"] = "review"
+            for r in rows:
+                if r.get("hash") == h:
+                    r["why"], r["status"] = s["why"], s["status"]
+            if h in ledger["files"]:
+                ledger["files"][h]["why"], ledger["files"][h]["status"] = s["why"], s["status"]
+            det["_overlap_msg"] = msg
+    return pd.DataFrame(parts)
 
 
 def place_index(ctx):
@@ -1880,6 +2004,14 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
             ledger["files"][h_]["why"] = msg
         except Exception as ex:
             log("    tally check failed for %s: %s" % (tl_[0], ex))
+    try:
+        ov_ = overlap_between_files(details, out_root, rows, ledger, log)
+        if len(ov_):
+            ctx._overlap = ov_
+            log("%d file(s) repeat new records of an earlier file (sheet Overlap_between_files)" % ov_["File"].nunique())
+    except Exception as ex:
+        ctx._overlap = None
+        log("overlap check failed: %s" % ex)
     # files that were seen before and are not in the folder any more; a newer version of the same name supersedes the older one
     for h, e in ledger["files"].items():
         e["present"] = h in seen_hashes
@@ -1957,6 +2089,8 @@ def write_report(path, rows, details, ctx, not_read=()):
             d = stack(key)
         if d is not None and len(d):
             sheets[name] = d
+    if getattr(ctx, "_overlap", None) is not None and len(ctx._overlap):
+        sheets["Overlap_between_files"] = ctx._overlap
     if len(not_read):
         sheets["Files_not_read"] = pd.DataFrame(list(not_read), columns=["File", "Why"])
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
