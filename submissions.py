@@ -1093,13 +1093,78 @@ def tally_compare(ctx, name, T, country):
     return pd.DataFrame(rows), msg
 
 
+def wide_rounds_layout(path, folder_country):
+    """A sheet with the rounds side by side (Province, District, then per round a target population and a number vaccinated; the campaign dates written above
+    the round labels): unpivoted into one record per district and round. Returns (layout, records) or (None, None)."""
+    if not str(path).lower().endswith((".xlsx", ".xlsm")):
+        return None, None
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        for ws in wb.worksheets[:3]:
+            rows = [list(r) for r in ws.iter_rows(min_row=1, max_row=400, values_only=True)]
+            head = rows[:8]
+            lab = next((i for i, r in enumerate(head) if sum(1 for c in r if isinstance(c, str) and re.fullmatch(r"R\s*\d", c.strip(), re.I)) >= 4), None)
+            if lab is None or not head or not any(isinstance(c, str) and re.match(r"province", c.strip(), re.I) for c in head[0] if c is not None):
+                continue
+            hdr = head[lab + 1] if lab + 1 < len(head) else []
+            kinds = {}
+            for j, c in enumerate(hdr):
+                t = str(c).lower() if c is not None else ""
+                if "target" in t or "pop" in t:
+                    kinds[j] = "pop"
+                elif "vaccinated" in t or "vaccin" in t:
+                    kinds[j] = "vacc"
+            rl = {j: re.sub(r"\s", "", str(c)).upper() for j, c in enumerate(head[lab]) if isinstance(c, str) and re.fullmatch(r"R\s*\d", c.strip(), re.I)}
+            datemap = {}
+            for r in head[:lab]:
+                for j, c in enumerate(r):
+                    if isinstance(c, str) and j in rl:
+                        m = re.search(r"(\d{1,2})\s*-\s*\d{1,2}\s*([A-Za-z]+)\s*(\d{4})", c)
+                        if m:
+                            dd = pd.to_datetime("%s %s %s" % (m.group(1), m.group(2)[:3], m.group(3)), errors="coerce", format="%d %b %Y")
+                            if not pd.isna(dd):
+                                datemap[rl[j]] = dd
+            pops = {rl[j]: j for j, k in kinds.items() if k == "pop" and j in rl}
+            vacs = {rl[j]: j for j, k in kinds.items() if k == "vacc" and j in rl}
+            rounds = [r for r in rl.values() if r in pops and r in vacs]
+            if not rounds:
+                continue
+            prov, recs = None, []
+            for i, r in enumerate(rows[lab + 2:], lab + 3):
+                if r and r[0] is not None and str(r[0]).strip():
+                    prov = str(r[0]).strip()
+                dist = r[1] if len(r) > 1 else None
+                if not prov or not isinstance(dist, str) or not dist.strip() or re.match(r"\s*(grand\s+|sub\s*)?total", dist, re.I) or re.match(r"\s*(grand\s+|sub\s*)?total", prov, re.I):
+                    continue
+                for rd in sorted(set(rounds)):
+                    v = r[vacs[rd]] if vacs[rd] < len(r) else None
+                    p = r[pops[rd]] if pops[rd] < len(r) else None
+                    if not isinstance(v, (int, float)):
+                        continue
+                    recs.append({"Country": folder_country, "Province": prov, "District": dist.strip(), "SIA_date": datemap.get(rd, pd.NaT),
+                                 "Round_Add": "Rnd" + rd[1:], "PopPolio": p if isinstance(p, (int, float)) else np.nan, "TotalNbrVaccPolio": v,
+                                 "_src_row": i, "_sheet": ws.title})
+            if len(recs) >= 5:
+                rec = pd.DataFrame(recs)
+                notes = ["rounds side by side in one sheet (%s): unpivoted into %d records (one per district and round with a number vaccinated); campaign dates read from the sheet: %s" % (
+                    ", ".join(sorted(set(rounds))), len(rec), ", ".join("%s %s" % (k, v.strftime("%Y-%m-%d")) for k, v in sorted(datemap.items())) or "none")]
+                lay = {"sheet": ws.title, "header_row": lab, "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "class": "rounds side by side (unpivoted)",
+                       "template_columns_found": len(rec.columns) - 2, "notes": notes, "extra": [], "etally": False}
+                return lay, rec
+    finally:
+        wb.close()
+    return None, None
+
+
 KINDS = (("lqas", "an LQAS file"), ("monitor", "a monitoring (IM) file"), ("_im_", "a monitoring (IM) file"), ("im_polio", "a monitoring (IM) file"),
          ("etally", "an eTally file"), ("tally", "a tally sheet"), ("aefi", "an AEFI file"), ("supplies", "a supplies file"), ("dqc", "a list of data-quality issues"),
          ("synthese", "a monitoring summary"), ("resultats", "a results summary"), ("daily call", "a call-in report"), ("vaccine utilization", "a vaccine utilisation summary"))
 
 
 def guess_kind(path, lay):
-    n = Path(path).name.lower()
+    import unicodedata
+    n = "".join(c for c in unicodedata.normalize("NFD", Path(path).name.lower()) if unicodedata.category(c) != "Mn")
     for k, v in KINDS:
         if k in n:
             return v
@@ -1135,10 +1200,16 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
                 lay, et_raw = etally_layout(path, sh, folder_country)
         except Exception:
             lay, et_raw = None, None
+    if lay is None and folder_country:
+        try:
+            lay, et_raw = wide_rounds_layout(path, folder_country)
+        except Exception:
+            lay, et_raw = None, None
     try:
         lay = lay or detect_layout(path, template_cols, assume=(("Country",) if folder_country else ()) + ("Round_Add", "Response"))
     except Exception as e:
-        s["why"] = "the file could not be opened (%s)" % type(e).__name__
+        kind_ = guess_kind(path, None)
+        s["why"] = ("looks like %s, not admin data; " % kind_ if kind_ else "") + "the file could not be opened (%s)" % type(e).__name__
         det["layout"] = {"class": "not readable", "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "notes": [str(e)[:200]]}
         return s, None, det
     det["layout"] = lay
@@ -1601,6 +1672,27 @@ def compare_with_live(P, ctx, prof):
             st, note = "new", ""
             # same place, same vaccine, and the same figures (or the same date) in the live file under another campaign name, round or date
             pl = place_hits(ctx, b._qcountry(P.at[i, "Country"]), cn(P.at[i, "Province"]), cn(P.at[i, "District"]))
+            # the same campaign and round at the same place, only the date, the province or the vaccine name differs: it is the live record
+            same_c = [h for h in pl if (not is_empty(P.at[i, "Response"])) and str(h[5]).strip().lower() == str(P.at[i, "Response"]).strip().lower()
+                      and str(h[6]).strip().lower() == str(P.at[i, "Round_Add"]).strip().lower()] if pl else []
+            if len(same_c) == 1:
+                lab, d_, v, tt, po, rs, ro = same_c[0]
+                tot = P.at[i, "TotalNbrVaccPolio"] if "TotalNbrVaccPolio" in P.columns else np.nan
+                pop = P.at[i, "PopPolio"] if "PopPolio" in P.columns else np.nan
+                dt_ = P.at[i, "SIA_date"]
+                dif = []
+                if not pd.isna(tot) and (pd.isna(tt) or abs(tot - tt) > 0.5):
+                    dif.append(("TotalNbrVaccPolio", "" if pd.isna(tt) else tt, tot))
+                if not pd.isna(pop) and (pd.isna(po) or abs(pop - po) > 0.5):
+                    dif.append(("PopPolio", "" if pd.isna(po) else po, pop))
+                st = "already in the live file, other figures" if dif else "already in the live file, same figures"
+                note = "live row %d: same place, campaign and round (%s %s); the date, province or vaccine name differs%s" % (
+                    lab + 2, rs, ro, "" if pd.isna(dt_) or abs((pd.Timestamp(dt_) - d_).days) == 0 else " (file %s, live %s)" % (pd.Timestamp(dt_).strftime("%Y-%m-%d"), d_.strftime("%Y-%m-%d")))
+                for c_, lv, sv in dif:
+                    diffs.append({"Row_in_file": rowref(P, i), "Country": P.at[i, "Country"], "District": P.at[i, "District"],
+                                  "SIA_date": "" if pd.isna(dt_) else pd.Timestamp(dt_).strftime("%Y-%m-%d"), "Response": P.at[i, "Response"],
+                                  "Column": c_, "Live_value": lv, "Submitted_value": sv, "Live_row": lab + 2})
+                pl = []
             if pl and not pd.isna(P.at[i, "SIA_date"]):
                 fam = vaccine_family(b)(P.at[i, "Vaccine_type"])
                 tot, pop = P.at[i, "TotalNbrVaccPolio"] if "TotalNbrVaccPolio" in P.columns else np.nan, P.at[i, "PopPolio"] if "PopPolio" in P.columns else np.nan
