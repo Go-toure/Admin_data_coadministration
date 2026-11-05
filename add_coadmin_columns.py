@@ -73,6 +73,7 @@ import argparse
 import re
 import sys
 from copy import copy
+from pathlib import Path
 
 import numpy as np
 import openpyxl
@@ -243,6 +244,9 @@ def main():
                     help="do not correct a province that is the same name written differently (MAI NDOMBE = MAINDOMBE, PROVINCIA DE NAMPULA = NAMPULA)")
     ap.add_argument("--no-fix-digit-error", action="store_true",
                     help="do not correct a target population that is 10 or 100 times off when the reported coverage and the district's other campaigns agree")
+    ap.add_argument("--add-records", action="append", default=[], metavar="FILE",
+                    help="records prepared by 'admin.py submissions' (template layout): the ones whose key is not in the input are "
+                         "added at the end of the data before anything else is done; may be given several times")
     ap.add_argument("--no-fix-list", action="store_true", help="do not write the per-country fix list (Fix_list_by_country.xlsx)")
     ap.add_argument("--no-fill-cvpolio", action="store_true",
                     help="do not fill an empty CVPolio with TotalNbrVaccPolio / PopPolio")
@@ -317,6 +321,9 @@ def main():
         sys.exit("The input has no CVPolio column, which the population corrections need. "
                  "Use a file that has it, or run with --no-fix-poppolio.")
 
+    added_log = []
+    if a.add_records:
+        added_log = append_records(ws, header, a.add_records)
     cells = list(ws.iter_rows(min_row=2, max_col=ncol))
     cells = [r for r in cells if any(c.value is not None for c in r)]
     n = len(cells)
@@ -952,6 +959,9 @@ def main():
         if repo_ctx is not None:
             ctx_ = repo_ctx.rename(columns={"SIA-date": "SIA_date"})
         qres = qc_run(qdf, geo, qc_config(cv_ceiling=a.cv_ceiling / 100.0, pop_factor=a.pop_factor), context=ctx_)
+        for r in added_log:
+            prov_log.append({"Excel row": r["Excel row"], "Country": r["Country"], "District": r["District"], "Column": "(whole record)",
+                             "Found": "", "Restored": "added", "Source": "submission " + r["file"]})
         qres["fixes"] = pd.DataFrame(prov_log)
         qres["dup_log"], qres["dup_groups"], qres["existing"] = dup_log, dup_groups, existing_rows
         qc_print(qres)
@@ -1732,6 +1742,67 @@ def fix_province_spelling(df, geo):
             if rp and _qn(rp) != _qn(target):
                 continue          # the district belongs to another province of the reference: not a spelling difference
             out[i] = (prov, target)
+    return out
+
+
+def append_records(ws, header, files):
+    """Add prepared submission records (template layout) at the end of the sheet: only those whose duplicate key is not in the sheet
+    yet (so running it again, or after the records were published, adds nothing). Several records of the same file may share a key
+    (different units: the data has no sub-district); the same record in two accepted files is added once. The new rows copy the cell
+    styles of the last row and the check_dp formula of its pattern. Returns [{Excel row, file, key fields}]."""
+    from openpyxl.formula.translate import Translator
+    last = ws.max_row
+    while last > 1 and not any(c.value is not None for c in ws[last]):
+        last -= 1
+    ncol = len(header)
+    idx = {h: j for j, h in enumerate(header)}
+    kc = [c for c in ("Country", "Province", "District", "Admin_3", "SIA_date", "Round_Add", "Vaccine_type", "Response") if c in idx]
+    base = pd.DataFrame([[ws.cell(row=r, column=idx[c] + 1).value for c in kc] for r in range(2, last + 1)], columns=kc, dtype=object)
+    have = set(dup_key(base)[0])
+    seen_sig = set()
+    style_row = [copy(ws.cell(row=last, column=j + 1)._style) for j in range(ncol)]
+    formulas = {}
+    for h in header:
+        v = ws.cell(row=last, column=idx[h] + 1).value
+        if isinstance(v, str) and v.startswith("="):
+            formulas[h] = (v, ws.cell(row=last, column=idx[h] + 1).coordinate)
+    out, skipped = [], 0
+    for f in files:
+        sub = pd.read_excel(f, sheet_name=0, dtype=object)
+        sub = sub[[c for c in sub.columns if c in idx]]
+        if not len(sub):
+            continue
+        keys, blank = dup_key(sub[[c for c in kc if c in sub.columns]].copy())
+        core = [c for c in DUP_CORE_COLS if c in sub.columns]
+        sigs = keys.astype(str)
+        for c in core:
+            sigs = sigs + "|" + pd.to_numeric(sub[c], errors="coerce").round(2).astype(str)
+        for i in range(len(sub)):
+            if blank.iat[i] or keys.iat[i] in have or sigs.iat[i] in seen_sig:
+                skipped += 1
+                continue
+            seen_sig.add(sigs.iat[i])
+            last += 1
+            for h, j in idx.items():
+                c = ws.cell(row=last, column=j + 1)
+                c._style = copy(style_row[j])
+                if h in sub.columns:
+                    v = sub.iloc[i][h]
+                    if v is None or (not isinstance(v, str) and pd.isna(v)):
+                        v = None
+                    elif isinstance(v, pd.Timestamp):
+                        v = v.to_pydatetime()
+                    elif isinstance(v, (np.integer,)):
+                        v = int(v)
+                    elif isinstance(v, (np.floating,)):
+                        v = float(v)
+                    c.value = v
+            for h, (fm, origin) in formulas.items():
+                ws.cell(row=last, column=idx[h] + 1).value = Translator(fm, origin=origin).translate_formula(
+                    ws.cell(row=last, column=idx[h] + 1).coordinate)
+            out.append({"Excel row": last, "Country": sub.iloc[i]["Country"], "Province": sub.iloc[i]["Province"],
+                        "District": sub.iloc[i]["District"], "Response": sub.iloc[i]["Response"], "file": Path(f).name})
+    print("records added from submissions: %d (%d already in the file or without a key, skipped)" % (len(out), skipped), flush=True)
     return out
 
 

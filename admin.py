@@ -54,6 +54,7 @@ DEFAULTS = {
     "gpei_env_file": "",                      # secrets.env holding GPEI_API_TOKEN (default: the scope folder's config/secrets.env)
     "geo": "geo_reference.csv",
     "district_source": "",                    # optional recovered file used by --district-source
+    "submissions_dir": "workspace/submissions_in",   # the files of the countries (downloaded from the submissions folder)
     "build_extra_args": [],
     "max_row_drop_pct": 2.0,
     "key_columns": ["Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response"],
@@ -280,6 +281,14 @@ def fingerprint(df):
     h.update("|".join(map(str, df.columns)).encode())
     h.update(pd.util.hash_pandas_object(df, index=False).values.tobytes())
     return h.hexdigest()
+
+
+def import_submissions():
+    path = HERE / "submissions.py"
+    spec = importlib.util.spec_from_file_location("coadmin_submissions", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
 
 
 def import_builder():
@@ -517,6 +526,14 @@ def cmd_build(a):
     ds = S.get("district_source")
     if ds and P(ds).is_file():
         cmd += ["--district-source", P(ds)]
+    if not getattr(a, "no_submissions", False):
+        sm = import_submissions()
+        acc = sm.accepted_files(WORK / "submissions")
+        if acc:
+            log("Submissions: %d accepted file(s) will be added to this build: %s" % (len(acc), ", ".join(n for n, _ in acc)))
+            for _, pth in acc:
+                cmd += ["--add-records", pth]
+            m["build"]["submissions"] = [n for n, _ in acc]
     cmd += list(S.get("build_extra_args") or []) + list(a.extra or [])
     m["build"]["command"] = " ".join(str(c) for c in cmd)
     rc, text = run_cmd(cmd, cwd=HERE, tee=rd / "build.log")
@@ -539,8 +556,9 @@ def cmd_build(a):
             shutil.copy2(src, rd / name)
     mm = re.search(r"\((\d+) records with an Error", text) or re.search(r"(\d+) records with an Error", text)
     mr = re.search(r"rows out: (\d+)", text)
+    ma = re.search(r"records added from submissions: (\d+)", text)
     m["build"].update({"ok": True, "finished": now(), "file": str(final), "errors": int(mm.group(1)) if mm else None,
-                       "rows_out": int(mr.group(1)) if mr else None,
+                       "rows_out": int(mr.group(1)) if mr else None, "added_records": int(ma.group(1)) if ma else 0,
                        "summary": [l.strip() for l in text.splitlines()
                                    if re.search(r"filled|renamed|corrected|removed|merged|restored|repair", l)][:25]})
     save_manifest(rd, m)
@@ -599,7 +617,10 @@ def cmd_check(a):
         warn.append("new columns: %s" % ", ".join(added[:10]))
     # 2. rows
     drop_pct = (len(base) - len(new)) / max(len(base), 1) * 100
+    added = int(m["build"].get("added_records") or 0)
     info.append("rows: %d -> %d (%+d)" % (len(base), len(new), len(new) - len(base)))
+    if added:
+        info.append("records added from accepted submissions (%s): %d" % (", ".join(m["build"].get("submissions") or []), added))
     if drop_pct > float(S["max_row_drop_pct"]):
         hard.append("%.1f%% of the rows disappeared (limit %.1f%%)" % (drop_pct, float(S["max_row_drop_pct"])))
     # 3. key fields blank
@@ -647,10 +668,11 @@ def cmd_check(a):
         warn.append("more quality errors than the previous build (%d -> %d)" % (prev, e1))
     # 7. what changed, cell by cell (only when the rows line up)
     changes = {}
-    if len(base) == len(new):
+    if len(base) == len(new) - added or len(base) == len(new):
+        new_cmp = new.iloc[:len(base)] if len(new) != len(base) else new
         common = [c for c in new.columns if c in base.columns]
         for c in common:
-            k = int((base[c].values != new[c].values).sum())
+            k = int((base[c].values != new_cmp[c].values).sum())
             if k:
                 changes[c] = k
         info.append("cells changed vs the base: %s" % (", ".join("%s %d" % kv for kv in sorted(changes.items(), key=lambda x: -x[1])[:12]) or "none"))
@@ -1261,6 +1283,66 @@ def cmd_duplicates(a):
     print()
 
 
+# ----------------------------------------------------------------------------------------------- submissions
+def _submissions_ctx(builder):
+    from types import SimpleNamespace
+    path, label = resolve_source("live")
+    log("Reading the live file (%s) ..." % label)
+    live = load_norm(path)
+    gp, lp = P(S["geo"]), P(S["lookup"])
+    geo = builder.load_geo(str(gp)) if gp.is_file() else None
+    lk = builder.load_lookup(str(lp)) if lp.is_file() else None
+    key, blank = builder.dup_key(live)
+    index = {}
+    for i, k, bl in zip(live.index, key.values, blank.values):
+        if not bl:
+            index.setdefault(k, []).append(i)
+    return SimpleNamespace(builder=builder, live=live, live_index=index, geo=geo, lookup=lk, live_label=label)
+
+
+def cmd_submissions(a):
+    sm = import_submissions()
+    out_root = WORK / "submissions"
+    who = a.by or os.environ.get("USERNAME") or os.environ.get("USER") or "operator"
+    if a.action == "list":
+        led = sm.load_ledger(out_root)
+        if not led["files"]:
+            print("\nNo file inspected yet: run 'admin.py submissions inspect'.\n")
+            return
+        print()
+        for h, e in sorted(led["files"].items(), key=lambda x: x[1].get("name", "")):
+            print("  %-45s %-8s %-9s new %-5s same %-5s other figures %-4s %s" % (
+                e["name"][:45], e.get("status", ""), e.get("decision") or "-", e.get("new", ""), e.get("existing_same", ""),
+                e.get("existing_different", ""), "(superseded)" if e.get("superseded") else ("" if e.get("present", True) else "(not in the folder)")))
+        print()
+        return
+    if a.action in ("accept", "reject"):
+        if not a.targets:
+            die("give the file name (or the start of its content hash).")
+        bad = 0
+        for t in a.targets:
+            ok, msg = sm.decide(out_root, t, "accepted" if a.action == "accept" else "rejected", who, a.note or "")
+            print(("  " if ok else "  NOT DONE: ") + msg)
+            bad += 0 if ok else 1
+        if bad:
+            sys.exit(2)
+        return
+    # inspect
+    if not getattr(a, "no_refresh_lookup", False):
+        refresh_lookup_step()
+    folder = Path(a.folder) if a.folder else P(S["submissions_dir"])
+    if not folder.is_dir():
+        die("the submissions folder does not exist: %s (download the files there, or give --folder)." % folder)
+    builder = import_builder()
+    ctx = _submissions_ctx(builder)
+    cols = list(ctx.live.columns)
+    rows = sm.inspect_folder(ctx, folder, out_root, cols, log=log)
+    ready = sum(1 for r in rows if r["status"] == "ready")
+    print("\n%d file(s): %d ready, %d to review, %d blocked." % (len(rows), ready, sum(1 for r in rows if r["status"] == "review"),
+                                                         sum(1 for r in rows if r["status"] == "blocked")))
+    print("Next: look at %s, then 'admin.py submissions accept <file>' for the files that go into the next build.\n" % (out_root / "Submissions_report.xlsx"))
+
+
 # ----------------------------------------------------------------------------------------------- find
 def cmd_find(a):
     path, label = resolve_source(a.source)
@@ -1375,6 +1457,7 @@ RULES = [
     ("province-spelling", "Geography", "A Province that is the same name as an Admin1 of the geography reference written differently (spaces, accents, punctuation, filler words: MAI NDOMBE = MAINDOMBE, PROVINCIA DE NAMPULA = NAMPULA, WADIFIRA = WADI FIRA, RS 3 = RS3) gets the reference's spelling. Exact match only, and only when the district does not belong to another province of the reference. Near matches and new Admin1s (Cuando, Sidama ...) are never changed: they are listed in the fix list.", "Request of 4 Nov 2026", "--no-fix-province-spelling"),
     ("digit-error", "Population", "A target population that is 10 or 100 times off (a missing or extra digit) is corrected only when the reported coverage (vaccinated / CVPolio) implies the corrected figure within 10% AND that figure is 0.6 - 1.7 times the median target of the same district's other campaigns. Both must agree; otherwise it stays flagged.", "Request of 4 Nov 2026", "--no-fix-digit-error"),
     ("fix-list", "Checks", "What cannot be corrected safely (missing key fields, report dates, target above total population, coverage above the ceiling, very different targets, coverage that differs, provinces to confirm, combined and separate records, records entered twice) is written to Fix_list_by_country.xlsx: one sheet per problem, with the row, the column to correct, the current and the suggested value. Cut per country in the app.", "Request of 4 Nov 2026", "--no-fix-list"),
+    ("submissions", "Intake", "The files the countries send (SharePoint folder Admin_data_submissions) are inspected one by one: layout (template, template with other header spellings, mapped by certain synonyms, or not usable), normalisation of every cell (capitals, spaces, country / province / vaccine / round spelling, dates, numbers as text, percentages, Year / SIAMTH / Ctry_Code / AFRO_block, the constants the live file has), the portal quality checks, the campaigns against the lookup, duplicates inside the file, and every record against the live file (new / same / other figures). An operator accepts or rejects each file; only accepted files are used, and only their NEW records are added at the end of the next build, before every other rule. Records already in the live file are never changed by a submission: the differences are listed.", "Request of 5 Nov 2026", "admin.py submissions inspect | list | accept | reject; build --no-submissions"),
     ("text-clean", "Hygiene", "Stray control characters (carriage returns), line breaks and double / edge spaces in Country, Province, District, Response, Vaccine_type and Round_Add are removed.", "Found in District (KAJIADO EAST) 30 Oct 2026", "--no-clean-text"),
     ("dates", "Hygiene", "SIA_date written as text ('18-sept-20') becomes a real date.", "Admin portal", "(always)"),
     ("duplicates", "Hygiene", "Exact copies are removed. A record entered twice (same key AND the same population and results) is reported as Duplicate record and removed only with --resolve-duplicates. Records with the same key but other population or results are different units (most records have no sub-district): never removed, reported only as information (Same names, other figures). Key = Country, Province, District, [Admin_3], SIA_date, Round_Add, Vaccine_type, Response, compared without accents, case or punctuation.", "Admin portal", "--no-dedupe, --resolve-duplicates; admin.py duplicates lists them and what a fix would do; the Operations Center has the same choice on the Cycle tab"),
@@ -1434,6 +1517,7 @@ def main():
     s = sub.add_parser("build"); s.add_argument("--base", help="start from this file instead of the latest backup of the live file")
     s.add_argument("--no-refresh-lookup", action="store_true", help="use lookup.xlsx as it is (default: refreshed from the GPEI API first)")
     s.add_argument("--no-backup", action="store_true", help="do not read SharePoint, use the newest local backup")
+    s.add_argument("--no-submissions", action="store_true", help="do not add the accepted submissions to this build")
     s.add_argument("extra", nargs="*", help="extra options for the builder, after --")
     s = sub.add_parser("baseinfo", help=argparse.SUPPRESS); s.add_argument("path")
     s = sub.add_parser("check"); s.add_argument("--run", type=int, help="version number (default: the newest)")
@@ -1451,6 +1535,12 @@ def main():
     s = sub.add_parser("inspect"); s.add_argument("--source", help="live (default), vNN build, bN backup version, or a file")
     s.add_argument("--no-refresh-lookup", action="store_true")
     s.add_argument("--country")
+    s = sub.add_parser("submissions", help="inspect the files the countries sent, accept or reject them (accepted ones go into the next build)")
+    s.add_argument("action", choices=["inspect", "list", "accept", "reject"])
+    s.add_argument("targets", nargs="*", help="accept / reject: the file name or the start of its content hash")
+    s.add_argument("--folder", help="inspect: the folder with the files (default: the submissions folder of the workspace)")
+    s.add_argument("--note", help="accept / reject: a note kept in the ledger"); s.add_argument("--by", help="who decides (default: the user name)")
+    s.add_argument("--no-refresh-lookup", action="store_true")
     s = sub.add_parser("duplicates", help="list the duplicates of a file and what removing them would do (nothing is changed)")
     s.add_argument("--source", help="live (default), vNN build, bN backup version, or a file"); s.add_argument("--country")
     s.add_argument("--keep", choices=["complete", "first"], default="complete"); s.add_argument("--no-file", action="store_true")
@@ -1469,7 +1559,8 @@ def main():
     fn = {"status": cmd_status, "runs": cmd_runs, "backup": cmd_backup, "lookup": cmd_lookup, "build": cmd_build, "check": cmd_check,
           "excel": cmd_excel, "publish": cmd_publish, "dictionary": cmd_dictionary, "all": cmd_all, "commit": cmd_commit,
           "sync-scope": cmd_sync_scope, "doctor": cmd_doctor, "inspect": cmd_inspect, "find": cmd_find,
-          "compare": cmd_compare, "rules": cmd_rules, "baseinfo": cmd_baseinfo, "duplicates": cmd_duplicates}[a.cmd]
+          "compare": cmd_compare, "rules": cmd_rules, "baseinfo": cmd_baseinfo, "duplicates": cmd_duplicates,
+          "submissions": cmd_submissions}[a.cmd]
     log("admin.py %s" % " ".join(sys.argv[1:]), quiet=True)
     try:
         fn(a)
