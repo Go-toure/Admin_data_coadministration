@@ -53,7 +53,11 @@ SYNONYMS = {"ctryname": "Country", "provname": "Province", "distname": "District
             "targetpopulation": "PopPolio", "targetpop": "PopPolio", "totalpopulation": "TotPop", "totalpop": "TotPop",
             "totalvaccinated": "TotalNbrVaccPolio", "childrenvaccinated": "TotalNbrVaccPolio", "vaccinated": "TotalNbrVaccPolio",
             "coverage": "CVPolio", "admincoverage": "CVPolio", "reportdate": "Date_Report", "datereport": "Date_Report",
-            "countrycode": "Ctry_Code", "iso3": "Ctry_Code"}
+            "countrycode": "Ctry_Code", "iso3": "Ctry_Code", "siacode": "Response", "obr": "Response",
+            "number0dosesvaccinated011m": "Nbr0dosesVaccPolio_0_11M", "numbernotdosevaccinated011m": "Nbr_1doses_Plus_VacPolio_0_11M",
+            "number0dosesvaccinated1259m": "Nbr0dosesVacPolio_12_59M", "numbernotdosevaccinated1259m": "Nbr_1doses_Plus_VacPolio_12_59M",
+            "childrenvaccinated059months": "TotalNbrVaccPolio", "dosesusedpolio": "Doses.UsedPolio", "wastratepolio": "WastRPolio",
+            "siasstartdate": "SIA_date", "under5targetted": "PopPolio", "under5targeted": "PopPolio"}
 
 
 # ----------------------------------------------------------------------------------------------- helpers
@@ -394,6 +398,281 @@ def round_offsets(ctx):
     return ctx._round_off
 
 
+# ----------------------------------------------------------------------------------------------- campaign hints, eTally
+VACC_ALIASES = {"nvpo2": "nOPV2", "nopv2": "nOPV2", "vpo2": "nOPV2", "bvpo": "bOPV", "vpob": "bOPV", "bopv": "bOPV", "vpot": "tOPV",
+                "topv": "tOPV", "mvpo2": "mOPV2", "mopv2": "mOPV2"}
+
+
+def vaccine_alias(v):
+    return VACC_ALIASES.get(re.sub(r"[^a-z0-9]", "", str(v).lower()))
+
+
+def name_hints(path, sheets=()):
+    """What the file name and the sheet names say about the campaign: a date (of the report, usually), a round, a vaccine."""
+    nm = Path(path).stem
+    out = {"date": None, "round": None, "vaccine": None, "year": None}
+    for rx, order in ((r"(?<!\d)(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])(20\d\d)(?!\d)", "dmy"), (r"(?<!\d)(20\d\d)[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])(?!\d)", "ymd"),
+                      (r"(?<!\d)(0?[1-9]|[12]\d|3[01])[-_. ](0?[1-9]|1[0-2])[-_. ](20\d\d)(?!\d)", "dmy")):
+        m = re.search(rx, nm)
+        if m:
+            g = [int(x) for x in m.groups()]
+            try:
+                out["date"] = dt.date(g[2], g[1], g[0]) if order == "dmy" else dt.date(g[0], g[1], g[2])
+            except ValueError:
+                pass
+            if out["date"]:
+                break
+    ys = re.findall(r"(?<!\d)(20[12]\d)(?!\d)", nm)
+    if ys:
+        out["year"] = int(ys[-1])
+    m = re.search(r"(?<![a-z])(?:r|rnd|round|rd|cycle)[\s_\-]*([1-9])(?!\d)", nm, re.I)
+    if m:
+        out["round"] = int(m.group(1))
+    toks = {t.lower() for t in re.findall(r"[nbmt]OPV2?|[nbmt]VPO2?", " ".join([nm] + [str(x) for x in sheets]), re.I)}
+    toks = {vaccine_alias(t) for t in toks} - {None}
+    if len(toks) == 1:
+        out["vaccine"] = toks.pop()
+    return out
+
+
+def live_spelling(ctx):
+    """{campaign key: the spelling of its Response in the live file}"""
+    if getattr(ctx, "_resp_spell", None) is None:
+        b = ctx.builder
+        s = ctx.live["Response"].dropna()
+        ctx._resp_spell = s.groupby(s.map(b._rk)).agg(lambda x: x.value_counts().index[0]).to_dict() if len(s) else {}
+    return ctx._resp_spell
+
+
+def infer_campaign(P, ctx, prof, hints, notes):
+    """Records without a Response: find the campaign in the lookup from what the file does say (country, SIA_date, round, vaccine; or, with no
+    date, the date / round / vaccine written in the file name). Only a unique answer is used, and it is always reported for the operator to
+    confirm. Returns the list of messages."""
+    b, lk, out = ctx.builder, ctx.lookup, []
+    if lk is None or "Response" not in P.columns or not len(P):
+        return out
+    vmap0 = {cn(v): v for v in prof["values"].get("Vaccine_type", ())}
+    # a Response is written but not the vaccine: the vaccine of that campaign in the lookup (when it has only one) or the one in the sheet / file name
+    nov = P["Vaccine_type"].map(is_empty) & ~P["Response"].map(is_empty)
+    if nov.any():
+        n_set = 0
+        for i in P.index[nov]:
+            rk = b._rk(P.at[i, "Response"])
+            lc = lk[(lk["_rk"] == rk) & (lk["_ck"] == b._lkc(P.at[i, "Country"]))] if not is_empty(P.at[i, "Country"]) else lk[lk["_rk"] == rk]
+            vals = list(dict.fromkeys(str(v) for v in lc["Vaccines"].dropna())) if "Vaccines" in lc.columns else []
+            vt = vmap0.get(cn(vals[0])) if len(vals) == 1 else None
+            how = "vaccine of this campaign in the lookup"
+            if not vt and hints.get("vaccine"):
+                vt, how = vmap0.get(cn(hints["vaccine"])), "vaccine written in the file or sheet name"
+            if vt:
+                P.at[i, "Vaccine_type"] = vt
+                notes.add(rowref(P, i), "Vaccine_type", "", vt, how)
+                n_set += 1
+        if n_set:
+            out.append("vaccine of %d record(s) taken from the lookup / the file name" % n_set)
+    # a Response and a round are written but no date: the start date of that round in the lookup
+    nod = P["SIA_date"].isna() & ~P["Response"].map(is_empty) & ~P["Round_Add"].map(is_empty)
+    if nod.any():
+        offs0, cache, n_set = round_offsets(ctx), {}, 0
+        for i in P.index[nod]:
+            rk, rn = b._rk(P.at[i, "Response"]), b._rnum(P.at[i, "Round_Add"])
+            ck0 = b._lkc(P.at[i, "Country"]) if not is_empty(P.at[i, "Country"]) else None
+            key = (rk, rn, ck0)
+            if key not in cache:
+                lc = lk[lk["_rk"] == rk]
+                if ck0:
+                    lc = lc[lc["_ck"] == ck0]
+                off = offs0["by_campaign"].get(rk, offs0["common"])
+                m = lc[[(not pd.isna(r)) and (int(r) + off == rn or int(r) == rn) for r in lc["_rn"]]]
+                if not len(m) and lc["_d"].nunique() == 1:        # the lookup has one round for this campaign and the file numbers it differently
+                    m = lc
+                cache[key] = (m.iloc[0]["_d"], m.iloc[0]["Round Number"], m.iloc[0]["OBR Name"]) if len(m) and m["_d"].nunique() == 1 else None
+            if cache[key]:
+                d_, rname, obr = cache[key]
+                P.at[i, "SIA_date"] = pd.Timestamp(d_)
+                notes.add(rowref(P, i), "SIA_date", "", d_, "start date of %s %s in the lookup (the file gives no date)" % (obr, rname))
+                n_set += 1
+        if n_set:
+            out.append("SIA_date of %d record(s) taken from the lookup (start of the round)" % n_set)
+    blank = P["Response"].map(is_empty)
+    if not blank.any():
+        return out
+    offs, spell = round_offsets(ctx), live_spelling(ctx)
+    starts = pd.to_datetime(lk["_d"], errors="coerce")
+    keyf = pd.DataFrame({"c": P["Country"].map(lambda v: "" if is_empty(v) else b._lkc(v)),
+                         "d": P["SIA_date"].map(lambda x: "" if pd.isna(x) else pd.Timestamp(x).strftime("%Y-%m-%d")),
+                         "r": P["Round_Add"].map(lambda x: "" if is_empty(x) else str(x)),
+                         "v": P["Vaccine_type"].map(lambda x: "" if is_empty(x) else str(x))})
+    vmap = {cn(v): v for v in prof["values"].get("Vaccine_type", ())}
+    named = ~(P["Province"].map(is_empty) | P["District"].map(is_empty))        # a line without province or district is not a record
+    for (c, d_, r_, v_), g in keyf[blank & named].groupby(["c", "d", "r", "v"]):
+        if not c:
+            continue
+        lc0 = lc = lk[lk["_ck"] == c]
+        vs = b._vset(v_) if v_ else set()
+        if not vs and hints.get("vaccine"):
+            vs = b._vset(hints["vaccine"])
+        vnote = ""
+        if vs and len(lc):
+            lc = lc0[[bool(x & vs) or not x for x in lc0["_vs"]]]
+            if lc.empty:
+                lc, vnote = lc0, "; the vaccine of the file (%s) is not the lookup's for this campaign" % (v_ or hints.get("vaccine"))
+        if lc.empty:
+            continue
+        rn = b._rnum(r_) if r_ else hints.get("round")
+        if d_:
+            ref = pd.Timestamp(d_)
+            t0, t1, src = ref - pd.Timedelta(days=45), ref + pd.Timedelta(days=45), "the SIA_date of the records"
+        elif hints.get("date"):
+            ref = pd.Timestamp(hints["date"])
+            t0, t1, src = ref - pd.Timedelta(days=100), ref + pd.Timedelta(days=7), "the date in the file name (a campaign starts before its report)"
+        elif hints.get("year"):
+            ref = None
+            t0, t1, src = pd.Timestamp(hints["year"], 1, 1), pd.Timestamp(hints["year"], 12, 31), "the year in the file name"
+        else:
+            continue
+        lc = lc[(starts.loc[lc.index] >= t0) & (starts.loc[lc.index] <= t1)]
+        if rn is not None and len(lc):
+            def same_round(row):
+                if pd.isna(row["_rn"]):
+                    return False
+                off = offs["by_campaign"].get(row["_rk"], offs["common"])
+                return int(row["_rn"]) + off == rn or int(row["_rn"]) == rn
+            lc = lc[lc.apply(same_round, axis=1)]
+        if lc.empty:
+            continue
+        keys = list(dict.fromkeys(zip(lc["_rk"], lc["_rn"])))
+        if len(keys) != 1:
+            if ref is None:
+                continue
+            dd = (starts.loc[lc.index] - ref).dt.days.abs().sort_values()
+            if len(dd) > 1 and dd.iloc[1] - dd.iloc[0] >= 20:
+                lc = lc.loc[[dd.index[0]]]
+            else:
+                continue
+        x = lc.iloc[0]
+        rk = x["_rk"]
+        name = spell.get(rk) or x["OBR Name"]
+        off = offs["by_campaign"].get(rk, offs["common"])
+        why = "campaign inferred: %s %s (starts %s) in the lookup, from %s%s" % (x["OBR Name"], x["Round Number"], x["Round Start Date"], src, vnote)
+        vt = None
+        if "Vaccines" in lk.columns and not is_empty(x.get("Vaccines")):
+            vt = vmap.get(cn(x["Vaccines"]))
+        for i in g.index:
+            P.at[i, "Response"] = name
+            notes.add(rowref(P, i), "Response", "", name, why)
+            if is_empty(P.at[i, "Round_Add"]) and not pd.isna(x["_rn"]):
+                P.at[i, "Round_Add"] = "Rnd%d" % (int(x["_rn"]) + off)
+                notes.add(rowref(P, i), "Round_Add", "", P.at[i, "Round_Add"], why)
+            if pd.isna(P.at[i, "SIA_date"]):
+                P.at[i, "SIA_date"] = pd.Timestamp(x["_d"])
+                notes.add(rowref(P, i), "SIA_date", "", x["_d"], why)
+            if is_empty(P.at[i, "Vaccine_type"]) and vt:
+                P.at[i, "Vaccine_type"] = vt
+                notes.add(rowref(P, i), "Vaccine_type", "", vt, why)
+        out.append("%s %s (%d record(s); from %s%s)" % (name, x["Round Number"], len(g), src, vnote))
+    return out
+
+
+ET_ZD = ("h2h_zero_dose_sum", "fp_opv_ri_zd_vaccinated", "dopv_vaccinated_zd_vaccinated", "spt_opv_vac_spt_zd_vaccinated", "tt_opv_tt_zd_vaccinated")
+
+
+def etally_find(path):
+    """The sheet of an eTally export (one line per settlement and day: state, lga, vacdate, total_children_vaccinated ...), or None."""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        for ws in wb.worksheets:
+            hdr = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+            low = [str(h).strip().lower() if h is not None else "" for h in (hdr or ())]
+            if all(k in low for k in ("state", "lga", "vacdate")) and any(h.startswith("total_children_vaccinated") for h in low):
+                return ws.title
+    finally:
+        wb.close()
+    return None
+
+
+def etally_layout(path, sheet, folder_country):
+    """Add the settlement lines up by state and LGA for the campaign: one record per LGA, in the template's columns.
+    Returns (layout dict, records frame)."""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = wb[sheet]
+    it = ws.iter_rows(values_only=True)
+    hdr = [str(h).strip().lower() if h is not None else "" for h in next(it)]
+    first = {}
+    for j, h in enumerate(hdr):
+        if h and h not in first:
+            first[h] = j
+    cols = [w for w in ("id", "state", "lga", "vacdate", "total_children_vaccinated", "total_children_vaccinated_bopv", "total_vaccine_doses_used") + ET_ZD if w in first]
+    ix = [first[w] for w in cols]
+    rows = [[r[j] if j < len(r) else None for j in ix] + [n] for n, r in enumerate(it, start=2)]
+    wb.close()
+    d = pd.DataFrame(rows, columns=cols + ["_row"])
+    n0 = len(d)
+    notes = []
+    if "id" in d.columns:
+        k = d["id"].notna() & d.duplicated("id", keep="last")
+        if k.any():
+            notes.append("%d settlement line(s) with an id already seen (edited submissions): the last one is kept" % int(k.sum()))
+        d = d[~k]
+    for c in cols:
+        if c not in ("id", "state", "lga", "vacdate"):
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["vacdate"] = pd.to_datetime(d["vacdate"], errors="coerce")
+    nolga = d["state"].map(is_empty) | d["lga"].map(is_empty)
+    if nolga.any():
+        notes.append("%d settlement line(s) without state or LGA left out" % int(nolga.sum()))
+    d = d[~nolga]
+    med = d["vacdate"].dropna().sort_values().iloc[len(d["vacdate"].dropna()) // 2]
+    ok = ((d["vacdate"] - med).abs() <= pd.Timedelta(days=20))
+    if (~ok).any():
+        notes.append("%d settlement line(s) with a vaccination date more than 20 days from the campaign (%s) left out" % (int((~ok).sum()), med.strftime("%Y-%m-%d")))
+    d = d[ok]
+    cnt = d["vacdate"].dt.normalize().value_counts().sort_index()
+    start = cnt[cnt >= max(10, 0.01 * len(d))].index.min()          # the first day on which the teams really report (a few test lines come earlier)
+    early = d["vacdate"] < start
+    if early.any():
+        notes.append("%d settlement line(s) dated before the first vaccination day (%s) left out (test entries)" % (int(early.sum()), start.strftime("%Y-%m-%d")))
+        d = d[~early]
+    agg = {"_row": "min"}
+    out_cols = {"total_children_vaccinated": "TotalNbrVaccPolio", "total_vaccine_doses_used": "Doses.UsedPolio", "total_children_vaccinated_bopv": "Total_Vacc_bOPV"}
+    for c in out_cols:
+        if c in d.columns:
+            agg[c] = lambda x: x.sum(min_count=1)
+    zd = [c for c in ET_ZD if c in d.columns]
+    for c in zd:
+        agg[c] = lambda x: x.sum(min_count=1)
+    g = d.groupby(["state", "lga"]).agg(agg).reset_index()
+    g["_n"] = d.groupby(["state", "lga"]).size().values
+    rec = pd.DataFrame({"Country": folder_country, "Province": g["state"], "District": g["lga"], "SIA_date": start})
+    for c, t in out_cols.items():
+        if c in g.columns:
+            rec[t] = g[c]
+    if zd:
+        z = g[zd].sum(axis=1, min_count=1)
+        rec["Total_Nbr_0doseVaccPolio_0_59M"] = z
+        rec["Total_Nbr_1dose_Plus_vaccPolio_0_59M"] = rec["TotalNbrVaccPolio"] - z
+    rec["_src_row"] = g["_row"].values
+    rec["_sheet"] = sheet
+    notes.insert(0, "eTally export: %d settlement lines added up into %d LGA records for the campaign that starts %s (first vaccination day)" % (len(d), len(rec), start.strftime("%Y-%m-%d")))
+    notes.append("figures added up from the settlement lines: children vaccinated, doses used, zero-dose children (household, fixed post, other teams); 1-dose-plus = total minus zero-dose; the target population is not in an eTally file")
+    lay = {"sheet": sheet, "header_row": 0, "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "class": "eTally (settlement lines added up by LGA)",
+           "template_columns_found": len(rec.columns) - 2, "notes": notes, "extra": [], "etally": True}
+    return lay, rec
+
+
+def population_from_live(ctx):
+    """{(country, province, district): the PopPolio of the latest live record}"""
+    if getattr(ctx, "_pop_live", None) is None:
+        b, L = ctx.builder, ctx.live
+        t = pd.DataFrame({"c": L["Country"].map(b._qcountry), "p": L["Province"].map(cn), "d": L["District"].map(cn),
+                          "dt": pd.to_datetime(L["SIA_date"], errors="coerce"), "pop": pd.to_numeric(L["PopPolio"], errors="coerce")}).dropna(subset=["pop", "dt"])
+        t = t.sort_values("dt").drop_duplicates(["c", "p", "d"], keep="last")
+        ctx._pop_live = {(r.c, r.p, r.d): r.pop for r in t.itertuples()}
+    return ctx._pop_live
+
+
 KINDS = (("lqas", "an LQAS file"), ("monitor", "a monitoring (IM) file"), ("_im_", "a monitoring (IM) file"), ("im_polio", "a monitoring (IM) file"),
          ("etally", "an eTally file"), ("tally", "a tally sheet"), ("aefi", "an AEFI file"), ("supplies", "a supplies file"), ("dqc", "a list of data-quality issues"),
          ("synthese", "a monitoring summary"), ("resultats", "a results summary"), ("daily call", "a call-in report"), ("vaccine utilization", "a vaccine utilisation summary"))
@@ -415,8 +694,16 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
          "rows_read": 0, "rows_used": 0, "excluded": 0, "new": 0, "existing_same": 0, "existing_different": 0, "existing_units": 0, "in_file_duplicates_removed": 0,
          "qc_errors": 0, "qc_warnings": 0, "countries": "", "status": "blocked", "why": ""}
     det = {"layout": None, "notes": None, "excluded": [], "issues": None, "compare": None, "diffs": None, "campaigns": None, "dups": None}
+    lay, et_raw = None, None
+    if "tally" in name.lower() and name.lower().endswith((".xlsx", ".xlsm")):
+        try:
+            sh = etally_find(path)
+            if sh:
+                lay, et_raw = etally_layout(path, sh, folder_country)
+        except Exception:
+            lay, et_raw = None, None
     try:
-        lay = detect_layout(path, template_cols, assume=(("Country",) if folder_country else ()) + ("Round_Add", "Response"))
+        lay = lay or detect_layout(path, template_cols, assume=(("Country",) if folder_country else ()) + ("Round_Add", "Response"))
     except Exception as e:
         s["why"] = "the file could not be opened (%s)" % type(e).__name__
         det["layout"] = {"class": "not readable", "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "notes": [str(e)[:200]]}
@@ -428,7 +715,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         kind = guess_kind(path, lay)
         s["why"] = ("looks like %s, not admin data; " % kind if kind else "") + "; ".join(lay["notes"])
         return s, None, det
-    raw = read_records(path, lay)
+    raw = et_raw if et_raw is not None else read_records(path, lay)
     s["rows_read"] = len(raw)
     notes = Notes()
     P = pd.DataFrame({c: raw[c] if c in raw.columns else None for c in template_cols}, dtype=object)
@@ -437,6 +724,17 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     # rows with nothing in the key and figure columns are empty lines; a "TOTAL" line is not a record
     core = [c for c in ("Province", "District", "SIA_date", "PopPolio", "TotalNbrVaccPolio") if c in raw.columns]
     empty_line = raw[core].map(is_empty).all(axis=1).values       # a pre-filled Country / code alone does not make a record
+    # a line with neither province nor district is not a record (title lines, summary tables of other sheets)
+    if "Province" in raw.columns and "District" in raw.columns:
+        empty_line = empty_line | (raw["Province"].map(is_empty) & raw["District"].map(is_empty)).values
+    # a line pre-filled with names and a target population but with no date and no vaccination figure was not reported: not a record
+    figs = [c for c in ("TotalNbrVaccPolio", "Total_Nbr_0doseVaccPolio_0_59M", "Total_Nbr_1dose_Plus_vaccPolio_0_59M", "Doses.UsedPolio") if c in raw.columns]
+    if figs:
+        nodate = raw["SIA_date"].map(is_empty).values if "SIA_date" in raw.columns else np.ones(len(raw), bool)
+        unrep = nodate & raw[figs].map(lambda v: is_empty(v) or str(v).strip() in ("0", "0.0")).all(axis=1).values & ~empty_line
+        if unrep.any():
+            lay["notes"].append("%d pre-filled line(s) with no date and no vaccination figure were ignored (not reported yet)" % int(unrep.sum()))
+            empty_line = empty_line | unrep
     totals = np.zeros(len(P), bool)
     for c in ("Country", "Province", "District"):
         totals |= P[c].map(lambda v: isinstance(v, str) and bool(re.match(r"^\s*(grand\s+)?total\b", v, re.I))).values
@@ -465,6 +763,11 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             if v is None:
                 continue
             t = std.get(b._qcountry(v))
+            if t is None and folder_country:
+                t = folder_country
+                notes.add(rowref(P, i), "Country", v, t, "country name not recognised: the country of the folder is used")
+                P.at[i, "Country"] = t
+                continue
             if t and t != v:
                 notes.add(rowref(P, i), "Country", v, t, "country name of the geography reference")
                 P.at[i, "Country"] = t
@@ -483,6 +786,14 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     # vaccine and round, in the spelling of the live file
     vmap = {cn(v): v for v in prof["values"].get("Vaccine_type", ())}
     for i, v in P["Vaccine_type"].items():
+        if v is not None and (re.fullmatch(r"[\d.\s]+", str(v)) or str(v).strip().lower() in EMPTY_WORDS):
+            notes.add(rowref(P, i), "Vaccine_type", v, "", "not a vaccine name: left empty")
+            P.at[i, "Vaccine_type"] = None
+            continue
+        a = vaccine_alias(v) if v is not None else None
+        if a and a != v:
+            notes.add(rowref(P, i), "Vaccine_type", v, a, "vaccine name written another way (French / short form)")
+            P.at[i, "Vaccine_type"] = v = a
         if isinstance(v, str):
             t = vmap.get(cn(v))
             if t and t != v:
@@ -535,13 +846,36 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             out.append(x)
         P[c] = pd.Series(out, index=P.index, dtype=float)
     det["bad_numbers"] = pd.DataFrame(bad_num)
+    # eTally has no target population: the latest one of the same LGA in the live file
+    if lay.get("etally"):
+        pops, nfill = population_from_live(ctx), 0
+        for i in P.index:
+            if is_empty(P.at[i, "PopPolio"]) or pd.isna(P.at[i, "PopPolio"]):
+                v = pops.get((b._qcountry(P.at[i, "Country"]), cn(P.at[i, "Province"]), cn(P.at[i, "District"])))
+                if v is not None:
+                    P.at[i, "PopPolio"] = float(v)
+                    nfill += 1
+                    notes.add(rowref(P, i), "PopPolio", "", float(v), "target population of the latest live record of this LGA (an eTally file has none)")
+        det.setdefault("warnings", []).append("%d of %d LGA(s) got their target population from the live file" % (nfill, len(P)))
+    # campaign values the operator gave for this file (campaign_hints.json: {"file name": {"Response": .., "Round_Add": .., "Vaccine_type": .., "SIA_date": ..}})
+    given = (getattr(ctx, "_campaign_hints", None) or {}).get(name)
+    if given:
+        for col, val in given.items():
+            if col not in P.columns:
+                continue
+            if col == "SIA_date":
+                val = pd.to_datetime(val, errors="coerce")
+            for i in P.index[P[col].map(lambda x: pd.isna(x) if col == "SIA_date" else is_empty(x))]:
+                P.at[i, col] = val
+                notes.add(rowref(P, i), col, "", val if col != "SIA_date" else val.strftime("%Y-%m-%d"), "given by the operator for this file (campaign_hints.json)")
     # an empty Response: the lookup (the same rules as the build), then the names of the lookup
     if ctx.lookup is not None:
         try:
-            for i, inf in b.fill_blank_response(P, ctx.lookup).items():
+            dated = P[P["SIA_date"].notna()]
+            for i, inf in b.fill_blank_response(dated, ctx.lookup).items():
                 P.at[i, "Response"] = inf["set"]["Response"]
                 notes.add(rowref(P, i), "Response", "", inf["set"]["Response"], inf["why"])
-            for i, inf in b.align_response_names(P, ctx.lookup, None).items():
+            for i, inf in b.align_response_names(P[P["SIA_date"].notna()], ctx.lookup, None).items():
                 old = P.at[i, "Response"]
                 P.at[i, "Response"] = inf["set"]["Response"]
                 notes.add(rowref(P, i), "Response", old, inf["set"]["Response"], inf["why"])
@@ -568,12 +902,33 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
                     notes.add(rowref(P, i), "Round_Add", "", P.at[i, "Round_Add"], "round taken from the lookup (country, campaign, start date); " + how)
         except Exception as e:
             det.setdefault("warnings", []).append("Round filling from the lookup failed: %s" % e)
+    # still no Response: look for the campaign in the lookup from what the file says (date, round, vaccine, file name)
+    try:
+        det["inferred"] = infer_campaign(P, ctx, prof, name_hints(path, [lay.get("sheet")] + [L.get("sheet") for L in lay.get("extra") or []]), notes)
+    except Exception as e:
+        det["inferred"] = []
+        det.setdefault("warnings", []).append("Campaign search in the lookup failed: %s" % e)
     # rows that cannot be used
-    bad = []
+    bad, camp_missing = [], Counter()
     for i in P.index:
         miss = [c for c in KEY_COLS if (pd.isna(P.at[i, c]) if c == "SIA_date" else is_empty(P.at[i, c]))]
         if miss:
             bad.append((i, "key field empty or unreadable: " + ", ".join(miss)))
+            if set(miss) <= {"SIA_date", "Round_Add", "Vaccine_type", "Response"}:
+                camp_missing[tuple(miss)] += 1
+    if camp_missing:
+        # the records are complete except for the campaign: tell the operator what the file says and which campaigns the lookup has
+        h = name_hints(path, [lay.get("sheet")] + [L.get("sheet") for L in lay.get("extra") or []])
+        cs = P["Country"].dropna().unique()
+        cand = ""
+        if ctx.lookup is not None and len(cs) == 1:
+            lc = ctx.lookup[ctx.lookup["_ck"] == b._lkc(cs[0])].sort_values("_d", ascending=False).head(6)
+            cand = " | ".join("%s %s (%s)" % (r["OBR Name"], r["Round Number"], r["Round Start Date"]) for _, r in lc.iterrows())
+        fields = sorted({c for k in camp_missing for c in k})
+        det["to_set"] = pd.DataFrame([{"Country": ", ".join(map(str, cs)), "Records_without_campaign": sum(camp_missing.values()), "Missing": ", ".join(fields),
+                                       "File_says": "; ".join("%s %s" % (k, v) for k, v in h.items() if v) or "nothing usable",
+                                       "Latest_campaigns_in_lookup": cand,
+                                       "To_give": '"%s": {"Response": "...", "Round_Add": "Rnd1", "Vaccine_type": "...", "SIA_date": "YYYY-MM-DD"}' % name}])
     for i, why in bad:
         det["excluded"].append({"Row_in_file": rowref(P, i), "Reason": why})
     P = P.drop(index=[i for i, _ in bad]).reset_index(drop=True)
@@ -590,7 +945,9 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             det["excluded"].append({"Row_in_file": rowref(P, i), "Reason": "exact copy of another record of the file"})
         P = P[~drop.values].reset_index(drop=True)
     s["rows_used"] = len(P)
-    s["excluded"] = s["rows_read"] - len(P)
+    s["excluded"] = len(det["excluded"])
+    if s["rows_read"] - len(P) - len(det["excluded"]) > 0:
+        lay["notes"].append("%d empty line(s) ignored" % (s["rows_read"] - len(P) - len(det["excluded"])))
     if not len(P):
         s["why"] = "no usable record"
         det["notes"] = pd.DataFrame(notes.rows)
@@ -670,6 +1027,10 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("%d record(s) with the same names as several live records and none identical (not added)" % s["existing_units"])
     if lay["class"] != "template":
         reasons.append("layout: " + lay["class"])
+    if det.get("inferred"):
+        reasons.append("campaign details taken from the lookup / the file name, not written in the file (please confirm): " + "; ".join(det["inferred"][:3]))
+    if lay.get("etally"):
+        reasons.append("; ".join(lay["notes"][:1]))
     if lay.get("skipped_sheets"):
         reasons.append("sheet(s) with column names but not usable, not read: %s" % ", ".join(str(x) for x in lay["skipped_sheets"]))
     if folder_country and len(P):
@@ -806,6 +1167,14 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
             log("learned headers: %d from %s" % (len(learned), lp.name))
         except (OSError, ValueError):
             log("WARNING: %s could not be read" % lp)
+    hp = out_root / "campaign_hints.json"
+    ctx._campaign_hints = {}
+    if hp.is_file():
+        try:
+            ctx._campaign_hints = {k: v for k, v in json.loads(hp.read_text(encoding="utf-8")).items() if isinstance(v, dict)}
+            log("campaign values given for %d file(s) in %s" % (len(ctx._campaign_hints), hp.name))
+        except (OSError, ValueError):
+            log("WARNING: %s could not be read" % hp)
     scratch = out_root / "_unzipped"
     if scratch.is_dir():
         shutil.rmtree(scratch, ignore_errors=True)
@@ -900,7 +1269,7 @@ def write_report(path, rows, details, ctx, not_read=()):
             rows_h.append({"Header": x, "In files": len(c["files"]), "Example file": sorted(c["files"])[0],
                            "Closest template column": tcols[near[0]] if near else "", "To teach it": '"%s": "%s"' % (x, tcols[near[0]]) if near else ""})
         sheets["Headers_to_learn"] = pd.DataFrame(rows_h)
-    for name, key in (("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
+    for name, key in (("Campaign_to_set", "to_set"), ("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
                       ("Normalised_cells", "notes"), ("Defaults_from_live", "defaults"), ("Left_out", "excluded_df"), ("Not_numbers", "bad_numbers"),
                       ("Values_not_seen", "unseen"), ("Duplicates_in_file", "dups"), ("Campaigns_vs_lookup", "campaigns")):
         if key == "excluded_df":
