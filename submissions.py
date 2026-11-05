@@ -21,6 +21,7 @@ import datetime as dt
 import hashlib
 import json
 import re
+import shutil
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -35,10 +36,16 @@ DATE_COLS = ["SIA_date", "Date_Report", "DateOfOnset"]
 CAT_COLS = ["Vaccine_type", "Round_Add", "AgeGPolio", "Main_Act"]
 NO_DEFAULT = set(KEY_COLS + FIGURE_COLS + ["Admin_3", "Date_Report", "DateOfOnset", "Year", "SIAMTH", "Index", "check_dp",
                                             "prov_candidates", "Ctry_Code", "AFRO_block", "CV_nOPV2", "CV_bOPV", "EpidNumber"])
-EXTENSIONS = (".xlsx", ".xlsm", ".csv")
+EXTENSIONS = (".xlsx", ".xlsm", ".xls", ".xlsb", ".csv")
+ARCHIVES = (".zip",)                       # opened: the files inside are inspected as if they were in the folder
+NOT_OPENED = (".7z", ".rar", ".tar", ".gz")   # archives that are not opened (extract them and put the files in the folder)
 EMPTY_WORDS = {"", "-", "--", "na", "n/a", "nan", "null", "none", "#n/a", "nd", "n.d.", "#div/0!"}
 # headers that mean the same as a template column (compared without case, accents, spaces, punctuation). Only what is certain.
-SYNONYMS = {"round": "Round_Add", "rnd": "Round_Add", "roundnumber": "Round_Add", "rounds": "Round_Add",
+SYNONYMS = {"ctryname": "Country", "provname": "Province", "distname": "District", "typeopvvaccine": "Vaccine_type",
+            "nbr0dosesvacpolio011m": "Nbr0dosesVaccPolio_0_11M", "totalnbr0dosepolio": "Total_Nbr_0doseVaccPolio_0_59M",
+            "totalnbr1dosepluspolio": "Total_Nbr_1dose_Plus_vaccPolio_0_59M", "totalnbrvacpolio": "TotalNbrVaccPolio",
+            "usedpolio": "Doses.UsedPolio",
+            "round": "Round_Add", "rnd": "Round_Add", "roundnumber": "Round_Add", "rounds": "Round_Add",
             "vaccine": "Vaccine_type", "vaccinetype": "Vaccine_type", "vaccineused": "Vaccine_type",
             "campaign": "Response", "campaignname": "Response", "responsename": "Response", "obrname": "Response",
             "admin1": "Province", "adm1": "Province", "admin2": "District", "adm2": "District",
@@ -50,6 +57,9 @@ SYNONYMS = {"round": "Round_Add", "rnd": "Round_Add", "roundnumber": "Round_Add"
 
 
 # ----------------------------------------------------------------------------------------------- helpers
+LEARNED = {}     # headers confirmed by the operators (inputs/header_synonyms.json: {"header as written": "template column"})
+
+
 def cn(x):
     """A header for comparison: no accents, case, spaces or punctuation (SIA-date = SIA_date = sia date)."""
     t = unicodedata.normalize("NFKD", str(x)).encode("ascii", "ignore").decode().lower()
@@ -67,12 +77,47 @@ def sha256_of(path, n=1 << 20):
     return h.hexdigest()
 
 
-def list_files(folder):
-    out = []
-    for p in sorted(Path(folder).rglob("*")):
-        if p.is_file() and p.suffix.lower() in EXTENSIONS and not p.name.startswith(("~$", ".")):
-            out.append(p)
-    return out
+def list_files(folder, scratch=None):
+    """Every data file below a folder, zip archives opened (the scratch folder holds the extracted files):
+    ([(path on disk, path shown: 'Country/archive.zip/inner.xlsx')], [(shown path, why it is not read)])."""
+    import zipfile
+    folder = Path(folder)
+    scratch = Path(scratch) if scratch else None
+    out, other = [], []
+
+    def walk_dir(d, shown_prefix, depth):
+        for p in sorted(Path(d).rglob("*")):
+            if not p.is_file() or p.name.startswith(("~$", ".")) or "__MACOSX" in p.parts:
+                continue
+            handle(p, shown_prefix + str(p.relative_to(d)).replace("\\", "/"), depth)
+
+    def handle(p, shown, depth):
+        ext = p.suffix.lower()
+        if ext in EXTENSIONS:
+            out.append((p, shown))
+        elif ext in ARCHIVES:
+            if scratch is None or depth >= 3:
+                other.append((shown, "zip archive not opened (too deeply nested)" if scratch else "zip archive not opened"))
+                return
+            try:
+                with zipfile.ZipFile(p) as z:
+                    if sum(i.file_size for i in z.infolist()) > 800 * 1024 * 1024:
+                        other.append((shown, "zip archive larger than 800 MB once opened: not opened"))
+                        return
+                    dest = scratch / ("%s_%d" % (sha256_of(p)[:12], depth))
+                    if not dest.is_dir():
+                        z.extractall(dest)
+            except Exception as e:
+                other.append((shown, "zip archive could not be opened (%s)" % type(e).__name__))
+                return
+            walk_dir(dest, shown + "/", depth + 1)
+        elif ext in NOT_OPENED:
+            other.append((shown, "%s archive: not opened (extract it and put its files in the folder)" % ext))
+        else:
+            other.append((shown, "not a spreadsheet (%s)" % (ext or "no extension")))
+
+    walk_dir(folder, "", 0)
+    return out, other
 
 
 def is_empty(v):
@@ -175,11 +220,32 @@ def learn_profile(live, builder, geo):
 
 # ----------------------------------------------------------------------------------------------- layout
 def read_head(path, nrows=25):
-    """{sheet: DataFrame of the first rows without header}."""
-    if str(path).lower().endswith(".csv"):
+    """{sheet: DataFrame of the first rows without header}. Large workbooks are read row by row (not loaded whole)."""
+    low = str(path).lower()
+    if low.endswith(".csv"):
         return {"(csv)": _read_csv(path, nrows)}
-    xl = pd.ExcelFile(path)
     out = {}
+    if low.endswith((".xlsx", ".xlsm")):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            for ws in wb.worksheets:
+                rows = []
+                for r in ws.iter_rows(min_row=1, max_row=nrows, values_only=True):
+                    rows.append(list(r))
+                if rows:
+                    w = max(len(r) for r in rows)
+                    out[ws.title] = pd.DataFrame([r + [None] * (w - len(r)) for r in rows], dtype=object)
+        finally:
+            wb.close()
+        return out
+    eng = "pyxlsb" if low.endswith(".xlsb") else None
+    if eng:
+        try:
+            import pyxlsb  # noqa: F401
+        except ImportError:
+            raise RuntimeError("an .xlsb file needs the package pyxlsb (pip install pyxlsb), or save it as .xlsx")
+    xl = pd.ExcelFile(path, engine=eng)
     for sn in xl.sheet_names:
         try:
             out[sn] = pd.read_excel(xl, sheet_name=sn, header=None, nrows=nrows, dtype=object)
@@ -226,7 +292,7 @@ def _map_header(raw, r, tn, template_cols, assume):
         lay["notes"].append("key columns missing: " + ", ".join(lay["missing_keys"]))
     elif lay["synonym"] or lay["country_from_folder"]:
         lay["class"] = "mapped (headers differ)"
-    elif len(seen) >= 0.9 * len(template_cols):
+    elif len(seen) >= 0.7 * len(template_cols):
         lay["class"] = "template"
     else:
         lay["class"] = "template columns, fewer than the template"
@@ -279,7 +345,7 @@ def _read_sheet(path, L):
     if str(path).lower().endswith(".csv"):
         raw = _read_csv(path)
     else:
-        raw = pd.read_excel(path, sheet_name=L["sheet"], header=None, dtype=object)
+        raw = pd.read_excel(path, sheet_name=L["sheet"], header=None, dtype=object, engine="pyxlsb" if str(path).lower().endswith(".xlsb") else None)
     r = L["header_row"]
     body = raw.iloc[r + 1:].copy()
     src = np.arange(r + 2, r + 2 + len(body))     # the row in the file as Excel shows it
@@ -312,6 +378,35 @@ class Notes:
             self.rows.append({"Row_in_file": src_row, "Column": col, "Found": found, "Set_to": new, "Rule": rule})
 
 
+def round_offsets(ctx):
+    """How the live file numbers the rounds against the lookup: {'by_campaign': {campaign key: offset}, 'common': most frequent offset}."""
+    if getattr(ctx, "_round_off", None) is None:
+        b = ctx.builder
+        try:
+            L = ctx.live
+            pr = pd.DataFrame({"_rk": L["Response"].map(b._rk), "_d": pd.to_datetime(L["SIA_date"], errors="coerce").dt.strftime("%Y-%m-%d"),
+                               "rn": L["Round_Add"].map(b._rnum)}).dropna(subset=["_d"]).drop_duplicates()
+            by = b._round_offsets(pr, ctx.lookup)
+        except Exception:
+            by = {}
+        common = Counter(by.values()).most_common(1)[0][0] if by else 0
+        ctx._round_off = {"by_campaign": by, "common": common}
+    return ctx._round_off
+
+
+KINDS = (("lqas", "an LQAS file"), ("monitor", "a monitoring (IM) file"), ("_im_", "a monitoring (IM) file"), ("im_polio", "a monitoring (IM) file"),
+         ("etally", "an eTally file"), ("tally", "a tally sheet"), ("aefi", "an AEFI file"), ("supplies", "a supplies file"), ("dqc", "a list of data-quality issues"),
+         ("synthese", "a monitoring summary"), ("resultats", "a results summary"), ("daily call", "a call-in report"), ("vaccine utilization", "a vaccine utilisation summary"))
+
+
+def guess_kind(path, lay):
+    n = Path(path).name.lower()
+    for k, v in KINDS:
+        if k in n:
+            return v
+    return ""
+
+
 def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     """Inspect one file. Returns (summary dict, prepared DataFrame in template layout or None, detail dict of frames)."""
     b = ctx.builder
@@ -321,7 +416,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
          "qc_errors": 0, "qc_warnings": 0, "countries": "", "status": "blocked", "why": ""}
     det = {"layout": None, "notes": None, "excluded": [], "issues": None, "compare": None, "diffs": None, "campaigns": None, "dups": None}
     try:
-        lay = detect_layout(path, template_cols, assume=("Country",) if folder_country else ())
+        lay = detect_layout(path, template_cols, assume=(("Country",) if folder_country else ()) + ("Round_Add", "Response"))
     except Exception as e:
         s["why"] = "the file could not be opened (%s)" % type(e).__name__
         det["layout"] = {"class": "not readable", "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "notes": [str(e)[:200]]}
@@ -330,7 +425,8 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     s["layout"], s["header_row"] = lay["class"], (lay["header_row"] + 1) if lay["header_row"] is not None else ""
     s["sheet"] = ", ".join(str(x) for x in ([lay["sheet"]] + [L["sheet"] for L in lay.get("extra") or []]) if x is not None)
     if lay["class"] == "not usable":
-        s["why"] = "; ".join(lay["notes"])
+        kind = guess_kind(path, lay)
+        s["why"] = ("looks like %s, not admin data; " % kind if kind else "") + "; ".join(lay["notes"])
         return s, None, det
     raw = read_records(path, lay)
     s["rows_read"] = len(raw)
@@ -339,8 +435,8 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     P["_src_row"] = raw["_src_row"].values
     P["_sheet"] = raw["_sheet"].values
     # rows with nothing in the key and figure columns are empty lines; a "TOTAL" line is not a record
-    core = [c for c in KEY_COLS + ["PopPolio", "TotalNbrVaccPolio"] if c in raw.columns]
-    empty_line = raw[core].map(is_empty).all(axis=1).values
+    core = [c for c in ("Province", "District", "SIA_date", "PopPolio", "TotalNbrVaccPolio") if c in raw.columns]
+    empty_line = raw[core].map(is_empty).all(axis=1).values       # a pre-filled Country / code alone does not make a record
     totals = np.zeros(len(P), bool)
     for c in ("Country", "Province", "District"):
         totals |= P[c].map(lambda v: isinstance(v, str) and bool(re.match(r"^\s*(grand\s+)?total\b", v, re.I))).values
@@ -451,6 +547,27 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
                 notes.add(rowref(P, i), "Response", old, inf["set"]["Response"], inf["why"])
         except Exception as e:
             det.setdefault("warnings", []).append("Response filling from the lookup failed: %s" % e)
+    # an empty round: the round of the lookup for this country, campaign and start date (the old AFRO template has no round column)
+    if ctx.lookup is not None and "Round_Add" in P.columns:
+        try:
+            lk = ctx.lookup
+            for i in P.index[P["Round_Add"].map(is_empty)]:
+                resp, d_, c_ = P.at[i, "Response"], P.at[i, "SIA_date"], P.at[i, "Country"]
+                if is_empty(resp) or pd.isna(d_) or is_empty(c_):
+                    continue
+                e = lk[(lk["_ck"] == b._lkc(c_)) & (lk["_rk"] == b._rk(resp)) & (lk["_d"] == pd.Timestamp(d_).strftime("%Y-%m-%d"))]
+                rn = list(dict.fromkeys(e["_rn"].dropna())) if len(e) else []
+                if len(rn) == 1:
+                    rk = b._rk(resp)
+                    offs = round_offsets(ctx)
+                    off = offs["by_campaign"].get(rk)
+                    how = "the data numbers this campaign's rounds %+d from the lookup" % off if off is not None else \
+                        "assumed numbering of the live file (%+d from the lookup)" % offs["common"]
+                    off = offs["common"] if off is None else off
+                    P.at[i, "Round_Add"] = "Rnd%d" % (int(rn[0]) + off)
+                    notes.add(rowref(P, i), "Round_Add", "", P.at[i, "Round_Add"], "round taken from the lookup (country, campaign, start date); " + how)
+        except Exception as e:
+            det.setdefault("warnings", []).append("Round filling from the lookup failed: %s" % e)
     # rows that cannot be used
     bad = []
     for i in P.index:
@@ -570,6 +687,8 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     if s["new"] == 0:
         reasons.append("no new record")
     s["status"] = "ready" if not reasons else "review"
+    if reasons == ["no new record"] or (s["new"] == 0 and not s["qc_errors"] and not s["existing_different"] and not s["existing_units"]):
+        s["status"] = "nothing new"
     s["why"] = "; ".join(reasons)
     P = P.drop(columns=["_src_row", "_sheet"])
     P = P[template_cols]
@@ -678,17 +797,29 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
     out_root = Path(out_root)
     (out_root / "prepared").mkdir(parents=True, exist_ok=True)
     ledger = load_ledger(out_root)
-    files = list_files(folder)
-    log("%d file(s) in %s" % (len(files), folder))
+    lp = out_root / "header_synonyms.json"
+    if lp.is_file():
+        try:
+            tn_ = {cn(c): c for c in template_cols}
+            learned = {cn(k): v for k, v in json.loads(lp.read_text(encoding="utf-8")).items() if v in template_cols}
+            SYNONYMS.update(learned)
+            log("learned headers: %d from %s" % (len(learned), lp.name))
+        except (OSError, ValueError):
+            log("WARNING: %s could not be read" % lp)
+    scratch = out_root / "_unzipped"
+    if scratch.is_dir():
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True, exist_ok=True)
+    files, not_read = list_files(folder, scratch)
+    log("%d data file(s) in %s (%d other file(s) not read)" % (len(files), folder, len(not_read)))
     prof = learn_profile(ctx.live, ctx.builder, ctx.geo)
     rows, details = [], {}
     seen_hashes = set()
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    for n_file, p in enumerate(files, 1):
+    for n_file, (p, rel) in enumerate(files, 1):
         h = sha256_of(p)
         seen_hashes.add(h)
         old = ledger["files"].get(h)
-        rel = str(Path(p).relative_to(folder)).replace("\\", "/")
         fc = folder_country_of(rel, ctx.geo, ctx.builder)
         log("  [%d/%d] inspecting %s%s" % (n_file, len(files), rel, ("  (folder country: %s)" % fc) if fc else ""))
         s, P, det = prepare_file(p, ctx, prof, template_cols, folder_country=fc)
@@ -714,12 +845,13 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
                  and k in seen_hashes]
         e["superseded"] = bool(newer) and h not in seen_hashes
     save_ledger(out_root, ledger)
-    write_report(out_root / "Submissions_report.xlsx", rows, details, ctx)
+    shutil.rmtree(scratch, ignore_errors=True)
+    write_report(out_root / "Submissions_report.xlsx", rows, details, ctx, not_read)
     log("report: %s" % (out_root / "Submissions_report.xlsx"))
     return rows
 
 
-def write_report(path, rows, details, ctx):
+def write_report(path, rows, details, ctx, not_read=()):
     ov = pd.DataFrame(rows)
     cols = ["name", "path", "status", "decision", "layout", "countries", "rows_read", "rows_used", "excluded", "new", "existing_same",
             "existing_different", "existing_units", "in_file_duplicates_removed", "qc_errors", "qc_warnings", "why", "hash"]
@@ -747,6 +879,27 @@ def write_report(path, rows, details, ctx):
                     "Mapped by synonym (verify)": "; ".join(L.get("synonym", [])), "Columns not in the template (ignored)": "; ".join(L.get("ignored", [])[:40]),
                     "Notes": "; ".join(L.get("notes", []))})
     sheets["Layout"] = pd.DataFrame(lay)
+    # every header the app could not map, over all the files: the way it learns. Copy a line into header_synonyms.json to teach it.
+    import difflib
+    tcols = {cn(c): c for c in (ctx.live.columns if getattr(ctx, "live", None) is not None else [])}
+    cnt = {}
+    for h, (s, det) in details.items():
+        L = det["layout"] or {}
+        if L.get("class") in ("not readable", "not usable") and not L.get("map"):
+            continue                                   # a file that is not admin data teaches nothing
+        for x in L.get("ignored", []):
+            if "(second column for" in str(x) or cn(x) in tcols or cn(x) in SYNONYMS or cn(x) == "checkdp":
+                continue                              # a repeated header or a column the app already knows
+            x = str(x)
+            c = cnt.setdefault(x, {"files": set(), "n": 0})
+            c["files"].add(s["name"])
+    if cnt:
+        rows_h = []
+        for x, c in sorted(cnt.items(), key=lambda kv: -len(kv[1]["files"])):
+            near = difflib.get_close_matches(cn(x), list(tcols), n=1, cutoff=0.8)
+            rows_h.append({"Header": x, "In files": len(c["files"]), "Example file": sorted(c["files"])[0],
+                           "Closest template column": tcols[near[0]] if near else "", "To teach it": '"%s": "%s"' % (x, tcols[near[0]]) if near else ""})
+        sheets["Headers_to_learn"] = pd.DataFrame(rows_h)
     for name, key in (("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
                       ("Normalised_cells", "notes"), ("Defaults_from_live", "defaults"), ("Left_out", "excluded_df"), ("Not_numbers", "bad_numbers"),
                       ("Values_not_seen", "unseen"), ("Duplicates_in_file", "dups"), ("Campaigns_vs_lookup", "campaigns")):
@@ -762,6 +915,8 @@ def write_report(path, rows, details, ctx):
             d = stack(key)
         if d is not None and len(d):
             sheets[name] = d
+    if len(not_read):
+        sheets["Files_not_read"] = pd.DataFrame(list(not_read), columns=["File", "Why"])
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
         for n, d in sheets.items():
             d.head(200000).to_excel(xw, sheet_name=n[:31], index=False)
