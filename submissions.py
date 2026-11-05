@@ -1062,13 +1062,16 @@ def tally_compare(ctx, name, T, country):
         grp = "live" if lab.startswith("live file") else "file"
         for col in [c for c in ("Total", "Total2") if F[c].notna().any()]:
             ident, both, m = score(g, col)
-            if both >= max(3, 0.1 * len(F)) and (best[grp] is None or (ident, both) > (best[grp][0], best[grp][1])):
+            ok_ = m[col].notna() & m["Total_o"].notna()
+            w5 = int((ok_ & ((m[col] / m["Total_o"].replace(0, np.nan) - 1).abs() <= 0.05)).sum())
+            relevant = ident >= 0.1 * len(F) or w5 >= 0.5 * len(F)          # a tally that does not resemble a campaign at all is not compared with it
+            if both >= max(3, 0.1 * len(F)) and relevant and (best[grp] is None or (ident, both) > (best[grp][0], best[grp][1])):
                 best[grp] = (ident, both, lab, col, m)
     parts, rows = [], []
     for grp in ("live", "file"):
         bst = best[grp]
         if not bst:
-            parts.append("%s: no campaign with figures for these LGAs" % ("live file" if grp == "live" else "files of the folder"))
+            parts.append("%s: no campaign with matching figures (the tally may cover a part only, e.g. a revaccination)" % ("live file" if grp == "live" else "files of the folder"))
             continue
         ident, both, lab, col, m = bst
         for _, r in m.iterrows():
@@ -1512,10 +1515,12 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     if det.get("callin_summary"):
         reasons.append(det["callin_summary"])
     # a file that is mostly another country's records than the folder it is in is in the wrong place
-    if folder_country and len(P) >= 50:
+    if folder_country and len(P) >= 10:
         oc = P["Country"].map(lambda v: v != folder_country)
         if oc.mean() > 0.5:
-            reasons.insert(0, "WRONG FILE OR WRONG FOLDER: %d of %d records are of other countries than the folder (%s); not usable, delete it from the folder" % (int(oc.sum()), len(P), folder_country))
+            top_c = P.loc[oc, "Country"].value_counts()
+            hint = ("; the records are of %s: move the file to that folder" % top_c.index[0]) if len(top_c) and top_c.iat[0] >= 0.8 * int(oc.sum()) and len(P) < 50 else "; not usable, delete it from the folder"
+            reasons.insert(0, "WRONG FILE OR WRONG FOLDER: %d of %d records are of other countries than the folder (%s)%s" % (int(oc.sum()), len(P), folder_country, hint))
             s["wrong_place"] = True
     if lay.get("skipped_sheets"):
         reasons.append("sheet(s) with column names but not usable, not read: %s" % ", ".join(str(x) for x in lay["skipped_sheets"]))
@@ -1600,13 +1605,17 @@ def compare_with_live(P, ctx, prof):
                 fam = vaccine_family(b)(P.at[i, "Vaccine_type"])
                 tot, pop = P.at[i, "TotalNbrVaccPolio"] if "TotalNbrVaccPolio" in P.columns else np.nan, P.at[i, "PopPolio"] if "PopPolio" in P.columns else np.nan
                 for lab, d_, v, tt, po, rs, ro in pl:
-                    if not (fam & v if fam and v else False):
+                    same_camp = (not is_empty(P.at[i, "Response"])) and str(rs).strip().lower() == str(P.at[i, "Response"]).strip().lower() \
+                        and str(ro).strip().lower() == str(P.at[i, "Round_Add"]).strip().lower()
+                    if not (fam & v if fam and v else False) and not same_camp:
                         continue
                     gap = abs((pd.Timestamp(P.at[i, "SIA_date"]) - d_).days)
                     same_fig = (not pd.isna(tot)) and (not pd.isna(tt)) and tot > 0 and abs(tot - tt) < 0.5
                     if same_fig and gap <= 120:
                         st = "possible duplicate: same figures as a live record of another campaign name, round or date"
                         note = "live row %d (%s %s, %s, %d day(s) apart)" % (lab + 2, rs, ro, d_.strftime("%Y-%m-%d"), gap)
+                        if not (fam & v if fam and v else False):
+                            note += "; same campaign and round, but the vaccine is named differently (file %s, live %s)" % (P.at[i, "Vaccine_type"], "/".join(sorted(v)) or "?")
                         if not (pd.isna(pop) or pd.isna(po)) and abs(pop - po) >= 0.5:
                             note += "; same children vaccinated but the target population differs (file %d, live %d)" % (pop, po)
                         break
