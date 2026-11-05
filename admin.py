@@ -1338,8 +1338,8 @@ def cmd_submissions(a):
     cols = list(ctx.live.columns)
     rows = sm.inspect_folder(ctx, folder, out_root, cols, log=log)
     ready = sum(1 for r in rows if r["status"] == "ready")
-    print("\n%d file(s): %d ready, %d to review, %d blocked." % (len(rows), ready, sum(1 for r in rows if r["status"] == "review"),
-                                                         sum(1 for r in rows if r["status"] == "blocked")))
+    print("\n%d file(s): %d ready, %d to review, %d blocked, %d with nothing new (tally sheets are checks)." % (len(rows), ready, sum(1 for r in rows if r["status"] == "review"),
+                                                         sum(1 for r in rows if r["status"] == "blocked"), sum(1 for r in rows if r["status"] == "nothing new")))
     print("Next: look at %s, then 'admin.py submissions accept <file>' for the files that go into the next build.\n" % (out_root / "Submissions_report.xlsx"))
 
 

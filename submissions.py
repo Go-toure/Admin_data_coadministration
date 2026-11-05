@@ -577,6 +577,124 @@ def infer_campaign(P, ctx, prof, hints, notes):
     return out
 
 
+def campaign_from_live(P, ctx, notes):
+    """Records with no campaign (Response, round, vaccine or date missing): the live file may already hold the same records. Each record is matched
+    on country, province, district and the number of children vaccinated; when most of the matches point to one campaign, the missing fields are
+    taken from it. Only fields that are empty are filled, and the operator is always asked to confirm. Returns the list of messages."""
+    b, out = ctx.builder, []
+    need = ["Response", "Round_Add", "Vaccine_type"]
+    if ctx.live is None or "TotalNbrVaccPolio" not in P.columns or not len(P) or "Response" not in P.columns:
+        return out
+    miss = P["Response"].map(is_empty) | P["Round_Add"].map(is_empty) | P["Vaccine_type"].map(is_empty) | P["SIA_date"].isna()
+    named = ~(P["Province"].map(is_empty) | P["District"].map(is_empty))
+    todo = P.index[miss & named]
+    if not len(todo):
+        return out
+    pidx, L = place_index(ctx), ctx.live
+    votes, per = Counter(), {}
+    for i in todo:
+        tot = pd.to_numeric(P.at[i, "TotalNbrVaccPolio"], errors="coerce")
+        if pd.isna(tot) or tot <= 0:
+            continue
+        hit = place_hits(ctx, b._qcountry(P.at[i, "Country"]), cn(P.at[i, "Province"]), cn(P.at[i, "District"]))
+        rows = [h for h in hit if (not pd.isna(h[3])) and abs(h[3] - tot) < 0.5 and not is_empty(h[5])]
+        keys = {(str(h[5]), str(h[6])) for h in rows}
+        if len(keys) == 1:
+            k = next(iter(keys))
+            votes[k] += 1
+            per[i] = (k, rows[0][0])
+    n_hit = sum(votes.values())
+    if not n_hit:
+        return out
+    (rs, ro), top = votes.most_common(1)[0]
+    if top < 0.6 * n_hit or n_hit < max(1, 0.2 * len(todo)):
+        out.append("live file: %d of %d record(s) without campaign match a live record, but not one campaign (%s): not used" %
+                   (n_hit, len(todo), ", ".join("%s %s x%d" % (k[0], k[1], v) for k, v in votes.most_common(3))))
+        return out
+    sel = L[(L["Response"].astype(str) == rs) & (L["Round_Add"].astype(str) == ro)]
+    ctr = {b._qcountry(c) for c in P.loc[todo, "Country"].dropna().unique()}
+    sel_c = sel[sel["Country"].map(b._qcountry).isin(ctr)]
+    sel = sel_c if len(sel_c) else sel
+    def mode(col):
+        v = sel[col].dropna().astype(str)
+        v = v[v.str.strip() != ""]
+        return v.value_counts().index[0] if len(v) else None
+    vacc = mode("Vaccine_type")
+    d_mode = pd.to_datetime(sel["SIA_date"], errors="coerce").dropna()
+    d_mode = d_mode.value_counts().index[0] if len(d_mode) else None
+    why = "campaign taken from the live file: %d of %d record(s) without a campaign have the same place and number vaccinated in %s %s" % (top, len(todo), rs, ro)
+    for i in todo:
+        for col, val in (("Response", rs), ("Round_Add", ro), ("Vaccine_type", vacc)):
+            if val and is_empty(P.at[i, col]):
+                P.at[i, col] = val
+                notes.add(rowref(P, i), col, "", val, why)
+        if P.at[i, "SIA_date"] is pd.NaT or pd.isna(P.at[i, "SIA_date"]):
+            d_ = pd.to_datetime(L.at[per[i][1], "SIA_date"], errors="coerce") if i in per and per[i][0] == (rs, ro) else d_mode
+            if d_ is not None and not pd.isna(d_):
+                P.at[i, "SIA_date"] = pd.Timestamp(d_)
+                notes.add(rowref(P, i), "SIA_date", "", pd.Timestamp(d_).strftime("%Y-%m-%d"), why)
+    other = int((~P.loc[todo, "Round_Add"].map(is_empty) & (P.loc[todo, "Round_Add"].astype(str) != ro)).sum())
+    out.append("%s %s (%d of %d record(s) matched in the live file; %d fill-in(s) for the rest%s)" % (
+        rs, ro, top, len(todo), len(todo) - top,
+        "; the file itself writes another round for %d record(s), kept as written: check" % other if other else ""))
+    return out
+
+
+def subdistrict_check(P, ctx, notes):
+    """A file of health-facility / sub-district lines (Admin_3 filled, each district on many lines) cannot be added to the district-level live file. When the
+    district totals (children vaccinated and target population) equal those of one campaign already in the live file, the file is its detail: the campaign
+    is filled in and the lines are reported as already there. Returns a dict (Response, Round_Add, districts, matched, message) or None."""
+    b = ctx.builder
+    if ctx.live is None or "Admin_3" not in P.columns or "TotalNbrVaccPolio" not in P.columns or not len(P):
+        return None
+    a3 = ~P["Admin_3"].map(is_empty)
+    keys = list(zip(P["Country"].map(lambda v: b._qcountry(v) if not is_empty(v) else ""), P["Province"].map(cn), P["District"].map(cn)))
+    if a3.mean() < 0.5 or len(P) < 1.5 * len(set(keys)):
+        return None
+    tot = pd.to_numeric(P["TotalNbrVaccPolio"], errors="coerce")
+    pop = pd.to_numeric(P["PopPolio"], errors="coerce") if "PopPolio" in P.columns else pd.Series(np.nan, index=P.index)
+    g = pd.DataFrame({"k": keys, "t": tot, "p": pop}).groupby("k").agg(t=("t", "sum"), p=("p", "sum"))
+    pidx, votes = place_index(ctx), Counter()
+    for k, r in g.iterrows():
+        cs = {(str(h[5]), str(h[6])) for h in place_hits(ctx, *k) if (not pd.isna(h[3])) and abs(h[3] - r["t"]) < 0.5
+              and (pd.isna(h[4]) or r["p"] == 0 or abs(h[4] - r["p"]) < 0.5) and not is_empty(h[5])}
+        if len(cs) == 1:
+            votes[next(iter(cs))] += 1
+    if not votes:
+        return None
+    (rs, ro), top = votes.most_common(1)[0]
+    if top < 3 or top < 0.4 * len(g) or top < 0.9 * sum(votes.values()):
+        return None
+    msg = ("health-facility lines (%d lines in %d districts); the district totals equal %s %s already in the live file (%d of %d districts; the others are spelled differently or are older district names), "
+           "so this is its detail: nothing to add" % (len(P), len(g), rs, ro, top, len(g)))
+    return {"Response": rs, "Round_Add": ro, "districts": len(g), "matched": top, "message": msg}
+
+
+def fill_down_sheet(P, notes):
+    """Lines of a sheet that lack the campaign while the other lines of the same sheet all carry one and the same campaign (Response, round, date):
+    the campaign is filled down (the person who filled the sheet did not copy it to the last lines). Reported for the operator to confirm."""
+    out = []
+    if "_sheet" not in P.columns or not len(P):
+        return out
+    for sh, g in P.groupby("_sheet", dropna=False):
+        full = g[~g["Response"].map(is_empty) & ~g["Round_Add"].map(is_empty) & g["SIA_date"].notna()]
+        todo = g[g["Response"].map(is_empty) & ~(g["Province"].map(is_empty) | g["District"].map(is_empty))]
+        if len(full) < 3 or not len(todo):
+            continue
+        trip = set(zip(full["Response"].astype(str), full["Round_Add"].astype(str), full["SIA_date"]))
+        if len(trip) != 1:
+            continue
+        rs, ro, dt_ = next(iter(trip))
+        why = "campaign filled down from the other %d line(s) of sheet %s (all give %s %s, %s)" % (len(full), sh, rs, ro, pd.Timestamp(dt_).strftime("%Y-%m-%d"))
+        for i in todo.index:
+            for col, val in (("Response", rs), ("Round_Add", ro), ("SIA_date", pd.Timestamp(dt_))):
+                if (P.at[i, col] is pd.NaT or pd.isna(P.at[i, col])) if col == "SIA_date" else is_empty(P.at[i, col]):
+                    P.at[i, col] = val
+                    notes.add(rowref(P, i), col, "", val, why)
+        out.append("%s %s: %d line(s) of sheet %s had no campaign, filled down from the other lines" % (rs, ro, len(todo), sh))
+    return out
+
+
 ET_ZD = ("h2h_zero_dose_sum", "fp_opv_ri_zd_vaccinated", "dopv_vaccinated_zd_vaccinated", "spt_opv_vac_spt_zd_vaccinated", "tt_opv_tt_zd_vaccinated")
 
 
@@ -803,6 +921,175 @@ def use_callin(P, ctx, notes, det, name):
         Path(cp).name, int(round(agree * (cmp_["Call_in"] > 0).sum())), int((cmp_["Call_in"] > 0).sum()), int(cmp_["Verdict"].str.startswith("differ more").sum()), n)
 
 
+# ----------------------------------------------------------------------------------------------- tally sheets: a check, not a source
+def tally_read(path):
+    """A Nigeria tally file read as a check (never as admin records): the LGA summaries ('... TallySheet Data Summary', sheet LGA), the ward tally
+    (State, Lga, Ward, TOTALOPV ...) and the tally details (sheet TD2_MainDATA). Returns {"kind", "vaccine", "frame"} with one line per LGA
+    (State, LGA, Target, Total, Total2, Wards), or None when the file is not one of these."""
+    name = Path(path).name
+    low = name.lower()
+    if "tally" not in low:
+        return None
+    vacc = "nOPV2" if "nopv2" in low and "bopv" not in low else "bOPV" if "bopv" in low else "MR" if ("measles" in low or "rubella" in low) else None
+    out = None
+    if low.endswith((".xlsx", ".xlsm")) and "summary" in low and "utilization" not in low:
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            if "LGA" not in wb.sheetnames:
+                return None
+            rows = list(wb["LGA"].iter_rows(values_only=True))
+        finally:
+            wb.close()
+        recs = []
+        for r in rows:
+            if r and len(r) > 3 and isinstance(r[0], str) and isinstance(r[1], str) and isinstance(r[2], (int, float)) and r[0].strip().lower() != "state":
+                nums = [x for x in r[2:] if isinstance(x, (int, float))]
+                if len(nums) >= 4:
+                    recs.append({"State": r[0].strip(), "LGA": r[1].strip(), "Target": nums[2], "Total": nums[-2], "Total2": np.nan, "Wards": np.nan})
+        if recs:
+            out = ("LGA summary", pd.DataFrame(recs))
+    if out is None:
+        try:
+            head = pd.read_excel(path, nrows=0)
+            cols = {str(c).strip().lower(): c for c in head.columns}
+            if {"state", "lga", "ward", "totalopv"} <= set(cols):
+                w = pd.read_excel(path)
+                w = w.rename(columns={cols[k]: k for k in cols})
+                for c in ("totalopv", "eligcild"):
+                    if c in w.columns:
+                        w[c] = pd.to_numeric(w[c], errors="coerce")
+                g = w.groupby(["state", "lga"]).agg(Total=("totalopv", "sum"), Target=("eligcild", "sum") if "eligcild" in w.columns else ("totalopv", "size"),
+                                                    Wards=("ward", "count")).reset_index().rename(columns={"state": "State", "lga": "LGA"})
+                g["Total2"] = np.nan
+                if "eligcild" not in w.columns:
+                    g["Target"] = np.nan
+                out = ("ward tally", g)
+        except Exception:
+            out = None
+    if out is None and low.endswith((".xls", ".xlsx")):
+        try:
+            x = pd.read_excel(path, sheet_name="TD2_MainDATA")
+            cols = {str(c).strip().lower(): c for c in x.columns}
+            if {"state", "lga", "ward"} <= set(cols) and "total_nopv" in cols:
+                for c in ("targetpop6wto59mths", "total_nopv", "total_bopv"):
+                    if c in cols:
+                        x[cols[c]] = pd.to_numeric(x[cols[c]], errors="coerce")
+                x["_t"] = x[cols["total_nopv"]].fillna(0) + (x[cols["total_bopv"]].fillna(0) if "total_bopv" in cols else 0)
+                g = x.groupby([cols["state"], cols["lga"]]).agg(Target=(cols["targetpop6wto59mths"], "sum") if "targetpop6wto59mths" in cols else ("_t", "size"),
+                                                                 Total=(cols["total_nopv"], "sum"), Total2=("_t", "sum"), Wards=(cols["ward"], "count")).reset_index()
+                g.columns = ["State", "LGA", "Target", "Total", "Total2", "Wards"]
+                out = ("tally details", g)
+        except Exception:
+            out = None
+    if out is None:
+        return None
+    kind, g = out
+    g = g[g["State"].map(lambda v: isinstance(v, str) and v.strip() != "") & g["LGA"].map(lambda v: isinstance(v, str) and v.strip() != "")]
+    return {"kind": kind, "vaccine": vacc, "frame": g.reset_index(drop=True)} if len(g) else None
+
+
+def _tally_candidates(ctx, country, vacc):
+    """Groups of records of the country to compare a tally with: {label: DataFrame(key -> Total, Pop)}, from the live file and from the files of the folder."""
+    b = ctx.builder
+    cands = {}
+
+    def add(label, D):
+        D = D.dropna(subset=["Total"])
+        if not len(D):
+            return
+        g = D.groupby("key").agg(Total=("Total", "sum"), Pop=("Pop", "sum"))
+        cands[label] = g
+
+    def frame(src):
+        keys = [(cn(a), cn(c)) for a, c in zip(src["Province"], src["District"])]
+        return pd.DataFrame({"key": keys, "Total": pd.to_numeric(src["TotalNbrVaccPolio"], errors="coerce").values,
+                             "Pop": pd.to_numeric(src["PopPolio"], errors="coerce").values if "PopPolio" in src.columns else np.nan})
+
+    def vfilter(v):
+        if not vacc or vacc == "MR":
+            return True
+        fam = vaccine_family(b)(v)
+        return (vacc.lower() in {x.lower() for x in fam}) or (not fam)
+
+    L = ctx.live[ctx.live["Country"].map(b._qcountry) == country]
+    if len(L):
+        d = pd.to_datetime(L["SIA_date"], errors="coerce")
+        for (rs, ro, dd), g in L.assign(_d=d).groupby([L["Response"].astype(str), L["Round_Add"].astype(str), "_d"], dropna=True):
+            g = g[g["Vaccine_type"].map(vfilter)]
+            if len(g) >= 3:
+                D = frame(g)
+                D["F"] = 0
+                add("live file: %s %s (%s)" % (rs, ro, pd.Timestamp(dd).strftime("%Y-%m-%d")), D)
+    for h, (nm, R) in (getattr(ctx, "_file_records", {}) or {}).items():
+        R = R[R["Country"].map(lambda v: b._qcountry(v) if not is_empty(v) else "") == country]
+        if not len(R):
+            continue
+        R = R.assign(_d=pd.to_datetime(R["SIA_date"], errors="coerce"))
+        for (rs, ro, dd), g in R.groupby([R["Response"].astype(str), R["Round_Add"].astype(str), "_d"], dropna=False):
+            g = g[g["Vaccine_type"].map(vfilter)]
+            if len(g) >= 3:
+                add("file %s: %s %s (%s)" % (nm, rs, ro, "" if pd.isna(dd) else pd.Timestamp(dd).strftime("%Y-%m-%d")), frame(g))
+    return cands
+
+
+def tally_compare(ctx, name, T, country):
+    """The LGA lines of a tally file against the best matching live campaign and the best matching file of the folder. Returns (DataFrame, message)."""
+    F = T["frame"].copy()
+    if T["vaccine"] == "MR":
+        return pd.DataFrame(), "TALLY SHEET used as a check, not as admin data (%s, %d LGAs): measles-rubella, the admin files carry no measles figures to compare it with" % (T["kind"], len(F))
+    cands = _tally_candidates(ctx, country, T["vaccine"])
+    universe = {}
+    for g in cands.values():
+        for k in g.index:
+            universe.setdefault(k[0], set()).add(k[1])
+    keys, fuzzy = [], 0
+    for s_, l_ in zip(F["State"], F["LGA"]):
+        k = (cn(s_), cn(re.sub(r"\s+lga$", "", l_, flags=re.I)))
+        if k[1] not in universe.get(k[0], ()):
+            near = difflib.get_close_matches(k[1], list(universe.get(k[0], ())), n=2, cutoff=0.8)
+            if near and (len(near) == 1 or difflib.SequenceMatcher(None, k[1], near[0]).ratio() - difflib.SequenceMatcher(None, k[1], near[1]).ratio() >= 0.05):
+                k, fuzzy = (k[0], near[0]), fuzzy + 1
+        keys.append(k)
+    F["key"] = keys
+
+    def score(g, col):
+        m = F.join(g, on="key", rsuffix="_o") if False else F.merge(g, left_on="key", right_index=True, how="left", suffixes=("", "_o"))
+        ok = m[col].notna() & m["Total_o"].notna()
+        return int((ok & ((m[col] - m["Total_o"]).abs() < 0.5)).sum()), int(ok.sum()), m
+    best = {"live": None, "file": None}
+    for lab, g in cands.items():
+        grp = "live" if lab.startswith("live file") else "file"
+        for col in [c for c in ("Total", "Total2") if F[c].notna().any()]:
+            ident, both, m = score(g, col)
+            if both >= max(3, 0.1 * len(F)) and (best[grp] is None or (ident, both) > (best[grp][0], best[grp][1])):
+                best[grp] = (ident, both, lab, col, m)
+    parts, rows = [], []
+    for grp in ("live", "file"):
+        bst = best[grp]
+        if not bst:
+            parts.append("%s: no campaign with figures for these LGAs" % ("live file" if grp == "live" else "files of the folder"))
+            continue
+        ident, both, lab, col, m = bst
+        for _, r in m.iterrows():
+            o, t = r.get("Total_o"), r[col]
+            if pd.isna(o) or pd.isna(t):
+                gap, v = np.nan, "LGA not in the other source" if pd.isna(o) else "no figure"
+            else:
+                gap = (t / o - 1) * 100 if o else np.nan
+                v = "identical" if abs(t - o) < 0.5 else "within 1%" if abs(gap) <= 1 else "differ 1-5%" if abs(gap) <= 5 else "differ more than 5%: check"
+            pg = (r["Target"] / r["Pop"] - 1) * 100 if not pd.isna(r["Target"]) and not pd.isna(r.get("Pop")) and r.get("Pop") else np.nan
+            rows.append({"State": r["State"], "LGA": r["LGA"], "Tally_total": t, "Tally_target": r["Target"], "Compared_with": lab, "Other_total": o,
+                         "Other_target": r.get("Pop"), "Total_gap_pct": round(gap, 1) if not pd.isna(gap) else np.nan,
+                         "Target_gap_pct": round(pg, 1) if not pd.isna(pg) else np.nan, "Verdict": v})
+        sub = pd.DataFrame(rows[-len(m):])
+        parts.append("%s: %d of %d LGAs identical, %d within 5%%, %d differ more than 5%%, %d not found" % (
+            lab, int((sub["Verdict"] == "identical").sum()), len(sub), int(sub["Verdict"].isin(["identical", "within 1%", "differ 1-5%"]).sum()),
+            int(sub["Verdict"].str.startswith("differ more").sum()), int(sub["Verdict"].str.startswith("LGA not").sum())))
+    msg = "TALLY SHEET used as a check, not as admin data (%s, %d LGAs%s). Against %s" % (T["kind"], len(F), ", %d LGA spelling(s) matched" % fuzzy if fuzzy else "", "; ".join(parts))
+    return pd.DataFrame(rows), msg
+
+
 KINDS = (("lqas", "an LQAS file"), ("monitor", "a monitoring (IM) file"), ("_im_", "a monitoring (IM) file"), ("im_polio", "a monitoring (IM) file"),
          ("etally", "an eTally file"), ("tally", "a tally sheet"), ("aefi", "an AEFI file"), ("supplies", "a supplies file"), ("dqc", "a list of data-quality issues"),
          ("synthese", "a monitoring summary"), ("resultats", "a results summary"), ("daily call", "a call-in report"), ("vaccine utilization", "a vaccine utilisation summary"))
@@ -825,6 +1112,19 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
          "qc_errors": 0, "qc_warnings": 0, "countries": "", "status": "blocked", "why": ""}
     det = {"layout": None, "notes": None, "excluded": [], "issues": None, "compare": None, "diffs": None, "campaigns": None, "dups": None}
     lay, et_raw = None, None
+    if "tally" in name.lower() and "etally" not in name.lower() and folder_country:
+        try:
+            tl = tally_read(path)
+        except Exception:
+            tl = None
+        if tl is not None:
+            if not hasattr(ctx, "_tallies"):
+                ctx._tallies = {}
+            ctx._tallies[s["hash"]] = (name, tl, folder_country)
+            s["layout"], s["status"], s["countries"], s["rows_read"] = "tally sheet (%s)" % tl["kind"], "nothing new", folder_country, len(tl["frame"])
+            s["why"] = "TALLY SHEET used as a check, not as admin data (%s, %d LGAs): see the Tally_check sheet" % (tl["kind"], len(tl["frame"]))
+            det["layout"] = {"class": "tally sheet", "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "notes": [], "header_row": None, "sheet": ""}
+            return s, None, det
     if "tally" in name.lower() and name.lower().endswith((".xlsx", ".xlsm")):
         try:
             sh = etally_find(path)
@@ -1044,10 +1344,38 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             det.setdefault("warnings", []).append("Round filling from the lookup failed: %s" % e)
     # still no Response: look for the campaign in the lookup from what the file says (date, round, vaccine, file name)
     try:
+        det["facility"] = subdistrict_check(P, ctx, notes)
+        if det["facility"]:
+            f = det["facility"]
+            sel = ctx.live[(ctx.live["Response"].astype(str) == f["Response"]) & (ctx.live["Round_Add"].astype(str) == f["Round_Add"])]
+            sel = sel[sel["Country"].map(b._qcountry).isin({b._qcountry(c) for c in P["Country"].dropna().unique()})]
+            for col in ("Response", "Round_Add", "Vaccine_type", "SIA_date"):
+                vals = sel[col].dropna().astype(str)
+                vals = vals[vals.str.strip() != ""]
+                if len(vals):
+                    v = vals.value_counts().index[0]
+                    v = pd.Timestamp(v) if col == "SIA_date" else v
+                    m_ = P[col].isna() if col == "SIA_date" else P[col].map(is_empty)
+                    for i in P.index[m_]:
+                        P.at[i, col] = v
+                        notes.add(rowref(P, i), col, "", v, "campaign taken from the live file (the district totals equal it)")
+    except Exception as e:
+        det["facility"] = None
+        det.setdefault("warnings", []).append("Facility-level check failed: %s" % e)
+    try:
+        det["from_live"] = campaign_from_live(P, ctx, notes)
+        det["filled_down"] = fill_down_sheet(P, notes)
         det["inferred"] = infer_campaign(P, ctx, prof, name_hints(path, [lay.get("sheet")] + [L.get("sheet") for L in lay.get("extra") or []]), notes)
     except Exception as e:
         det["inferred"] = []
         det.setdefault("warnings", []).append("Campaign search in the lookup failed: %s" % e)
+    # pre-filled lines with no campaign and no vaccination figure at all: planned, not reported yet
+    if "TotalNbrVaccPolio" in P.columns and len(P):
+        fig0 = pd.to_numeric(P["TotalNbrVaccPolio"], errors="coerce").fillna(0) == 0
+        unrep2 = fig0 & P["SIA_date"].isna() & P["Response"].map(is_empty) & P["Round_Add"].map(is_empty) & ~P["Province"].map(is_empty) & ~P["District"].map(is_empty)
+        if unrep2.any():
+            lay["notes"].append("%d pre-filled line(s) with no campaign and no vaccination figure were ignored (not reported yet)" % int(unrep2.sum()))
+            P = P[~unrep2]
     # rows that cannot be used
     bad, camp_missing = [], Counter()
     for i in P.index:
@@ -1096,6 +1424,9 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     # comparison with the live file (before the defaults are filled in: only what the country reported is compared)
     cmp_, diffs = compare_with_live(P, ctx, prof)
     det["compare"], det["diffs"] = cmp_, diffs
+    if det.get("facility"):
+        cmp_["Status"] = "already in the live file, same figures"
+        cmp_["Note"] = "health-facility line; its district total equals the live file's " + det["facility"]["Response"] + " " + det["facility"]["Round_Add"]
     s["new"] = int((cmp_["Status"] == "new").sum())
     s["existing_same"] = int((cmp_["Status"] == "already in the live file, same figures").sum())
     s["existing_different"] = int((cmp_["Status"] == "already in the live file, other figures").sum())
@@ -1170,6 +1501,10 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("%d record(s) that look like live records under another campaign name, round or date (not added): see the Records sheet" % s["possible_dup"])
     if lay["class"] != "template":
         reasons.append("layout: " + lay["class"])
+    if det.get("from_live"):
+        reasons.append("campaign details taken from the live file (same place and number vaccinated), not written in the file (please confirm): " + "; ".join(det["from_live"][:3]))
+    if det.get("filled_down"):
+        reasons.append("campaign filled down inside the sheet, not written in those lines (please confirm): " + "; ".join(det["filled_down"][:3]))
     if det.get("inferred"):
         reasons.append("campaign details taken from the lookup / the file name, not written in the file (please confirm): " + "; ".join(det["inferred"][:3]))
     if lay.get("etally"):
@@ -1204,6 +1539,11 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     if not s.get("wrong_place") and (reasons == ["no new record"] or (s["new"] == 0 and not s["qc_errors"] and not s["existing_different"] and not s["existing_units"] and not s.get("possible_dup"))):
         s["status"] = "nothing new"
     s["why"] = "; ".join(reasons)
+    if det.get("facility"):
+        s["status"], s["why"] = "nothing new", det["facility"]["message"] + ("; " + s["why"] if s["why"] else "")
+    if not hasattr(ctx, "_file_records"):
+        ctx._file_records = {}
+    ctx._file_records[s["hash"]] = (name, P[[c for c in ("Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response", "TotalNbrVaccPolio", "PopPolio") if c in P.columns]].copy())
     P = P[(cmp_["Status"] == "new").values]                 # only the records the live file does not have go to the build
     P = P.drop(columns=["_src_row", "_sheet"])
     P = P[template_cols]
@@ -1227,6 +1567,18 @@ def place_index(ctx):
     return ctx._place_idx
 
 
+def place_hits(ctx, country, province, district):
+    """The live records of a place: those of the same country, province and district, and those of the same district name filed under another province
+    (the live file may use an older or longer province name: 'Central' / 'Central Region', 'Toliary' / 'Androy'). The figures decide in the callers."""
+    idx = place_index(ctx)
+    if getattr(ctx, "_cd_idx", None) is None:
+        cd = {}
+        for (c, p_, d_), v in idx.items():
+            cd.setdefault((c, d_), []).extend(v)
+        ctx._cd_idx = cd
+    return list(ctx._cd_idx.get((country, district), []))
+
+
 def vaccine_family(b):
     return lambda v: frozenset(b._vset(v)) or frozenset({cn(v)}) if isinstance(v, str) and v.strip() else frozenset()
 
@@ -1243,7 +1595,7 @@ def compare_with_live(P, ctx, prof):
         if not cand:
             st, note = "new", ""
             # same place, same vaccine, and the same figures (or the same date) in the live file under another campaign name, round or date
-            pl = place_index(ctx).get((b._qcountry(P.at[i, "Country"]), cn(P.at[i, "Province"]), cn(P.at[i, "District"])))
+            pl = place_hits(ctx, b._qcountry(P.at[i, "Country"]), cn(P.at[i, "Province"]), cn(P.at[i, "District"]))
             if pl and not pd.isna(P.at[i, "SIA_date"]):
                 fam = vaccine_family(b)(P.at[i, "Vaccine_type"])
                 tot, pop = P.at[i, "TotalNbrVaccPolio"] if "TotalNbrVaccPolio" in P.columns else np.nan, P.at[i, "PopPolio"] if "PopPolio" in P.columns else np.nan
@@ -1414,6 +1766,19 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
         log("    %s: %s | %d rows, %d new, %d already there (%d with other figures)%s" %
             (s["status"].upper(), s["layout"], s["rows_read"], s["new"], s["existing_same"] + s["existing_different"], s["existing_different"],
              (" | " + s["why"]) if s["why"] else ""))
+    ctx._file_records = getattr(ctx, "_file_records", {})
+    for i_, ((h_, (s_, det_))) in enumerate(details.items()):
+        tl_ = (getattr(ctx, "_tallies", {}) or {}).get(h_)
+        if not tl_:
+            continue
+        try:
+            tdf, msg = tally_compare(ctx, tl_[0], tl_[1], ctx.builder._qcountry(tl_[2]))
+            det_["tally_check"] = tdf
+            s_["why"] = msg
+            rows[i_]["why"] = msg
+            ledger["files"][h_]["why"] = msg
+        except Exception as ex:
+            log("    tally check failed for %s: %s" % (tl_[0], ex))
     # files that were seen before and are not in the folder any more; a newer version of the same name supersedes the older one
     for h, e in ledger["files"].items():
         e["present"] = h in seen_hashes
@@ -1476,7 +1841,7 @@ def write_report(path, rows, details, ctx, not_read=()):
             rows_h.append({"Header": x, "In files": len(c["files"]), "Example file": sorted(c["files"])[0],
                            "Closest template column": tcols[near[0]] if near else "", "To teach it": '"%s": "%s"' % (x, tcols[near[0]]) if near else ""})
         sheets["Headers_to_learn"] = pd.DataFrame(rows_h)
-    for name, key in (("Campaign_to_set", "to_set"), ("eTally_vs_callin", "callin_check"), ("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
+    for name, key in (("Campaign_to_set", "to_set"), ("eTally_vs_callin", "callin_check"), ("Tally_check", "tally_check"), ("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
                       ("Normalised_cells", "notes"), ("Defaults_from_live", "defaults"), ("Left_out", "excluded_df"), ("Not_numbers", "bad_numbers"),
                       ("Values_not_seen", "unseen"), ("Duplicates_in_file", "dups"), ("Campaigns_vs_lookup", "campaigns")):
         if key == "excluded_df":
