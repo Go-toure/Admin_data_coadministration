@@ -1157,7 +1157,8 @@ def wide_rounds_layout(path, folder_country):
     return None, None
 
 
-KINDS = (("lqas", "an LQAS file"), ("monitor", "a monitoring (IM) file"), ("_im_", "a monitoring (IM) file"), ("im_polio", "a monitoring (IM) file"),
+KINDS = (("ipdredo", "a revisit (REDO) tally of the ward teams"), ("ipdvaccine", "a vaccine vials tally"), ("callindatasource", "a call-in summary of other interventions (NTD, SMC, routine immunisation)"),
+         ("lqas", "an LQAS file"), ("monitor", "a monitoring (IM) file"), ("_im_", "a monitoring (IM) file"), ("im_polio", "a monitoring (IM) file"),
          ("etally", "an eTally file"), ("tally", "a tally sheet"), ("aefi", "an AEFI file"), ("supplies", "a supplies file"), ("dqc", "a list of data-quality issues"),
          ("synthese", "a monitoring summary"), ("resultats", "a results summary"), ("daily call", "a call-in report"), ("vaccine utilization", "a vaccine utilisation summary"))
 
@@ -1209,7 +1210,10 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         lay = lay or detect_layout(path, template_cols, assume=(("Country",) if folder_country else ()) + ("Round_Add", "Response"))
     except Exception as e:
         kind_ = guess_kind(path, None)
-        s["why"] = ("looks like %s, not admin data; " % kind_ if kind_ else "") + "the file could not be opened (%s)" % type(e).__name__
+        damaged = isinstance(e, (AssertionError, IndexError)) and str(path).lower().endswith(".xls")
+        s["why"] = ("looks like %s, not admin data; " % kind_ if kind_ else "") + (
+            "the old .xls file is damaged (its list of texts is cut; open it in Excel and save it again as .xlsx if it matters)" if damaged
+            else "the file could not be opened (%s)" % type(e).__name__)
         det["layout"] = {"class": "not readable", "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "notes": [str(e)[:200]]}
         return s, None, det
     det["layout"] = lay
@@ -1497,6 +1501,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     s["countries"] = ", ".join(sorted(P["Country"].dropna().unique()))
     # comparison with the live file (before the defaults are filled in: only what the country reported is compared)
     det["date_check"] = date_year_check(P, notes)
+    det["vaccine_check"] = vaccine_vs_lookup(P, ctx)
     cmp_, diffs = compare_with_live(P, ctx, prof)
     det["compare"], det["diffs"] = cmp_, diffs
     det["older"] = older_campaign_check(P, cmp_)
@@ -1582,6 +1587,8 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append(m_ + ": check")
     for m_ in det.get("older", []):
         reasons.append(m_)
+    for m_ in det.get("vaccine_check", []):
+        reasons.append("vaccine against the lookup: " + m_)
     if lay["class"] != "template":
         reasons.append("layout: " + lay["class"])
     if det.get("from_live"):
@@ -1746,8 +1753,28 @@ def overlap_between_files(details, out_root, rows, ledger, log=print):
                     r["why"], r["status"] = s["why"], s["status"]
             if h in ledger["files"]:
                 ledger["files"][h]["why"], ledger["files"][h]["status"] = s["why"], s["status"]
+                ledger["files"][h]["overlap"] = tot
             det["_overlap_msg"] = msg
     return pd.DataFrame(parts)
+
+
+def vaccine_vs_lookup(P, ctx):
+    """The vaccine written in the file against the vaccine the lookup has for the same campaign (mOPV2 for nOPV2 is a typo until proven otherwise)."""
+    msgs = []
+    lk = getattr(ctx, "lookup", None)
+    if lk is None or not {"Response", "Vaccine_type", "Country"} <= set(P.columns) or "_vs" not in getattr(lk, "columns", []):
+        return msgs
+    b = ctx.builder
+    for (c, resp), g in P.groupby([P["Country"].fillna(""), P["Response"].fillna("")]):
+        if not c or not resp:
+            continue
+        e = lk[(lk["_ck"] == b._lkc(c)) & (lk["_rk"] == b._rk(resp))]
+        allowed = set().union(*e["_vs"]) if len(e) else set()
+        used = set().union(*[b._vset(v) for v in g["Vaccine_type"].dropna()]) if g["Vaccine_type"].notna().any() else set()
+        if allowed and used and not (used & allowed):
+            vals = ", ".join(sorted(g["Vaccine_type"].dropna().astype(str).unique())[:3])
+            msgs.append("%s: the file writes the vaccine as %s (%d record(s)), the lookup has %s: a typo?" % (resp, vals, len(g), ", ".join(sorted(allowed))))
+    return msgs
 
 
 def place_index(ctx):
@@ -1981,9 +2008,24 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
             prepared = "prepared/%s.xlsx" % h[:12]
             P.to_excel(out_root / prepared, sheet_name="Sheet1", index=False)
         e = old or {"decision": None, "decided_by": "", "decided_at": "", "note": "", "first_seen": now}
+        stem_ = name_stem(Path(rel).name)
+        if not e.get("decision"):
+            prev_ = earlier_decisions(ledger, h, stem_, fc)
+            if prev_:
+                p0_ = prev_[0]
+                same_shape = p0_.get("layout") == s.get("layout") and p0_.get("rows_read") == s.get("rows_read")
+                txt_ = "a file with the same name pattern ('%s') was %s by %s on %s%s" % (
+                    p0_.get("name"), p0_["decision"], p0_.get("decided_by") or "?", (p0_.get("decided_at") or "")[:10],
+                    (": " + p0_["note"]) if p0_.get("note") else "")
+                s["why"] = (s["why"] + "; " if s["why"] else "") + txt_
+                if p0_["decision"] == "rejected" and same_shape and s["status"] != "blocked":
+                    e.update({"decision": "rejected", "decided_by": "app (same layout and number of rows as the rejected file)", "decided_at": now,
+                              "note": "decided from the earlier rejection of " + str(p0_.get("name"))})
+                    s["why"] += " -> rejected again by the app (same layout and number of rows); accept it by hand if it is right"
         e.update({k: s[k] for k in ("name", "path", "size", "hash", "layout", "rows_read", "rows_used", "excluded", "new", "existing_same",
                                     "existing_different", "existing_units", "qc_errors", "qc_warnings", "countries", "status", "why")})
         e["possible_dup"] = s.get("possible_dup", 0)
+        e["stem"], e["country_folder"] = stem_, fc or ""
         e.update({"prepared": prepared, "last_inspected": now, "present": True})
         ledger["files"][h] = e
         rows.append(dict(s, decision=e["decision"] or "", decided_by=e["decided_by"]))
@@ -2089,6 +2131,25 @@ def write_report(path, rows, details, ctx, not_read=()):
             d = stack(key)
         if d is not None and len(d):
             sheets[name] = d
+    dec = []
+    for h, (s_, det_) in details.items():
+        base = {"File": s_["name"], "Status": s_["status"]}
+        for m_ in det_.get("from_live") or []:
+            dec.append(dict(base, Question="Campaign details were not in the file; taken from the live file", Proposed=m_, Where="campaign_hints.json (or accept to keep it)"))
+        for m_ in det_.get("filled_down") or []:
+            dec.append(dict(base, Question="Campaign copied down inside the sheet", Proposed=m_, Where="accept if right"))
+        for m_ in det_.get("inferred") or []:
+            dec.append(dict(base, Question="Campaign details taken from the lookup or the file name", Proposed=m_, Where="campaign_hints.json"))
+        for m_ in det_.get("vaccine_check") or []:
+            dec.append(dict(base, Question="Vaccine differs from the lookup", Proposed=m_, Where="ask the country, or correct in the file"))
+        for m_ in (det_.get("date_check") or {}).get("fixed", []):
+            dec.append(dict(base, Question="Year of a date corrected", Proposed=m_, Where="see Normalised_cells"))
+        for m_ in (det_.get("date_check") or {}).get("far", []):
+            dec.append(dict(base, Question="Date far from the round", Proposed=m_, Where="ask the country"))
+        for m_ in det_.get("older") or []:
+            dec.append(dict(base, Question="Records of an older campaign in the file", Proposed=m_, Where="reject the file or ask the country"))
+    if dec:
+        sheets["Decisions_needed"] = pd.DataFrame(dec)
     if getattr(ctx, "_overlap", None) is not None and len(ctx._overlap):
         sheets["Overlap_between_files"] = ctx._overlap
     if len(not_read):
@@ -2105,6 +2166,27 @@ def write_report(path, rows, details, ctx, not_read=()):
                 except Exception:
                     pass
                 ws.column_dimensions[ws.cell(1, k).column_letter].width = w
+
+
+def name_stem(name):
+    """A file name without its extension, digits, dates, months, version words: 'Togo_Admin_R2_final_v3.xlsx' and 'togo admin r4 (copy).xlsx' meet."""
+    b = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", str(name or "").lower())
+    b = re.sub(r"[_\-\.\(\)]+", " ", b)
+    b = re.sub(r"\b(final|updated|update|copy|new|version|revised|corrected|clean|cleaned|v\d+|jan\w*|feb\w*|mar\w*|apr\w*|may|jun\w*|jul\w*|aug\w*|sep\w*|oct\w*|nov\w*|dec\w*)\b", " ", b)
+    b = re.sub(r"\b(round|rnd|cycle|phase|r)\s*(\d+)\b", r"\1\2", b)      # the round number stays: round 1 and round 2 are not the same file
+    b = re.sub(r"\b\d+\b", " ", b)
+    return re.sub(r"\s+", " ", b).strip()
+
+
+def earlier_decisions(ledger, h, stem, country):
+    """The decisions already taken on files with the same name pattern (same country folder): [(entry)] newest first."""
+    out = []
+    for k, e in ledger["files"].items():
+        if k == h or not e.get("decision"):
+            continue
+        if e.get("stem") and e.get("stem") == stem and (e.get("country_folder") or "") == (country or ""):
+            out.append(e)
+    return sorted(out, key=lambda e: e.get("decided_at", ""), reverse=True)
 
 
 # ----------------------------------------------------------------------------------------------- the ledger
@@ -2151,7 +2233,47 @@ def decide(out_root, target, decision, by, note=""):
             return False, "the prepared records of %s are missing: inspect the folder again" % e["name"]
     e.update({"decision": decision, "decided_by": by, "decided_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"), "note": note})
     save_ledger(out_root, ledger)
-    return True, "%s: %s by %s" % (e["name"], decision, by)
+    extra = ""
+    if decision == "accepted":
+        try:
+            extra = learn_campaign(out_root, e)
+        except Exception as ex:
+            extra = ""
+    return True, "%s: %s by %s%s" % (e["name"], decision, by, extra)
+
+
+def learn_campaign(out_root, e):
+    """An accepted file whose campaign details were not written in it: the details the operator accepted are kept in campaign_hints.json
+    (for this file name), so the next inspection of the same file does not depend on the live file or the lookup."""
+    why = e.get("why") or ""
+    if not any(t in why for t in ("campaign details taken from", "campaign filled down")):
+        return ""
+    pth = Path(out_root) / (e.get("prepared") or "")
+    if not pth.is_file():
+        return ""
+    d = pd.read_excel(pth, dtype=object)
+    hint = {}
+    for col in ("Response", "Round_Add", "Vaccine_type"):
+        if col in d.columns and d[col].notna().any():
+            vc = d[col].dropna().astype(str).value_counts()
+            if len(vc) == 1:
+                hint[col] = vc.index[0]
+    if "SIA_date" in d.columns and pd.to_datetime(d["SIA_date"], errors="coerce").notna().any():
+        vd = pd.to_datetime(d["SIA_date"], errors="coerce").dropna().dt.strftime("%Y-%m-%d").value_counts()
+        if len(vd) == 1:
+            hint["SIA_date"] = vd.index[0]
+    if not hint:
+        return ""
+    hp = Path(out_root) / "campaign_hints.json"
+    try:
+        cur = json.loads(hp.read_text(encoding="utf-8")) if hp.is_file() else {}
+    except ValueError:
+        cur = {}
+    if e["name"] in cur:
+        return ""
+    cur[e["name"]] = hint
+    hp.write_text(json.dumps(cur, indent=1, ensure_ascii=False), encoding="utf-8")
+    return " (campaign details kept in campaign_hints.json: %s)" % ", ".join("%s %s" % (k, v) for k, v in hint.items())
 
 
 def accepted_files(out_root):
