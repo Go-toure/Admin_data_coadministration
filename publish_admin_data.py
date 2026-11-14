@@ -86,7 +86,7 @@ EXIT_DICT_FAILED = 3          # the admin data is published but the dictionary p
 # Where add_coadmin_columns.py leaves the upload files (the first existing folders are searched).
 DEFAULT_DIRS = [
     HERE / "coadmin_output" / "upload_to_sharepoint",
-    Path(r"C:\Users\TOURE\Documents\REPOSITORIES\input\scope\data\co_administration\upload_to_sharepoint"),
+    Path(r"C:\Users\TOURE\Documents\Gith_repositories\scope\data\co_administration\upload_to_sharepoint"),
 ]
 DEFAULT_BACKUP_REPO = Path(r"C:\Users\TOURE\Documents\Gith_repositories\SharePoint_version_backup")
 SECRET_FILES = [
