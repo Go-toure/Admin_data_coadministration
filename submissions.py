@@ -447,6 +447,59 @@ def live_spelling(ctx):
     return ctx._resp_spell
 
 
+WIRE_MAX_BACK = 60       # days: a record belongs to the previous planned campaign when that one started at most this long before (older: a round missing from the lookup is more likely)
+WIRE_MAX_LEAD = 21       # days: a campaign that ran earlier than planned (its first vaccination day before the planned start)
+
+
+def wire_by_date(lc, starts, ref, rn, offs):
+    """Which round of the lookup a record belongs to, from its date alone (a tally has no campaign name).
+    lc: the lookup rounds of the country (and vaccine) that may apply; starts: their planned start dates; ref: the date of the
+    records; rn: the round number the file gives (or None); offs: the numbering offsets of the live file.
+    Rule: a campaign keeps its PLANNED start date, also when it was conducted later; so data dated on or after a planned start belong to
+    that planned campaign until the next planned start, and data between two campaigns belong to the previous one (at most
+    WIRE_MAX_BACK days back). A campaign can also run EARLIER than planned: when the next planned start is at most WIRE_MAX_LEAD days
+    ahead and the previous campaign started longer ago than that, the next one is taken. When both are within WIRE_MAX_LEAD days there is
+    no safe answer. Only one campaign (Response + round) may start on the chosen date.
+    Returns (index of the lookup row, a text saying how) or None."""
+    if lc is None or not len(lc):
+        return None
+    if rn is not None:
+        def same_round(row):
+            if pd.isna(row["_rn"]):
+                return False
+            off = offs["by_campaign"].get(row["_rk"], offs["common"])
+            return int(row["_rn"]) + off == rn or int(row["_rn"]) == rn
+        lc = lc[lc.apply(same_round, axis=1)]
+        if lc.empty:
+            return None
+    st = starts.loc[lc.index]
+    delta = (st - ref).dt.days                     # < 0: the planned start is before the record
+    back, ahead = delta[delta <= 0], delta[delta > 0]
+    floor_d = back.max() if len(back) else None
+    next_d = ahead.min() if len(ahead) else None
+    gap = -int(floor_d) if floor_d is not None else None
+    lead = int(next_d) if next_d is not None else None
+
+    def one(d_):
+        rows = lc.loc[delta[delta == d_].index]
+        keys = list(dict.fromkeys(zip(rows["_rk"], rows["_rn"])))
+        return rows.index[0] if len(keys) == 1 else None
+    if gap == 0:
+        i = one(floor_d)
+        return (i, "the lookup round that starts on the date of the records") if i is not None else None
+    near_next = lead is not None and lead <= WIRE_MAX_LEAD
+    near_floor = gap is not None and gap <= WIRE_MAX_LEAD
+    if near_next and near_floor:
+        return None
+    if near_next:
+        i = one(next_d)
+        return (i, "the campaign ran %d day(s) before its planned start in the lookup" % lead) if i is not None else None
+    if gap is not None and gap <= WIRE_MAX_BACK:
+        i = one(floor_d)
+        return (i, "the records are dated %d day(s) after the planned start of the previous campaign in the lookup and before the next one" % gap) if i is not None else None
+    return None
+
+
 def infer_campaign(P, ctx, prof, hints, notes):
     """Records without a Response: find the campaign in the lookup from what the file does say (country, SIA_date, round, vaccine; or, with no
     date, the date / round / vaccine written in the file name). Only a unique answer is used, and it is always reported for the operator to
@@ -534,25 +587,32 @@ def infer_campaign(P, ctx, prof, hints, notes):
             t0, t1, src = pd.Timestamp(hints["year"], 1, 1), pd.Timestamp(hints["year"], 12, 31), "the year in the file name"
         else:
             continue
-        lc = lc[(starts.loc[lc.index] >= t0) & (starts.loc[lc.index] <= t1)]
-        if rn is not None and len(lc):
-            def same_round(row):
-                if pd.isna(row["_rn"]):
-                    return False
-                off = offs["by_campaign"].get(row["_rk"], offs["common"])
-                return int(row["_rn"]) + off == rn or int(row["_rn"]) == rn
-            lc = lc[lc.apply(same_round, axis=1)]
-        if lc.empty:
-            continue
-        keys = list(dict.fromkeys(zip(lc["_rk"], lc["_rn"])))
-        if len(keys) != 1:
-            if ref is None:
+        try:
+            wired = wire_by_date(lc, starts, ref, rn, offs) if (d_ and ref is not None) else None
+        except Exception:
+            wired = None            # the earlier inference (window and nearest round) then decides, as before
+        if wired is not None:
+            lc, src = lc.loc[[wired[0]]], "the date of the records: " + wired[1]
+        else:
+            lc = lc[(starts.loc[lc.index] >= t0) & (starts.loc[lc.index] <= t1)]
+            if rn is not None and len(lc):
+                def same_round(row):
+                    if pd.isna(row["_rn"]):
+                        return False
+                    off = offs["by_campaign"].get(row["_rk"], offs["common"])
+                    return int(row["_rn"]) + off == rn or int(row["_rn"]) == rn
+                lc = lc[lc.apply(same_round, axis=1)]
+            if lc.empty:
                 continue
-            dd = (starts.loc[lc.index] - ref).dt.days.abs().sort_values()
-            if len(dd) > 1 and dd.iloc[1] - dd.iloc[0] >= 20:
-                lc = lc.loc[[dd.index[0]]]
-            else:
-                continue
+            keys = list(dict.fromkeys(zip(lc["_rk"], lc["_rn"])))
+            if len(keys) != 1:
+                if ref is None:
+                    continue
+                dd = (starts.loc[lc.index] - ref).dt.days.abs().sort_values()
+                if len(dd) > 1 and dd.iloc[1] - dd.iloc[0] >= 20:
+                    lc = lc.loc[[dd.index[0]]]
+                else:
+                    continue
         x = lc.iloc[0]
         rk = x["_rk"]
         name = spell.get(rk) or x["OBR Name"]
@@ -570,6 +630,10 @@ def infer_campaign(P, ctx, prof, hints, notes):
             if pd.isna(P.at[i, "SIA_date"]):
                 P.at[i, "SIA_date"] = pd.Timestamp(x["_d"])
                 notes.add(rowref(P, i), "SIA_date", "", x["_d"], why)
+            elif wired is not None and pd.Timestamp(P.at[i, "SIA_date"]).normalize() != pd.Timestamp(x["_d"]).normalize():
+                old_d = pd.Timestamp(P.at[i, "SIA_date"]).strftime("%Y-%m-%d")
+                P.at[i, "SIA_date"] = pd.Timestamp(x["_d"])          # the planned date of the lookup is kept (the file's own date is in the note)
+                notes.add(rowref(P, i), "SIA_date", old_d, x["_d"], why + "; the planned start of the lookup is kept, the file says " + old_d)
             if is_empty(P.at[i, "Vaccine_type"]) and vt:
                 P.at[i, "Vaccine_type"] = vt
                 notes.add(rowref(P, i), "Vaccine_type", "", vt, why)
@@ -1600,6 +1664,8 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("campaign filled down inside the sheet, not written in those lines (please confirm): " + "; ".join(det["filled_down"][:3]))
     if det.get("inferred"):
         codes.append("campaign_inferred")
+        if any("planned start of the previous campaign" in str(m_) for m_ in det["inferred"]):
+            codes.append("campaign_by_floor")      # dated after a planned start, before the next one: it can be a round the lookup does not have: a person confirms
         reasons.append("campaign details taken from the lookup / the file name, not written in the file (please confirm): " + "; ".join(det["inferred"][:3]))
     if lay.get("etally"):
         reasons.append("; ".join(lay["notes"][:1])); codes.append("etally")
