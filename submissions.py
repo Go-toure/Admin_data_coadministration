@@ -529,6 +529,52 @@ def wire_next_round(lc, starts, ref, rn, offs):
     return {"x": x, "last": int(nums.max()), "gap": int((ref - pd.Timestamp(x["_d"])).days)}
 
 
+def standardize_to_lookup(P, ctx, notes):
+    """Records that name a campaign of the lookup but carry another date: the campaign keeps its PLANNED start date (the lookup's), also when it was
+    conducted earlier or later. Same country and same Response as the lookup, a date that is not a planned start of that Response, one safe answer
+    from wire_by_date (the round the file gives is respected): SIA_date becomes the planned start, an empty round is filled, the date in the file goes
+    in the notes. Returns the list of texts (one per country, Response and date), to confirm."""
+    out = []
+    lk = ctx.lookup
+    if lk is None or not {"Country", "Response", "SIA_date"} <= set(P.columns) or not len(P):
+        return out
+    b = ctx.builder
+    starts = pd.to_datetime(lk["_d"], errors="coerce")
+    offs = round_offsets(ctx)
+    ck = P["Country"].map(b._lkc)
+    rk = P["Response"].map(lambda x: b._rk(x) if not is_empty(x) else "")
+    ok = P["SIA_date"].notna() & (rk != "")
+    for (c, r_, d_), g in P[ok].groupby([ck[ok], rk[ok], P.loc[ok, "SIA_date"].dt.strftime("%Y-%m-%d")]):
+        lc = lk[(lk["_ck"] == c) & (lk["_rk"] == r_)]
+        if lc.empty or d_ in set(lc["_d"]):
+            continue
+        rns = {b._rnum(x) for x in g["Round_Add"] if not is_empty(x)} if "Round_Add" in g.columns else set()
+        rns.discard(None)
+        rn = next(iter(rns)) if len(rns) == 1 else None
+        if len(rns) > 1:
+            continue
+        try:
+            i = wire_by_date(lc, starts, pd.Timestamp(d_), rn, offs)
+        except Exception:
+            i = None
+        if not i:
+            continue
+        j, how = i
+        x = lk.loc[j]
+        new_d = pd.Timestamp(x["_d"])
+        if pd.isna(new_d):
+            continue
+        off = offs["by_campaign"].get(x["_rk"], offs["common"])
+        for k in g.index:
+            P.at[k, "SIA_date"] = new_d
+            notes.add(rowref(P, k), "SIA_date", d_, new_d.strftime("%Y-%m-%d"), "planned start date of the lookup kept (%s)" % how)
+            if "Round_Add" in P.columns and is_empty(P.at[k, "Round_Add"]) and not pd.isna(x["_rn"]):
+                P.at[k, "Round_Add"] = "Rnd%d" % (int(x["_rn"]) + off)
+                notes.add(rowref(P, k), "Round_Add", "", P.at[k, "Round_Add"], "round of the lookup")
+        out.append("%s %s: %d record(s) dated %s now carry the planned start %s (%s)" % (x["OBR Name"], x["Round Number"], len(g), d_, new_d.strftime("%Y-%m-%d"), how))
+    return out
+
+
 def infer_campaign(P, ctx, prof, hints, notes):
     """Records without a Response: find the campaign in the lookup from what the file does say (country, SIA_date, round, vaccine; or, with no
     date, the date / round / vaccine written in the file name). Only a unique answer is used, and it is always reported for the operator to
@@ -1531,6 +1577,12 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
                     notes.add(rowref(P, i), "Round_Add", "", P.at[i, "Round_Add"], "round taken from the lookup (country, campaign, start date); " + how)
         except Exception as e:
             det.setdefault("warnings", []).append("Round filling from the lookup failed: %s" % e)
+    # a named campaign of the lookup with another date than its planned start: the planned start is kept (the file's date goes in the notes)
+    if ctx.lookup is not None:
+        try:
+            det["date_std"] = standardize_to_lookup(P, ctx, notes)
+        except Exception as e:
+            det.setdefault("warnings", []).append("Standardising the dates with the lookup failed: %s" % e)
     # still no Response: look for the campaign in the lookup from what the file says (date, round, vaccine, file name)
     try:
         det["facility"] = subdistrict_check(P, ctx, notes)
@@ -1624,7 +1676,9 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     s["existing_same"] = int((cmp_["Status"] == "already in the live file, same figures").sum())
     s["existing_different"] = int((cmp_["Status"] == "already in the live file, other figures").sum())
     s["existing_units"] = int(cmp_["Status"].str.startswith("same names as several").sum())
-    s["possible_dup"] = int(cmp_["Status"].str.startswith("possible duplicate").sum())
+    # a record with the same place and the same figures as a live record of another name, round or date is a duplicate: it is removed (never added)
+    s["dup_removed"] = int(cmp_["Status"].str.startswith("possible duplicate: same figures").sum())
+    s["possible_dup"] = int(cmp_["Status"].str.startswith("possible duplicate").sum()) - s["dup_removed"]
     # derived columns and the live file's constants
     yr = P["SIA_date"].dt.year.astype(float)
     mo = P["SIA_date"].dt.month.astype(float)
@@ -1672,7 +1726,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     det["issues"] = quality_issues(P, ctx, prof)
     iss = det["issues"]
     s["qc_errors"] = int(iss.loc[iss["severity"] == "Error", "Excel_row"].nunique()) if len(iss) else 0
-    s["qc_warnings"] = int(iss.loc[iss["severity"] == "Warning", "Excel_row"].nunique()) if len(iss) else 0
+    s["qc_warnings"] = int(iss.loc[(iss["severity"] == "Warning") & ~iss["check"].isin(["coverage_ceiling", "coverage_high"]), "Excel_row"].nunique()) if len(iss) else 0
     # campaigns against the lookup
     if ctx.lookup is not None:
         try:
@@ -1681,7 +1735,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         except Exception:
             det["campaigns"] = None
     # the verdict (every finding also has a code, kept in the ledger: the automatic rules read the codes, never the text)
-    reasons, codes = [], []
+    reasons, codes, infos = [], [], []
     if s["excluded"]:
         reasons.append("%d row(s) left out" % s["excluded"]); codes.append("left_out")
     if s["qc_errors"]:
@@ -1690,6 +1744,10 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("%d record(s) already in the live file with other figures (not changed)" % s["existing_different"]); codes.append("other_figures")
     if s["existing_units"]:
         reasons.append("%d record(s) with the same names as several live records and none identical (not added)" % s["existing_units"]); codes.append("several_units")
+    if s.get("dup_removed"):
+        infos.append("%d duplicate record(s) removed (same place and figures as a live record under another campaign name, round or date): see the Records sheet" % s["dup_removed"])
+    for m_ in det.get("date_std", []) or []:
+        reasons.append("date standardised to the lookup (please confirm): " + m_); codes.append("date_standardized")
     if s.get("possible_dup"):
         codes.append("possible_dup")
         reasons.append("%d record(s) that look like live records under another campaign name, round or date (not added): see the Records sheet" % s["possible_dup"])
@@ -1745,9 +1803,9 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("%d cell(s) that are not numbers" % len(det["bad_numbers"]))
     if len(iss) and "check" in iss.columns:
         nc_ = int(iss.loc[iss["check"] == "coverage_ceiling", "Excel_row"].nunique())
-        if nc_:
-            codes.append("coverage_ceiling")
-            reasons.append("%d record(s) with coverage above the ceiling (more vaccinated than the target allows): check the figures with the country" % nc_)
+        s["coverage_ceiling"] = nc_
+        if nc_:       # for reference only: the live file has its own coverage columns, a high coverage never stops a record
+            infos.append("%d record(s) with coverage above the ceiling (kept; for reference)" % nc_)
     if s["qc_warnings"] > 0.25 * s["rows_used"]:
         reasons.append("more than 25% of the records have a warning"); codes.append("warnings")
     if s["new"] == 0:
@@ -1766,7 +1824,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         s["status"] = "blocked"
     if not s.get("wrong_place") and (reasons == ["no new record"] or (s["new"] == 0 and not s["qc_errors"] and not s["existing_different"] and not s["existing_units"] and not s.get("possible_dup"))):
         s["status"] = "nothing new"
-    s["why"] = "; ".join(reasons)
+    s["why"] = "; ".join(reasons + (["for reference: " + "; ".join(infos)] if infos else []))
     if det.get("facility"):
         s["status"], s["why"] = "nothing new", det["facility"]["message"] + ("; " + s["why"] if s["why"] else "")
     if not hasattr(ctx, "_file_records"):
@@ -1871,22 +1929,27 @@ def overlap_between_files(details, out_root, rows, ledger, log=print):
         for k, f in zip(keys[~blank], figs[~blank]):
             seen.setdefault(k, (h, f))
         tot = sum(v[0] for v in cnt.values())
-        s["overlap"] = tot
+        same_tot = sum(v[1] for v in cnt.values())
+        s["overlap"] = tot - same_tot          # a copy with the same figures is a duplicate: the build keeps one, nobody needs to look
+        s["overlap_same"] = same_tot
         for h2, (n, same) in cnt.items():
             parts.append({"File": s["name"], "Also_in_earlier_file": details[h2][0]["name"], "New_records_in_both": n, "Same_figures": same, "Other_figures": n - same})
         if tot:
             msg = "%d of its %d new record(s) are also new in %s (the build keeps the first accepted copy)" % (
                 tot, s["new"], "; ".join("%s (%d)" % (details[h2][0]["name"], v[0]) for h2, v in sorted(cnt.items(), key=lambda kv: -kv[1][0])[:3]))
+            if s["overlap"] == 0:
+                msg = "for reference: " + msg.replace("(the build keeps the first accepted copy)", "(same figures: duplicates, the build keeps one)")
             s["why"] = (s["why"] + "; " if s["why"] else "") + msg
-            if s["status"] == "ready":
+            if s["status"] == "ready" and s["overlap"]:
                 s["status"] = "review"
             for r in rows:
                 if r.get("hash") == h:
                     r["why"], r["status"] = s["why"], s["status"]
             if h in ledger["files"]:
                 ledger["files"][h]["why"], ledger["files"][h]["status"] = s["why"], s["status"]
-                ledger["files"][h]["overlap"] = tot
-                ledger["files"][h]["codes"] = list(ledger["files"][h].get("codes") or []) + ["overlap"]
+                ledger["files"][h]["overlap"] = s["overlap"]
+                if s["overlap"]:
+                    ledger["files"][h]["codes"] = list(ledger["files"][h].get("codes") or []) + ["overlap"]
             det["_overlap_msg"] = msg
     return pd.DataFrame(parts)
 
@@ -2436,7 +2499,7 @@ def auto_reasons_ok(why):
 # round of the lookup (same country, campaign, date and round) and the vaccine agrees with the lookup, a campaign that the file did not
 # write but the lookup gave, a year typed wrongly that the lookup's date confirms, and an eTally export added up by LGA are harmless too.
 AUTO_CODES = {"left_out", "other_figures", "layout_mapped", "warnings"}
-AUTO_CODES_LOOKUP = {"campaign_inferred", "year_fixed", "etally"}
+AUTO_CODES_LOOKUP = {"campaign_inferred", "year_fixed", "etally", "date_standardized"}
 
 
 def auto_codes_ok(e):
@@ -2505,7 +2568,8 @@ def auto_candidates(out_root, ledger=None):
 
 CODE_MEANING = {
     "overlap": ("the new records are also new in another file", "engine: a copy with the same figures is harmless; other figures need a person"),
-    "coverage_ceiling": ("records with more vaccinated than the target allows", "the country (figures) or a person"),
+    "coverage_ceiling": ("records with more vaccinated than the target allows (reference only, no longer stops a file)", "nobody: the live file has its own coverage columns"),
+    "date_standardized": ("records given the planned start date of the lookup for their campaign", "the engine when the lookup confirms it"),
     "possible_dup": ("records that look like live records under another campaign name, round or date", "a person"),
     "unseen": ("names or values never seen in the live file", "a person (new spelling or new area)"),
     "campaign_from_live": ("campaign details taken from the live file, not written in the file", "a person, once (remembered)"),
