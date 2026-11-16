@@ -226,6 +226,8 @@ def main():
                                   "(default: geo_reference.csv next to this script)")
     ap.add_argument("--no-quality", action="store_true", help="do not run the quality checks (merged from the admin portal)")
     ap.add_argument("--afrogdb", metavar="DIR", help="the AFRO-Geo-Reference folder (default: next to this repository, or AFRO_GEO_REFERENCE_DIR)")
+    ap.add_argument("--no-afrogdb-extended", action="store_true",
+                    help="geo_code: do not use the extended layers (manual decisions, Ethiopia woreda to zone, relaxed, old shape, name similarity)")
     ap.add_argument("--no-afrogdb-codes", action="store_true",
                     help="do not add the geo_code / geo_match columns (AFROGDB district code)")
     ap.add_argument("--no-fix-province", action="store_true",
@@ -792,7 +794,7 @@ def main():
         else:
             try:
                 gref = load_afrogdb(gdir)
-                gc_, gm_, gun = afrogdb_codes(df, gref)
+                gc_, gm_, gun = afrogdb_codes(df, gref, extended=not a.no_afrogdb_extended)
                 geo_vals = {"geo_code": gc_, "geo_match": gm_}
                 kept_ = ~drop
                 n_ok = int(gc_[kept_].notna().sum())
@@ -1716,6 +1718,10 @@ GEO_COLS = ["geo_code", "geo_match"]
 _GEO_FOUND = {"exact", "normalized", "other province", "crosswalk", "crosswalk (auto)"}
 
 
+def _geo_found(status):
+    return status in _GEO_FOUND or str(status).startswith("extended")
+
+
 def _gk(x):
     """Matching key of AFRO-Geo-Reference (afro_nk): no accents, capitals, no 'RM ' prefix, letters and digits only."""
     import unicodedata
@@ -1766,7 +1772,11 @@ def load_afrogdb(dirpath):
         for r in x.itertuples(index=False):
             xw.setdefault((_gk(r.country), _gk(r.province), _gk(r.district)), r)
     rdist = rdist.reset_index(drop=True)
-    ref = {"alias": alias, "xw": xw, "cs": set(_gk(c) for c in rc["country"]), "dist": {}, "cd": {}, "by_code": {}}
+    xe = {}
+    if ex("crosswalk_extended.csv"):
+        for r in rd("crosswalk_extended.csv").itertuples(index=False):
+            xe.setdefault((_gk(r.country), _gk(r.province), _gk(r.district)), r)
+    ref = {"alias": alias, "xw": xw, "xe": xe, "cs": set(_gk(c) for c in rc["country"]), "dist": {}, "cd": {}, "by_code": {}}
     for r in rdist.itertuples(index=False):
         ck, pk, dk = _gk(r.country), _gk(r.province), _gk(r.district)
         ref["dist"].setdefault((ck, pk, dk), (r.country, r.province, r.district, r.geo_code))
@@ -1776,7 +1786,7 @@ def load_afrogdb(dirpath):
     return ref
 
 
-def afrogdb_codes(df, ref):
+def afrogdb_codes(df, ref, extended=True):
     """geo_code and geo_match for every row of df (Country, Province, District). Returns (geo_code Series, geo_match Series,
     DataFrame of the names that were not found, with their number of rows)."""
     trip = list(zip(df["Country"].tolist(), df["Province"].tolist(), df["District"].tolist()))
@@ -1809,10 +1819,17 @@ def afrogdb_codes(df, ref):
                         status, code = ("crosswalk" if dec == "ok" else "crosswalk (auto)"), tgt[3]
                     elif r.std_district == r.std_district and r.std_district is not None:
                         status, code = ("crosswalk" if dec == "ok" else "crosswalk (auto)"), None
-        cache[t] = (code if status in _GEO_FOUND else None, status)
+        if extended and status in ("unmatched", "ambiguous"):         # manual, Ethiopia woreda -> zone, relaxed, old shape, name similarity
+            r = ref["xe"].get((ck0, pk, dk))
+            if r is not None:
+                if r.method == "no shape":
+                    status, code = "no shape", None
+                elif r.geo_code in ref["by_code"]:
+                    status, code = "extended: " + r.method + (" (probable)" if r.confidence == "probable" else ""), ref["by_code"][r.geo_code][3]
+        cache[t] = (code if _geo_found(status) else None, status)
     codes = pd.Series([cache[t][0] for t in trip], index=df.index, dtype=object)
     match = pd.Series([cache[t][1] for t in trip], index=df.index, dtype=object)
-    nf = match[~match.isin(_GEO_FOUND)]
+    nf = match[~match.map(_geo_found)]
     un = pd.DataFrame({"Country": df.loc[nf.index, "Country"], "Province": df.loc[nf.index, "Province"],
                        "District": df.loc[nf.index, "District"], "geo_match": nf})
     if len(un):
