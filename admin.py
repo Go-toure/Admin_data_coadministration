@@ -56,6 +56,7 @@ DEFAULTS = {
     "afrogdb_dir": "",                        # AFRO-Geo-Reference folder (default: next to this repository)
     "district_source": "",                    # optional recovered file used by --district-source
     "submissions_dir": "workspace/submissions_in",   # the files of the countries: 'submissions pull' copies them here from SharePoint
+    "submissions_auto": False,                # true: the build also takes the files of automatic rule 1 (see submissions.py), no decision needed
     "submissions_max_mb": 60,                 # a file of the submissions folder larger than this is not copied
     "build_extra_args": [],
     "max_row_drop_pct": 2.0,
@@ -539,7 +540,13 @@ def cmd_build(a):
             log("WARNING: the decisions of the Operations Center on the submissions were NOT read (%s). The ledger kept on this PC is used: "
                 "files accepted in the app are not in this build." % st)
         m["build"]["submissions_ledger"] = st
-        acc = sm.accepted_files(WORK / "submissions")
+        use_auto = bool(S.get("submissions_auto")) and not getattr(a, "no_auto_submissions", False)
+        acc = sm.accepted_files(WORK / "submissions", auto=use_auto)
+        if use_auto:
+            auto_names = [n for n, _, _ in sm.auto_candidates(WORK / "submissions")]
+            m["build"]["submissions_auto"] = auto_names
+            if auto_names:
+                log("Submissions: %d file(s) taken by %s (nobody decided on them, only harmless findings): %s" % (len(auto_names), sm.AUTO_RULE, ", ".join(auto_names)))
         if acc:
             log("Submissions: %d accepted file(s) will be added to this build: %s" % (len(acc), ", ".join(n for n, _ in acc)))
             for _, pth in acc:
@@ -632,6 +639,8 @@ def cmd_check(a):
     info.append("rows: %d -> %d (%+d)" % (len(base), len(new), len(new) - len(base)))
     if added:
         info.append("records added from accepted submissions (%s): %d" % (", ".join(m["build"].get("submissions") or []), added))
+    if m["build"].get("submissions_auto"):
+        info.append("files taken by automatic rule 1 (no person decided on them): %s" % ", ".join(m["build"]["submissions_auto"]))
     led = m["build"].get("submissions_ledger")
     if led and led != "adminops":
         warn.append("the decisions on the submissions were not read from the Operations Center (%s): files accepted in the app are not in this build" % led)
@@ -1363,13 +1372,22 @@ def submissions_state_pull(dry_run=False):
 
 def cmd_submissions(a):
     sm = import_submissions()
-    if a.action in ("list", "accept", "reject") and not getattr(a, "no_pull", False) and not getattr(a, "local", False):
+    out_root = WORK / "submissions"
+    if a.action in ("list", "auto", "accept", "reject") and not getattr(a, "no_pull", False) and not getattr(a, "local", False):
         if a.action != "list":
             die("accept and reject are made in the Operations Center (Submissions tab): the PC reads those decisions and does not make "
                 "its own, so that there is one ledger. To decide here anyway, add --local (the decision then stays on this PC only).")
         st = submissions_state_pull()
         if st != "adminops":
             log("NOTE: the ledger of the Operations Center was not read (%s): this is the ledger kept on this PC." % st)
+    if a.action == "auto":
+        c = sm.auto_candidates(out_root)
+        led = sm.load_ledger(out_root)["files"]
+        print("\n%s would take %d file(s) into a build (nobody has decided on them; a person's decision always wins):\n" % (sm.AUTO_RULE, len(c)))
+        for n, pth, note in sorted(c):
+            print("  %-80s %s" % (n[:80], note.split(": ", 1)[1]))
+        print("\nEverything else needs a person. Turn it on with \"submissions_auto\": true in admin_settings.json.\n")
+        return
     if a.action == "pull":
         if not submissions_pull_step(dry_run=a.dry_run, explicit=True):
             sys.exit(1)
@@ -1539,6 +1557,7 @@ RULES = [
     ("digit-error", "Population", "A target population that is 10 or 100 times off (a missing or extra digit) is corrected only when the reported coverage (vaccinated / CVPolio) implies the corrected figure within 10% AND that figure is 0.6 - 1.7 times the median target of the same district's other campaigns. Both must agree; otherwise it stays flagged.", "Request of 4 Nov 2026", "--no-fix-digit-error"),
     ("fix-list", "Checks", "What cannot be corrected safely (missing key fields, report dates, target above total population, coverage above the ceiling, very different targets, coverage that differs, provinces to confirm, combined and separate records, records entered twice) is written to Fix_list_by_country.xlsx: one sheet per problem, with the row, the column to correct, the current and the suggested value. Cut per country in the app.", "Request of 4 Nov 2026", "--no-fix-list"),
     ("submissions", "Intake", "The files the countries send (SharePoint folder Admin_data_submissions, copied read-only to workspace/submissions_in by 'admin.py submissions pull', which 'submissions inspect' runs first) are inspected one by one. The decisions (accept / reject, who, the note) are made in the Operations Center and kept in its AdminOps folder; a build on the PC reads that ledger first (read only, ADMIN_STORE_SHARE_URL) so that it adds exactly what the app accepted, and says so in the manifest and in the check when it could not: layout (template, template with other header spellings, mapped by certain synonyms, or not usable), normalisation of every cell (capitals, spaces, country / province / vaccine / round spelling, dates, numbers as text, percentages, Year / SIAMTH / Ctry_Code / AFRO_block, the constants the live file has), the portal quality checks, the campaigns against the lookup, duplicates inside the file, and every record against the live file (new / same / other figures). An operator accepts or rejects each file; only accepted files are used, and only their NEW records are added at the end of the next build, before every other rule. Records already in the live file are never changed by a submission: the differences are listed.", "Request of 5 Nov 2026", "admin.py submissions inspect | list | accept | reject; build --no-submissions"),
+    ("submissions-auto", "Intake", "Automatic rule 1 (switch: submissions_auto in admin_settings.json, off by default). A file nobody has decided on is taken into the build by itself only when every finding of its inspection is harmless: records already in the live file with other figures (never changed by a submission), a header mapping that was certain, records left out, many warnings. A file with an Error, a coverage above the ceiling, a date far from its campaign, a campaign guessed from the live file or the file name, values never seen, cells that are not numbers, a possible duplicate, records also new in another file or an eTally conversion always waits for a person. A decision of a person, accepted or rejected, always wins. The files taken are listed in the log, in the manifest and in the check.", "Request of 16 Nov 2026", "--no-auto-submissions; admin.py submissions auto lists what the rule would take"),
     ("text-clean", "Hygiene", "Stray control characters (carriage returns), line breaks and double / edge spaces in Country, Province, District, Response, Vaccine_type and Round_Add are removed.", "Found in District (KAJIADO EAST) 30 Oct 2026", "--no-clean-text"),
     ("dates", "Hygiene", "SIA_date written as text ('18-sept-20') becomes a real date.", "Admin portal", "(always)"),
     ("duplicates", "Hygiene", "Exact copies are removed. A record entered twice (same key AND the same population and results) is reported as Duplicate record and removed only with --resolve-duplicates. Records with the same key but other population or results are different units (most records have no sub-district): never removed, reported only as information (Same names, other figures). Key = Country, Province, District, [Admin_3], SIA_date, Round_Add, Vaccine_type, Response, compared without accents, case or punctuation.", "Admin portal", "--no-dedupe, --resolve-duplicates; admin.py duplicates lists them and what a fix would do; the Operations Center has the same choice on the Cycle tab"),
@@ -1599,6 +1618,7 @@ def main():
     s.add_argument("--no-refresh-lookup", action="store_true", help="use lookup.xlsx as it is (default: refreshed from the GPEI API first)")
     s.add_argument("--no-backup", action="store_true", help="do not read SharePoint, use the newest local backup")
     s.add_argument("--no-submissions", action="store_true", help="do not add the accepted submissions to this build")
+    s.add_argument("--no-auto-submissions", action="store_true", help="do not take the files of automatic rule 1 (setting submissions_auto)")
     s.add_argument("--no-ledger-pull", action="store_true", help="do not read the decisions of the Operations Center first, use the ledger kept on this PC")
     s.add_argument("extra", nargs="*", help="extra options for the builder, after --")
     s = sub.add_parser("baseinfo", help=argparse.SUPPRESS); s.add_argument("path")
@@ -1618,7 +1638,7 @@ def main():
     s.add_argument("--no-refresh-lookup", action="store_true")
     s.add_argument("--country")
     s = sub.add_parser("submissions", help="inspect the files the countries sent, accept or reject them (accepted ones go into the next build)")
-    s.add_argument("action", choices=["pull", "inspect", "list", "accept", "reject"])
+    s.add_argument("action", choices=["pull", "inspect", "list", "auto", "accept", "reject"])
     s.add_argument("targets", nargs="*", help="accept / reject: the file name or the start of its content hash")
     s.add_argument("--folder", help="inspect: the folder with the files (default: the submissions folder of the workspace, filled from SharePoint)")
     s.add_argument("--no-pull", action="store_true", help="inspect: do not read the SharePoint folder first, use the local copy as it is; list: do not read the app's ledger")

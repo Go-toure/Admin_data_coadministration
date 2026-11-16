@@ -2276,8 +2276,49 @@ def learn_campaign(out_root, e):
     return " (campaign details kept in campaign_hints.json: %s)" % ", ".join("%s %s" % (k, v) for k, v in hint.items())
 
 
-def accepted_files(out_root):
-    """Prepared record files of the accepted files: [(name, path)]."""
+# ------------------------------------------------------------------------------------------------ automatic rule 1
+# A file nobody has decided on is taken into a build by itself ONLY when everything the inspection found about it is on this list:
+# findings about records that are already in the live file (which no submission ever changes) or about the layout, never about
+# the new records themselves. Anything else (an Error, a date far from the campaign, a campaign guessed from the live file or the
+# file name, values never seen, numbers that are not numbers, a coverage above the ceiling, a possible duplicate, records
+# that are also new in another file, an eTally conversion ...) stays for a person. A decision of a person always wins.
+AUTO_RULE = "automatic rule 1"
+AUTO_INFO = ("row(s) left out",
+             "already in the live file with other figures (not changed)",
+             "layout: mapped (headers differ)",
+             "of the records have a warning")
+
+
+def auto_reasons_ok(why):
+    """True when every finding in 'why' is one of the harmless ones above."""
+    parts = [x.strip() for x in (why or "").split("; ") if x.strip()]
+    return all(any(t in x for t in AUTO_INFO) for x in parts)
+
+
+def auto_candidates(out_root, ledger=None):
+    """[(name, path, note)] of the files rule 1 takes into the build: not decided by a person, not blocked, not replaced by a newer
+    version, still in the folder, with new records, no Error, no record with several live units, no possible duplicate, no overlap
+    with another file, and only the harmless findings of AUTO_INFO."""
+    ledger = ledger or load_ledger(out_root)
+    out = []
+    for h, e in ledger["files"].items():
+        if e.get("decision") or e.get("superseded") or not e.get("present", True) or e.get("status") in ("blocked", "nothing new"):
+            continue
+        if not e.get("prepared") or (e.get("new") or 0) <= 0:
+            continue
+        if e.get("qc_errors") or e.get("existing_units") or e.get("possible_dup") or e.get("overlap"):
+            continue
+        if not auto_reasons_ok(e.get("why")):
+            continue
+        p = Path(out_root) / e["prepared"]
+        if p.is_file():
+            out.append((e["name"], str(p), "%s: %d new record(s), only harmless findings" % (AUTO_RULE, int(e.get("new") or 0))))
+    return out
+
+
+def accepted_files(out_root, auto=False):
+    """Prepared record files of the accepted files: [(name, path)]. With auto=True the files of automatic rule 1 are added
+    (never a file a person rejected or accepted otherwise: they are already decided)."""
     ledger = load_ledger(out_root)
     out = []
     for h, e in ledger["files"].items():
@@ -2285,4 +2326,6 @@ def accepted_files(out_root):
             p = Path(out_root) / e["prepared"]
             if p.is_file():
                 out.append((e["name"], str(p)))
+    if auto:
+        out += [(n, p) for n, p, _ in auto_candidates(out_root, ledger)]
     return out
