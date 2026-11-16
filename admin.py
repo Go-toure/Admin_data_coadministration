@@ -55,7 +55,8 @@ DEFAULTS = {
     "geo": "geo_reference.csv",
     "afrogdb_dir": "",                        # AFRO-Geo-Reference folder (default: next to this repository)
     "district_source": "",                    # optional recovered file used by --district-source
-    "submissions_dir": "workspace/submissions_in",   # the files of the countries (downloaded from the submissions folder)
+    "submissions_dir": "workspace/submissions_in",   # the files of the countries: 'submissions pull' copies them here from SharePoint
+    "submissions_max_mb": 60,                 # a file of the submissions folder larger than this is not copied
     "build_extra_args": [],
     "max_row_drop_pct": 2.0,
     "key_columns": ["Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response"],
@@ -1312,8 +1313,32 @@ def _submissions_ctx(builder):
     return SimpleNamespace(builder=builder, live=live, live_index=index, geo=geo, lookup=lk, live_label=label)
 
 
+def submissions_pull_step(dry_run=False, explicit=False):
+    """Copy the countries' files from the SharePoint folder Admin_data_submissions to submissions_dir (read only on SharePoint).
+    pull_submissions.py reads the link and the sign-in values itself (the backup tool's secrets.env); this script never does.
+    Returns True when the local copy is up to date."""
+    tool = HERE / "pull_submissions.py"
+    if not tool.is_file():
+        if explicit:
+            log("pull_submissions.py is not here: nothing to pull with.")
+            return False
+        return True            # a copy of the engine without the pull (the Operations Center reads the folder itself): use the files in place
+    dest = P(S["submissions_dir"])
+    cmd = [sys.executable, str(tool), "--dest", str(dest), "--max-mb", str(S.get("submissions_max_mb", 60)),
+           "--env-file", str(BACKUP_REPO / "config" / "secrets.env")]
+    if dry_run:
+        cmd.append("--dry-run")
+    log("Reading the files of the submissions folder from SharePoint ...")
+    rc, _ = run_cmd(cmd, cwd=HERE)
+    return rc == 0
+
+
 def cmd_submissions(a):
     sm = import_submissions()
+    if a.action == "pull":
+        if not submissions_pull_step(dry_run=a.dry_run, explicit=True):
+            sys.exit(1)
+        return
     out_root = WORK / "submissions"
     who = a.by or os.environ.get("USERNAME") or os.environ.get("USER") or "operator"
     if a.action == "list":
@@ -1343,8 +1368,12 @@ def cmd_submissions(a):
     if not getattr(a, "no_refresh_lookup", False):
         refresh_lookup_step()
     folder = Path(a.folder) if a.folder else P(S["submissions_dir"])
+    if not a.folder and not getattr(a, "no_pull", False):
+        if not submissions_pull_step():
+            log("WARNING: the submissions folder could NOT be read from SharePoint: %s" % (
+                "the copy already in %s is used and may be out of date." % folder if folder.is_dir() else "there is no local copy either."))
     if not folder.is_dir():
-        die("the submissions folder does not exist: %s (download the files there, or give --folder)." % folder)
+        die("the submissions folder does not exist: %s (run 'admin.py submissions pull', or give --folder)." % folder)
     builder = import_builder()
     ctx = _submissions_ctx(builder)
     cols = list(ctx.live.columns)
@@ -1470,7 +1499,7 @@ RULES = [
     ("province-spelling", "Geography", "A Province that is the same name as an Admin1 of the geography reference written differently (spaces, accents, punctuation, filler words: MAI NDOMBE = MAINDOMBE, PROVINCIA DE NAMPULA = NAMPULA, WADIFIRA = WADI FIRA, RS 3 = RS3) gets the reference's spelling. Exact match only, and only when the district does not belong to another province of the reference. Near matches and new Admin1s (Cuando, Sidama ...) are never changed: they are listed in the fix list.", "Request of 4 Nov 2026", "--no-fix-province-spelling"),
     ("digit-error", "Population", "A target population that is 10 or 100 times off (a missing or extra digit) is corrected only when the reported coverage (vaccinated / CVPolio) implies the corrected figure within 10% AND that figure is 0.6 - 1.7 times the median target of the same district's other campaigns. Both must agree; otherwise it stays flagged.", "Request of 4 Nov 2026", "--no-fix-digit-error"),
     ("fix-list", "Checks", "What cannot be corrected safely (missing key fields, report dates, target above total population, coverage above the ceiling, very different targets, coverage that differs, provinces to confirm, combined and separate records, records entered twice) is written to Fix_list_by_country.xlsx: one sheet per problem, with the row, the column to correct, the current and the suggested value. Cut per country in the app.", "Request of 4 Nov 2026", "--no-fix-list"),
-    ("submissions", "Intake", "The files the countries send (SharePoint folder Admin_data_submissions) are inspected one by one: layout (template, template with other header spellings, mapped by certain synonyms, or not usable), normalisation of every cell (capitals, spaces, country / province / vaccine / round spelling, dates, numbers as text, percentages, Year / SIAMTH / Ctry_Code / AFRO_block, the constants the live file has), the portal quality checks, the campaigns against the lookup, duplicates inside the file, and every record against the live file (new / same / other figures). An operator accepts or rejects each file; only accepted files are used, and only their NEW records are added at the end of the next build, before every other rule. Records already in the live file are never changed by a submission: the differences are listed.", "Request of 5 Nov 2026", "admin.py submissions inspect | list | accept | reject; build --no-submissions"),
+    ("submissions", "Intake", "The files the countries send (SharePoint folder Admin_data_submissions, copied read-only to workspace/submissions_in by 'admin.py submissions pull', which 'submissions inspect' runs first) are inspected one by one: layout (template, template with other header spellings, mapped by certain synonyms, or not usable), normalisation of every cell (capitals, spaces, country / province / vaccine / round spelling, dates, numbers as text, percentages, Year / SIAMTH / Ctry_Code / AFRO_block, the constants the live file has), the portal quality checks, the campaigns against the lookup, duplicates inside the file, and every record against the live file (new / same / other figures). An operator accepts or rejects each file; only accepted files are used, and only their NEW records are added at the end of the next build, before every other rule. Records already in the live file are never changed by a submission: the differences are listed.", "Request of 5 Nov 2026", "admin.py submissions inspect | list | accept | reject; build --no-submissions"),
     ("text-clean", "Hygiene", "Stray control characters (carriage returns), line breaks and double / edge spaces in Country, Province, District, Response, Vaccine_type and Round_Add are removed.", "Found in District (KAJIADO EAST) 30 Oct 2026", "--no-clean-text"),
     ("dates", "Hygiene", "SIA_date written as text ('18-sept-20') becomes a real date.", "Admin portal", "(always)"),
     ("duplicates", "Hygiene", "Exact copies are removed. A record entered twice (same key AND the same population and results) is reported as Duplicate record and removed only with --resolve-duplicates. Records with the same key but other population or results are different units (most records have no sub-district): never removed, reported only as information (Same names, other figures). Key = Country, Province, District, [Admin_3], SIA_date, Round_Add, Vaccine_type, Response, compared without accents, case or punctuation.", "Admin portal", "--no-dedupe, --resolve-duplicates; admin.py duplicates lists them and what a fix would do; the Operations Center has the same choice on the Cycle tab"),
@@ -1549,9 +1578,11 @@ def main():
     s.add_argument("--no-refresh-lookup", action="store_true")
     s.add_argument("--country")
     s = sub.add_parser("submissions", help="inspect the files the countries sent, accept or reject them (accepted ones go into the next build)")
-    s.add_argument("action", choices=["inspect", "list", "accept", "reject"])
+    s.add_argument("action", choices=["pull", "inspect", "list", "accept", "reject"])
     s.add_argument("targets", nargs="*", help="accept / reject: the file name or the start of its content hash")
-    s.add_argument("--folder", help="inspect: the folder with the files (default: the submissions folder of the workspace)")
+    s.add_argument("--folder", help="inspect: the folder with the files (default: the submissions folder of the workspace, filled from SharePoint)")
+    s.add_argument("--no-pull", action="store_true", help="inspect: do not read the SharePoint folder first, use the local copy as it is")
+    s.add_argument("--dry-run", action="store_true", help="pull: list what would be copied, write nothing")
     s.add_argument("--note", help="accept / reject: a note kept in the ledger"); s.add_argument("--by", help="who decides (default: the user name)")
     s.add_argument("--no-refresh-lookup", action="store_true")
     s = sub.add_parser("duplicates", help="list the duplicates of a file and what removing them would do (nothing is changed)")
