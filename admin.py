@@ -532,6 +532,13 @@ def cmd_build(a):
         cmd += ["--district-source", P(ds)]
     if not getattr(a, "no_submissions", False):
         sm = import_submissions()
+        st = "local" if getattr(a, "no_ledger_pull", False) else submissions_state_pull()
+        if st == "adminops":
+            log("Submissions: the decisions of the Operations Center were read.")
+        else:
+            log("WARNING: the decisions of the Operations Center on the submissions were NOT read (%s). The ledger kept on this PC is used: "
+                "files accepted in the app are not in this build." % st)
+        m["build"]["submissions_ledger"] = st
         acc = sm.accepted_files(WORK / "submissions")
         if acc:
             log("Submissions: %d accepted file(s) will be added to this build: %s" % (len(acc), ", ".join(n for n, _ in acc)))
@@ -625,6 +632,9 @@ def cmd_check(a):
     info.append("rows: %d -> %d (%+d)" % (len(base), len(new), len(new) - len(base)))
     if added:
         info.append("records added from accepted submissions (%s): %d" % (", ".join(m["build"].get("submissions") or []), added))
+    led = m["build"].get("submissions_ledger")
+    if led and led != "adminops":
+        warn.append("the decisions on the submissions were not read from the Operations Center (%s): files accepted in the app are not in this build" % led)
     if drop_pct > float(S["max_row_drop_pct"]):
         hard.append("%.1f%% of the rows disappeared (limit %.1f%%)" % (drop_pct, float(S["max_row_drop_pct"])))
     # 3. key fields blank
@@ -1333,8 +1343,33 @@ def submissions_pull_step(dry_run=False, explicit=False):
     return rc == 0
 
 
+def submissions_state_pull(dry_run=False):
+    """Copy the DECISIONS on the submissions (ledger, report, prepared records) from the AdminOps folder of the Operations Center
+    to workspace/submissions, read only: the app decides, the PC build adds exactly what the app accepted. The ledger in place is kept
+    in workspace/submissions/ledger_backups. Returns 'adminops' (read), 'no link' (ADMIN_STORE_SHARE_URL not set) or 'failed'."""
+    tool = HERE / "pull_submissions.py"
+    if not tool.is_file():
+        return "no tool"
+    cmd = [sys.executable, str(tool), "--ledger", "--dest", str(WORK / "submissions"),
+           "--env-file", str(BACKUP_REPO / "config" / "secrets.env")]
+    if dry_run:
+        cmd.append("--dry-run")
+    log("Reading the decisions on the submissions from the AdminOps folder ...")
+    rc, text = run_cmd(cmd, cwd=HERE)
+    if rc == 0:
+        return "adminops"
+    return "no link" if "no share link" in text else "failed"
+
+
 def cmd_submissions(a):
     sm = import_submissions()
+    if a.action in ("list", "accept", "reject") and not getattr(a, "no_pull", False) and not getattr(a, "local", False):
+        if a.action != "list":
+            die("accept and reject are made in the Operations Center (Submissions tab): the PC reads those decisions and does not make "
+                "its own, so that there is one ledger. To decide here anyway, add --local (the decision then stays on this PC only).")
+        st = submissions_state_pull()
+        if st != "adminops":
+            log("NOTE: the ledger of the Operations Center was not read (%s): this is the ledger kept on this PC." % st)
     if a.action == "pull":
         if not submissions_pull_step(dry_run=a.dry_run, explicit=True):
             sys.exit(1)
@@ -1369,6 +1404,9 @@ def cmd_submissions(a):
         refresh_lookup_step()
     folder = Path(a.folder) if a.folder else P(S["submissions_dir"])
     if not a.folder and not getattr(a, "no_pull", False):
+        st = submissions_state_pull()          # earlier decisions stay: the ledger of the app first, then the files
+        if st != "adminops":
+            log("NOTE: the ledger of the Operations Center was not read (%s): the ledger kept on this PC is used." % st)
         if not submissions_pull_step():
             log("WARNING: the submissions folder could NOT be read from SharePoint: %s" % (
                 "the copy already in %s is used and may be out of date." % folder if folder.is_dir() else "there is no local copy either."))
@@ -1381,7 +1419,8 @@ def cmd_submissions(a):
     ready = sum(1 for r in rows if r["status"] == "ready")
     print("\n%d file(s): %d ready, %d to review, %d blocked, %d with nothing new (tally sheets are checks)." % (len(rows), ready, sum(1 for r in rows if r["status"] == "review"),
                                                          sum(1 for r in rows if r["status"] == "blocked"), sum(1 for r in rows if r["status"] == "nothing new")))
-    print("Next: look at %s, then 'admin.py submissions accept <file>' for the files that go into the next build.\n" % (out_root / "Submissions_report.xlsx"))
+    print("Next: look at %s. Accept or reject in the Operations Center (Submissions tab): the build here reads those decisions. "
+          "What 'inspect' wrote on this PC is a preview; it is replaced by the app's ledger at the next build.\n" % (out_root / "Submissions_report.xlsx"))
 
 
 # ----------------------------------------------------------------------------------------------- find
@@ -1499,7 +1538,7 @@ RULES = [
     ("province-spelling", "Geography", "A Province that is the same name as an Admin1 of the geography reference written differently (spaces, accents, punctuation, filler words: MAI NDOMBE = MAINDOMBE, PROVINCIA DE NAMPULA = NAMPULA, WADIFIRA = WADI FIRA, RS 3 = RS3) gets the reference's spelling. Exact match only, and only when the district does not belong to another province of the reference. Near matches and new Admin1s (Cuando, Sidama ...) are never changed: they are listed in the fix list.", "Request of 4 Nov 2026", "--no-fix-province-spelling"),
     ("digit-error", "Population", "A target population that is 10 or 100 times off (a missing or extra digit) is corrected only when the reported coverage (vaccinated / CVPolio) implies the corrected figure within 10% AND that figure is 0.6 - 1.7 times the median target of the same district's other campaigns. Both must agree; otherwise it stays flagged.", "Request of 4 Nov 2026", "--no-fix-digit-error"),
     ("fix-list", "Checks", "What cannot be corrected safely (missing key fields, report dates, target above total population, coverage above the ceiling, very different targets, coverage that differs, provinces to confirm, combined and separate records, records entered twice) is written to Fix_list_by_country.xlsx: one sheet per problem, with the row, the column to correct, the current and the suggested value. Cut per country in the app.", "Request of 4 Nov 2026", "--no-fix-list"),
-    ("submissions", "Intake", "The files the countries send (SharePoint folder Admin_data_submissions, copied read-only to workspace/submissions_in by 'admin.py submissions pull', which 'submissions inspect' runs first) are inspected one by one: layout (template, template with other header spellings, mapped by certain synonyms, or not usable), normalisation of every cell (capitals, spaces, country / province / vaccine / round spelling, dates, numbers as text, percentages, Year / SIAMTH / Ctry_Code / AFRO_block, the constants the live file has), the portal quality checks, the campaigns against the lookup, duplicates inside the file, and every record against the live file (new / same / other figures). An operator accepts or rejects each file; only accepted files are used, and only their NEW records are added at the end of the next build, before every other rule. Records already in the live file are never changed by a submission: the differences are listed.", "Request of 5 Nov 2026", "admin.py submissions inspect | list | accept | reject; build --no-submissions"),
+    ("submissions", "Intake", "The files the countries send (SharePoint folder Admin_data_submissions, copied read-only to workspace/submissions_in by 'admin.py submissions pull', which 'submissions inspect' runs first) are inspected one by one. The decisions (accept / reject, who, the note) are made in the Operations Center and kept in its AdminOps folder; a build on the PC reads that ledger first (read only, ADMIN_STORE_SHARE_URL) so that it adds exactly what the app accepted, and says so in the manifest and in the check when it could not: layout (template, template with other header spellings, mapped by certain synonyms, or not usable), normalisation of every cell (capitals, spaces, country / province / vaccine / round spelling, dates, numbers as text, percentages, Year / SIAMTH / Ctry_Code / AFRO_block, the constants the live file has), the portal quality checks, the campaigns against the lookup, duplicates inside the file, and every record against the live file (new / same / other figures). An operator accepts or rejects each file; only accepted files are used, and only their NEW records are added at the end of the next build, before every other rule. Records already in the live file are never changed by a submission: the differences are listed.", "Request of 5 Nov 2026", "admin.py submissions inspect | list | accept | reject; build --no-submissions"),
     ("text-clean", "Hygiene", "Stray control characters (carriage returns), line breaks and double / edge spaces in Country, Province, District, Response, Vaccine_type and Round_Add are removed.", "Found in District (KAJIADO EAST) 30 Oct 2026", "--no-clean-text"),
     ("dates", "Hygiene", "SIA_date written as text ('18-sept-20') becomes a real date.", "Admin portal", "(always)"),
     ("duplicates", "Hygiene", "Exact copies are removed. A record entered twice (same key AND the same population and results) is reported as Duplicate record and removed only with --resolve-duplicates. Records with the same key but other population or results are different units (most records have no sub-district): never removed, reported only as information (Same names, other figures). Key = Country, Province, District, [Admin_3], SIA_date, Round_Add, Vaccine_type, Response, compared without accents, case or punctuation.", "Admin portal", "--no-dedupe, --resolve-duplicates; admin.py duplicates lists them and what a fix would do; the Operations Center has the same choice on the Cycle tab"),
@@ -1560,6 +1599,7 @@ def main():
     s.add_argument("--no-refresh-lookup", action="store_true", help="use lookup.xlsx as it is (default: refreshed from the GPEI API first)")
     s.add_argument("--no-backup", action="store_true", help="do not read SharePoint, use the newest local backup")
     s.add_argument("--no-submissions", action="store_true", help="do not add the accepted submissions to this build")
+    s.add_argument("--no-ledger-pull", action="store_true", help="do not read the decisions of the Operations Center first, use the ledger kept on this PC")
     s.add_argument("extra", nargs="*", help="extra options for the builder, after --")
     s = sub.add_parser("baseinfo", help=argparse.SUPPRESS); s.add_argument("path")
     s = sub.add_parser("check"); s.add_argument("--run", type=int, help="version number (default: the newest)")
@@ -1581,7 +1621,8 @@ def main():
     s.add_argument("action", choices=["pull", "inspect", "list", "accept", "reject"])
     s.add_argument("targets", nargs="*", help="accept / reject: the file name or the start of its content hash")
     s.add_argument("--folder", help="inspect: the folder with the files (default: the submissions folder of the workspace, filled from SharePoint)")
-    s.add_argument("--no-pull", action="store_true", help="inspect: do not read the SharePoint folder first, use the local copy as it is")
+    s.add_argument("--no-pull", action="store_true", help="inspect: do not read the SharePoint folder first, use the local copy as it is; list: do not read the app's ledger")
+    s.add_argument("--local", action="store_true", help="accept / reject: decide on this PC only (normally decisions are made in the Operations Center)")
     s.add_argument("--dry-run", action="store_true", help="pull: list what would be copied, write nothing")
     s.add_argument("--note", help="accept / reject: a note kept in the ledger"); s.add_argument("--by", help="who decides (default: the user name)")
     s.add_argument("--no-refresh-lookup", action="store_true")
