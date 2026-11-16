@@ -500,6 +500,35 @@ def wire_by_date(lc, starts, ref, rn, offs):
     return None
 
 
+def wire_next_round(lc, starts, ref, rn, offs):
+    """The records say a round number (the round column, a hint, or the file name: 'Cycle_2') that the lookup does not have yet.
+    When the campaign that started last before the date of the records is the one whose LAST lookup round is rn - 1, and that round
+    started at most WIRE_MAX_BACK days before the records, the round exists but the lookup was not updated: the records are the next round
+    of the same campaign (same Response). Returns {'x': the lookup row of the last known round, 'last': its number, 'gap': days} or None."""
+    if lc is None or not len(lc) or rn is None:
+        return None
+    st = starts.loc[lc.index]
+    back = (ref - st).dt.days
+    before = back[back >= 0]
+    if before.empty:
+        return None
+    last_start = st.loc[before.idxmin()]
+    cand = lc.loc[before[before == before.min()].index]
+    rks = list(dict.fromkeys(cand["_rk"]))
+    if len(rks) != 1 or int(before.min()) > WIRE_MAX_BACK:
+        return None
+    rk = rks[0]
+    rows = lc[lc["_rk"] == rk]
+    off = offs["by_campaign"].get(rk, offs["common"])
+    nums = (rows["_rn"] + off).dropna().astype(int)
+    if nums.empty or rn != int(nums.max()) + 1:
+        return None
+    x = rows.loc[nums.idxmax()]
+    if pd.Timestamp(x["_d"]) > ref or int((ref - pd.Timestamp(x["_d"])).days) > WIRE_MAX_BACK:
+        return None
+    return {"x": x, "last": int(nums.max()), "gap": int((ref - pd.Timestamp(x["_d"])).days)}
+
+
 def infer_campaign(P, ctx, prof, hints, notes):
     """Records without a Response: find the campaign in the lookup from what the file does say (country, SIA_date, round, vaccine; or, with no
     date, the date / round / vaccine written in the file name). Only a unique answer is used, and it is always reported for the operator to
@@ -591,7 +620,15 @@ def infer_campaign(P, ctx, prof, hints, notes):
             wired = wire_by_date(lc, starts, ref, rn, offs) if (d_ and ref is not None) else None
         except Exception:
             wired = None            # the earlier inference (window and nearest round) then decides, as before
-        if wired is not None:
+        nxt = None
+        if wired is None and d_ and ref is not None and rn is not None:
+            try:
+                nxt = wire_next_round(lc, starts, ref, rn, offs)
+            except Exception:
+                nxt = None
+        if nxt is not None:
+            lc, src = lc.loc[[nxt["x"].name]], "the date of the records"
+        elif wired is not None:
             lc, src = lc.loc[[wired[0]]], "the date of the records: " + wired[1]
         else:
             lc = lc[(starts.loc[lc.index] >= t0) & (starts.loc[lc.index] <= t1)]
@@ -618,14 +655,24 @@ def infer_campaign(P, ctx, prof, hints, notes):
         name = spell.get(rk) or x["OBR Name"]
         off = offs["by_campaign"].get(rk, offs["common"])
         why = "campaign inferred: %s %s (starts %s) in the lookup, from %s%s" % (x["OBR Name"], x["Round Number"], x["Round Start Date"], src, vnote)
+        rname_out = x["Round Number"]
+        if nxt is not None:
+            rname_out = "Round %d" % rn
+            why = ("round %d of %s is not in the lookup yet (the lookup has rounds up to %d, the last starting %s): taken as the next round of "
+                   "the same campaign, with the date of the records%s" % (rn, x["OBR Name"], nxt["last"], x["Round Start Date"], vnote))
+            gl = getattr(ctx, "_lookup_gaps", None)
+            if gl is None:
+                gl = ctx._lookup_gaps = []
+            gl.append({"Country": x["Country"], "Response": name, "Round_missing_in_lookup": rn, "Date_in_the_data": d_,
+                       "Last_round_in_lookup": nxt["last"], "Last_round_start": x["Round Start Date"], "Records": len(g)})
         vt = None
         if "Vaccines" in lk.columns and not is_empty(x.get("Vaccines")):
             vt = vmap.get(cn(x["Vaccines"]))
         for i in g.index:
             P.at[i, "Response"] = name
             notes.add(rowref(P, i), "Response", "", name, why)
-            if is_empty(P.at[i, "Round_Add"]) and not pd.isna(x["_rn"]):
-                P.at[i, "Round_Add"] = "Rnd%d" % (int(x["_rn"]) + off)
+            if is_empty(P.at[i, "Round_Add"]) and (nxt is not None or not pd.isna(x["_rn"])):
+                P.at[i, "Round_Add"] = "Rnd%d" % (rn if nxt is not None else int(x["_rn"]) + off)
                 notes.add(rowref(P, i), "Round_Add", "", P.at[i, "Round_Add"], why)
             if pd.isna(P.at[i, "SIA_date"]):
                 P.at[i, "SIA_date"] = pd.Timestamp(x["_d"])
@@ -637,7 +684,7 @@ def infer_campaign(P, ctx, prof, hints, notes):
             if is_empty(P.at[i, "Vaccine_type"]) and vt:
                 P.at[i, "Vaccine_type"] = vt
                 notes.add(rowref(P, i), "Vaccine_type", "", vt, why)
-        out.append("%s %s (%d record(s); from %s%s)" % (name, x["Round Number"], len(g), src, vnote))
+        out.append("%s %s (%d record(s); from %s%s)" % (name, rname_out, len(g), src + ("; round not in the lookup yet" if nxt is not None else ""), vnote))
     return out
 
 
@@ -1664,6 +1711,8 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("campaign filled down inside the sheet, not written in those lines (please confirm): " + "; ".join(det["filled_down"][:3]))
     if det.get("inferred"):
         codes.append("campaign_inferred")
+        if any("round not in the lookup yet" in str(m_) for m_ in det["inferred"]):
+            codes.append("campaign_next_round")    # the lookup has no such round: a person confirms, and the lookup needs the round
         if any("planned start of the previous campaign" in str(m_) for m_ in det["inferred"]):
             codes.append("campaign_by_floor")      # dated after a planned start, before the next one: it can be a round the lookup does not have: a person confirms
         reasons.append("campaign details taken from the lookup / the file name, not written in the file (please confirm): " + "; ".join(det["inferred"][:3]))
@@ -2201,6 +2250,9 @@ def write_report(path, rows, details, ctx, not_read=()):
             rows_h.append({"Header": x, "In files": len(c["files"]), "Example file": sorted(c["files"])[0],
                            "Closest template column": tcols[near[0]] if near else "", "To teach it": '"%s": "%s"' % (x, tcols[near[0]]) if near else ""})
         sheets["Headers_to_learn"] = pd.DataFrame(rows_h)
+    gaps = getattr(ctx, "_lookup_gaps", None)
+    if gaps:
+        sheets["Lookup_gaps"] = pd.DataFrame(gaps).drop_duplicates()
     for name, key in (("Campaign_to_set", "to_set"), ("eTally_vs_callin", "callin_check"), ("Tally_check", "tally_check"), ("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
                       ("Normalised_cells", "notes"), ("Defaults_from_live", "defaults"), ("Left_out", "excluded_df"), ("Not_numbers", "bad_numbers"),
                       ("Values_not_seen", "unseen"), ("Duplicates_in_file", "dups"), ("Campaigns_vs_lookup", "campaigns")):
@@ -2399,6 +2451,25 @@ def auto_codes_ok(e):
     return all(c in ok for c in codes)
 
 
+# Automatic rule 3, the engine learns from the people: a file with the same name pattern, in the same country folder and with the same layout as a file
+# that a PERSON accepted is accepted again, when it shows no kind of finding that the accepted one did not show and none of the HARD ones.
+AUTO_HARD = {"error", "several_units", "possible_dup", "overlap", "wrong_place", "other_country", "non_numbers", "vaccine_vs_lookup", "sheets_skipped"}
+
+
+def precedent_for(e, ledger):
+    """The newest earlier file accepted by a person that this entry repeats (same pattern, folder and layout, no new kind of finding), or None."""
+    codes = e.get("codes")
+    if codes is None or not e.get("stem") or set(codes) & AUTO_HARD or e.get("overlap"):
+        return None
+    for p in earlier_decisions(ledger, None, e.get("stem"), e.get("country_folder")):
+        who = str(p.get("decided_by") or "")
+        if p.get("decision") != "accepted" or who.startswith("engine") or p.get("layout") != e.get("layout"):
+            continue
+        if set(codes) <= (set(p.get("codes") or []) | AUTO_CODES | AUTO_CODES_LOOKUP):
+            return p
+    return None
+
+
 def auto_candidates(out_root, ledger=None):
     """[(name, path, note)] of the files rule 1 takes into the build: not decided by a person, not blocked, not replaced by a newer
     version, still in the folder, with new records, no Error, no record with several live units, no possible duplicate, no overlap
@@ -2413,6 +2484,13 @@ def auto_candidates(out_root, ledger=None):
         if e.get("qc_errors") or e.get("existing_units") or e.get("possible_dup") or e.get("overlap"):
             continue
         by_codes = auto_codes_ok(e)
+        prec = precedent_for(e, ledger) if by_codes is False else None
+        if prec is not None:
+            p = Path(out_root) / e["prepared"]
+            if p.is_file():
+                out.append((e["name"], str(p), "%s: %d new record(s), the same kind of file as '%s', accepted by %s on %s" % (
+                    AUTO_RULE, int(e.get("new") or 0), str(prec.get("name"))[:40], prec.get("decided_by") or "?", str(prec.get("decided_at") or "")[:10])))
+            continue
         if by_codes is False or (by_codes is None and not auto_reasons_ok(e.get("why"))):
             continue
         lk = int(e.get("lookup_rounds") or 0)
@@ -2422,6 +2500,107 @@ def auto_candidates(out_root, ledger=None):
         p = Path(out_root) / e["prepared"]
         if p.is_file():
             out.append((e["name"], str(p), "%s: %d new record(s), %s" % (AUTO_RULE, int(e.get("new") or 0), how)))
+    return out
+
+
+CODE_MEANING = {
+    "overlap": ("the new records are also new in another file", "engine: a copy with the same figures is harmless; other figures need a person"),
+    "coverage_ceiling": ("records with more vaccinated than the target allows", "the country (figures) or a person"),
+    "possible_dup": ("records that look like live records under another campaign name, round or date", "a person"),
+    "unseen": ("names or values never seen in the live file", "a person (new spelling or new area)"),
+    "campaign_from_live": ("campaign details taken from the live file, not written in the file", "a person, once (remembered)"),
+    "campaign_inferred": ("campaign taken from the lookup / the file name", "the engine when the lookup confirms it"),
+    "campaign_by_floor": ("dated after a planned start, before the next one", "a person, once (remembered)"),
+    "campaign_next_round": ("round missing from the lookup, taken as the next round of the same campaign", "a person, and the lookup needs the round"),
+    "error": ("records with an Error", "the country"),
+    "several_units": ("same names as several live records, none identical", "a person"),
+    "sheets_skipped": ("a sheet with column names that could not be read", "the country or a person"),
+    "non_numbers": ("cells that are not numbers", "the country"),
+    "year_fixed": ("year of a date corrected", "the engine when the lookup confirms it"),
+    "date_far": ("a date far from the campaign", "a person"),
+    "older_campaign": ("records of an older campaign inside the file", "a person"),
+    "etally": ("eTally export added up by LGA", "the engine when the lookup confirms the campaign"),
+    "callin": ("eTally compared with the call-in workbook", "a person"),
+    "layout_other": ("a layout that is not the template", "a person"),
+    "vaccine_vs_lookup": ("the vaccine differs from the lookup", "the country or a person"),
+    "other_country": ("records of another country than the folder", "a person"),
+    "wrong_place": ("a file in the wrong folder", "move or delete the file"),
+}
+
+
+def blockers_of(e):
+    """The kinds of finding that keep a file from an automatic decision, in plain words: [code]. None when the entry has no codes (inspect again)."""
+    codes = e.get("codes")
+    if codes is None:
+        return None
+    ok = set(AUTO_CODES)
+    lk = int(e.get("lookup_rounds") or 0)
+    if lk and int(e.get("lookup_ok") or 0) == lk and "vaccine_vs_lookup" not in codes:
+        ok |= AUTO_CODES_LOOKUP
+    out = [c for c in dict.fromkeys(codes) if c not in ok and c not in ("no_new",)]
+    if e.get("overlap") and "overlap" not in out:
+        out.append("overlap")
+    return out
+
+
+def summary(out_root, audit=None):
+    """What a person would otherwise work out by hand: where the new records are, what keeps them from going in by themselves, who can fix it,
+    and which rounds of the lookup that have no data in the live file are in a submitted file. Returns {sheet: DataFrame}."""
+    ledger = load_ledger(out_root)
+    auto = {n for n, _, _ in auto_candidates(out_root, ledger)}
+    rows = []
+    for h, e in ledger["files"].items():
+        if not e.get("present", True) or e.get("superseded") or (e.get("new") or 0) <= 0:
+            continue
+        bl = blockers_of(e)
+        rows.append({"File": e["name"], "Country": e.get("country_folder") or "", "New": int(e["new"]), "Status": e.get("status"),
+                     "Decision": e.get("decision") or "", "Auto": e["name"] in auto, "Blockers": bl})
+    f = pd.DataFrame(rows)
+    out = {}
+    if len(f):
+        f["Blocker_list"] = f["Blockers"].map(lambda b: "inspect again (no codes)" if b is None else ", ".join(b))
+        bl_rows = []
+        for code in sorted({c for b in f["Blockers"] if b for c in b}):
+            sel = f[f["Blockers"].map(lambda b: bool(b) and code in b) & ~f["Auto"] & (f["Decision"] == "")]
+            m = CODE_MEANING.get(code, (code, "a person"))
+            bl_rows.append({"Finding": code, "Meaning": m[0], "Who can fix it": m[1], "Files": len(sel), "New_records_affected": int(sel["New"].sum())})
+        out["Blockers"] = pd.DataFrame(bl_rows).sort_values("New_records_affected", ascending=False) if bl_rows else pd.DataFrame()
+        g = []
+        for c, d in f.groupby("Country"):
+            todo = d[~d["Auto"] & (d["Decision"] == "")]
+            top = pd.Series([x for b in todo["Blockers"] if b for x in b]).value_counts()
+            g.append({"Country": c, "Files_with_new_records": len(d), "New_records": int(d["New"].sum()), "Taken_by_rules": int(d.loc[d["Auto"], "New"].sum()),
+                      "Decided": int(d.loc[d["Decision"] != "", "New"].sum()), "Waiting_for_a_person": int(todo["New"].sum()),
+                      "Main_finding": top.index[0] if len(top) else ""})
+        out["By_country"] = pd.DataFrame(g).sort_values("New_records", ascending=False)
+        out["Files"] = f.drop(columns=["Blockers"]).sort_values(["Country", "New"], ascending=[True, False])
+    # lookup rounds without data in the live file, found in a submitted file?
+    rep = Path(out_root) / "Submissions_report.xlsx"
+    if audit and Path(audit).is_file() and rep.is_file():
+        try:
+            nd = pd.read_excel(audit, sheet_name="Lookup_no_data")
+            cv = pd.read_excel(rep, sheet_name="Campaigns_vs_lookup")
+        except Exception:
+            nd, cv = None, None
+        if nd is not None and len(nd):
+            def rk(x):
+                return re.sub(r"[^a-z0-9]", "", str(x).lower())
+            def rnum(x):
+                m = re.search(r"(\d+)", str(x))
+                return int(m.group(1)) if m else None
+            cv = cv.assign(_k=cv["Response"].map(rk), _r=cv["Round_Add"].map(rnum))
+            st = {e["name"]: e for e in ledger["files"].values()}
+            rec = []
+            for _, r in nd.iterrows():
+                hit = cv[(cv["_k"] == rk(r["OBR Name"])) & (cv["_r"] == rnum(r["Round Number"]))]
+                files = [x for x in hit["File"].dropna().unique() if x in st and st[x].get("present", True) and not st[x].get("superseded")]
+                n_new = max([int(st[x].get("new") or 0) for x in files] or [0])
+                rec.append({"Country": r["Country"], "Campaign": r["OBR Name"], "Round": r["Round Number"], "Planned_start": str(r["Round Start Date"])[:10],
+                            "In_a_submitted_file": bool(files), "Files": "; ".join(files[:3]), "New_records_in_best_file": n_new,
+                            "Next_step": ("the file brings new records: decide it" if n_new else ("the file has the records but all are in the live file or held back: see its findings" if files else "not in any submitted file: ask the country"))})
+            r_ = pd.DataFrame(rec)
+            r_["_d"] = r_["Planned_start"]
+            out["Missing_rounds"] = r_[r_["_d"] >= "2025-01-01"].sort_values(["Country", "_d"]).drop(columns="_d")
     return out
 
 
