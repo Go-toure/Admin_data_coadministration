@@ -1569,38 +1569,42 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             det["campaigns"] = rep
         except Exception:
             det["campaigns"] = None
-    # the verdict
-    reasons = []
+    # the verdict (every finding also has a code, kept in the ledger: the automatic rules read the codes, never the text)
+    reasons, codes = [], []
     if s["excluded"]:
-        reasons.append("%d row(s) left out" % s["excluded"])
+        reasons.append("%d row(s) left out" % s["excluded"]); codes.append("left_out")
     if s["qc_errors"]:
-        reasons.append("%d record(s) with an Error" % s["qc_errors"])
+        reasons.append("%d record(s) with an Error" % s["qc_errors"]); codes.append("error")
     if s["existing_different"]:
-        reasons.append("%d record(s) already in the live file with other figures (not changed)" % s["existing_different"])
+        reasons.append("%d record(s) already in the live file with other figures (not changed)" % s["existing_different"]); codes.append("other_figures")
     if s["existing_units"]:
-        reasons.append("%d record(s) with the same names as several live records and none identical (not added)" % s["existing_units"])
+        reasons.append("%d record(s) with the same names as several live records and none identical (not added)" % s["existing_units"]); codes.append("several_units")
     if s.get("possible_dup"):
+        codes.append("possible_dup")
         reasons.append("%d record(s) that look like live records under another campaign name, round or date (not added): see the Records sheet" % s["possible_dup"])
     for m_ in det.get("date_check", {}).get("fixed", []):
-        reasons.append("year of the date corrected (please confirm): " + m_)
+        reasons.append("year of the date corrected (please confirm): " + m_); codes.append("year_fixed")
     for m_ in det.get("date_check", {}).get("far", []):
-        reasons.append(m_ + ": check")
+        reasons.append(m_ + ": check"); codes.append("date_far")
     for m_ in det.get("older", []):
-        reasons.append(m_)
+        reasons.append(m_); codes.append("older_campaign")
     for m_ in det.get("vaccine_check", []):
-        reasons.append("vaccine against the lookup: " + m_)
+        reasons.append("vaccine against the lookup: " + m_); codes.append("vaccine_vs_lookup")
     if lay["class"] != "template":
-        reasons.append("layout: " + lay["class"])
+        reasons.append("layout: " + lay["class"]); codes.append("layout_mapped" if str(lay["class"]).startswith("mapped") else ("etally" if lay.get("etally") else "layout_other"))
     if det.get("from_live"):
+        codes.append("campaign_from_live")
         reasons.append("campaign details taken from the live file (same place and number vaccinated), not written in the file (please confirm): " + "; ".join(det["from_live"][:3]))
     if det.get("filled_down"):
+        codes.append("campaign_filled_down")
         reasons.append("campaign filled down inside the sheet, not written in those lines (please confirm): " + "; ".join(det["filled_down"][:3]))
     if det.get("inferred"):
+        codes.append("campaign_inferred")
         reasons.append("campaign details taken from the lookup / the file name, not written in the file (please confirm): " + "; ".join(det["inferred"][:3]))
     if lay.get("etally"):
-        reasons.append("; ".join(lay["notes"][:1]))
+        reasons.append("; ".join(lay["notes"][:1])); codes.append("etally")
     if det.get("callin_summary"):
-        reasons.append(det["callin_summary"])
+        reasons.append(det["callin_summary"]); codes.append("callin")
     # a file that is mostly another country's records than the folder it is in is in the wrong place
     if folder_country and len(P) >= 10:
         oc = P["Country"].map(lambda v: v != folder_country)
@@ -1608,27 +1612,40 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             top_c = P.loc[oc, "Country"].value_counts()
             hint = ("; the records are of %s: move the file to that folder" % top_c.index[0]) if len(top_c) and top_c.iat[0] >= 0.8 * int(oc.sum()) and len(P) < 50 else "; not usable, delete it from the folder"
             reasons.insert(0, "WRONG FILE OR WRONG FOLDER: %d of %d records are of other countries than the folder (%s)%s" % (int(oc.sum()), len(P), folder_country, hint))
-            s["wrong_place"] = True
+            s["wrong_place"] = True; codes.append("wrong_place")
     if lay.get("skipped_sheets"):
+        codes.append("sheets_skipped")
         reasons.append("sheet(s) with column names but not usable, not read: %s" % ", ".join(str(x) for x in lay["skipped_sheets"]))
     if folder_country and len(P):
         other = P["Country"].map(lambda v: v != folder_country)
         if other.any():
             others = P.loc[other, "Country"].value_counts().head(3)
+            codes.append("other_country")
             reasons.append("%d record(s) of another country than the folder (%s): %s" % (
                 int(other.sum()), folder_country, ", ".join("%s %d" % (k, v) for k, v in others.items())))
     if len(det["unseen"]):
-        reasons.append("values never seen in the live file")
+        reasons.append("values never seen in the live file"); codes.append("unseen")
     if det["bad_numbers"] is not None and len(det["bad_numbers"]):
+        codes.append("non_numbers")
         reasons.append("%d cell(s) that are not numbers" % len(det["bad_numbers"]))
     if len(iss) and "check" in iss.columns:
         nc_ = int(iss.loc[iss["check"] == "coverage_ceiling", "Excel_row"].nunique())
         if nc_:
+            codes.append("coverage_ceiling")
             reasons.append("%d record(s) with coverage above the ceiling (more vaccinated than the target allows): check the figures with the country" % nc_)
     if s["qc_warnings"] > 0.25 * s["rows_used"]:
-        reasons.append("more than 25% of the records have a warning")
+        reasons.append("more than 25% of the records have a warning"); codes.append("warnings")
     if s["new"] == 0:
-        reasons.append("no new record")
+        reasons.append("no new record"); codes.append("no_new")
+    s["codes"] = codes
+    # the lookup as evidence: every campaign round of the file is a round of the lookup (same country, campaign, date and round)
+    s["lookup_rounds"], s["lookup_ok"] = 0, 0
+    try:
+        cp = det.get("campaigns")
+        if cp is not None and len(cp):
+            s["lookup_rounds"], s["lookup_ok"] = int(len(cp)), int(cp["Status"].eq("OK").sum())
+    except Exception:
+        pass                    # no evidence: the rule then simply does not apply
     s["status"] = "ready" if not reasons else "review"
     if s.get("wrong_place"):
         s["status"] = "blocked"
@@ -1754,6 +1771,7 @@ def overlap_between_files(details, out_root, rows, ledger, log=print):
             if h in ledger["files"]:
                 ledger["files"][h]["why"], ledger["files"][h]["status"] = s["why"], s["status"]
                 ledger["files"][h]["overlap"] = tot
+                ledger["files"][h]["codes"] = list(ledger["files"][h].get("codes") or []) + ["overlap"]
             det["_overlap_msg"] = msg
     return pd.DataFrame(parts)
 
@@ -2025,6 +2043,7 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
         e.update({k: s[k] for k in ("name", "path", "size", "hash", "layout", "rows_read", "rows_used", "excluded", "new", "existing_same",
                                     "existing_different", "existing_units", "qc_errors", "qc_warnings", "countries", "status", "why")})
         e["possible_dup"] = s.get("possible_dup", 0)
+        e["codes"], e["lookup_rounds"], e["lookup_ok"] = s.get("codes"), s.get("lookup_rounds", 0), s.get("lookup_ok", 0)
         e["stem"], e["country_folder"] = stem_, fc or ""
         e.update({"prepared": prepared, "last_inspected": now, "present": True})
         ledger["files"][h] = e
@@ -2295,6 +2314,25 @@ def auto_reasons_ok(why):
     return all(any(t in x for t in AUTO_INFO) for x in parts)
 
 
+# Automatic rule 2 (needs the codes of an inspection made by this version): the same, and when EVERY campaign round of the file is a
+# round of the lookup (same country, campaign, date and round) and the vaccine agrees with the lookup, a campaign that the file did not
+# write but the lookup gave, a year typed wrongly that the lookup's date confirms, and an eTally export added up by LGA are harmless too.
+AUTO_CODES = {"left_out", "other_figures", "layout_mapped", "warnings"}
+AUTO_CODES_LOOKUP = {"campaign_inferred", "year_fixed", "etally"}
+
+
+def auto_codes_ok(e):
+    """None when the ledger entry has no codes (an older inspection: use the text rule), else True / False."""
+    codes = e.get("codes")
+    if codes is None:
+        return None
+    ok = set(AUTO_CODES)
+    lk = int(e.get("lookup_rounds") or 0)
+    if lk and int(e.get("lookup_ok") or 0) == lk and "vaccine_vs_lookup" not in codes:
+        ok |= AUTO_CODES_LOOKUP
+    return all(c in ok for c in codes)
+
+
 def auto_candidates(out_root, ledger=None):
     """[(name, path, note)] of the files rule 1 takes into the build: not decided by a person, not blocked, not replaced by a newer
     version, still in the folder, with new records, no Error, no record with several live units, no possible duplicate, no overlap
@@ -2308,11 +2346,16 @@ def auto_candidates(out_root, ledger=None):
             continue
         if e.get("qc_errors") or e.get("existing_units") or e.get("possible_dup") or e.get("overlap"):
             continue
-        if not auto_reasons_ok(e.get("why")):
+        by_codes = auto_codes_ok(e)
+        if by_codes is False or (by_codes is None and not auto_reasons_ok(e.get("why"))):
             continue
+        lk = int(e.get("lookup_rounds") or 0)
+        how = "only harmless findings"
+        if by_codes and lk and int(e.get("lookup_ok") or 0) == lk and set(e.get("codes") or []) & AUTO_CODES_LOOKUP:
+            how = "campaign confirmed by the lookup (%d of %d round(s))" % (int(e["lookup_ok"]), lk)
         p = Path(out_root) / e["prepared"]
         if p.is_file():
-            out.append((e["name"], str(p), "%s: %d new record(s), only harmless findings" % (AUTO_RULE, int(e.get("new") or 0))))
+            out.append((e["name"], str(p), "%s: %d new record(s), %s" % (AUTO_RULE, int(e.get("new") or 0), how)))
     return out
 
 
