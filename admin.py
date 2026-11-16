@@ -53,6 +53,7 @@ DEFAULTS = {
     "refresh_lookup": True,                   # refresh lookup.xlsx from the GPEI API at the start of build and inspect
     "gpei_env_file": "",                      # secrets.env holding GPEI_API_TOKEN (default: the scope folder's config/secrets.env)
     "geo": "geo_reference.csv",
+    "afrogdb_dir": "",                        # AFRO-Geo-Reference folder (default: next to this repository)
     "district_source": "",                    # optional recovered file used by --district-source
     "submissions_dir": "workspace/submissions_in",   # the files of the countries (downloaded from the submissions folder)
     "build_extra_args": [],
@@ -64,7 +65,7 @@ DEFAULTS = {
     "excel_method": "python",                 # "python": values written into the file, no Excel needed; "excel": desktop Excel
     "excel_visible": True,                    # show the Excel window while it saves (any pop-up can then be answered)
 }
-EXPECTED_CHANGE = {"Response", "Round_Add", "District", "Province", "Country", "SIA_date", "Vaccine_type", "PopPolio",
+EXPECTED_CHANGE = {"geo_code", "geo_match", "Response", "Round_Add", "District", "Province", "Country", "SIA_date", "Vaccine_type", "PopPolio",
                    "CVPolio", "TotalNbrVaccPolio", "Tot_Vacc_nOPV2", "CV_nOPV2", "Total_Vacc_bOPV", "CV_bOPV", "TotPop",
                    "AgeGPolio", "Admin_3", "Year", "Index", "SIAMTH"}
 DATA_EXT = (".xlsx", ".xls", ".csv", ".pkl", ".rds", ".zip")
@@ -520,6 +521,8 @@ def cmd_build(a):
     geo = P(S["geo"])
     if geo.is_file():
         cmd += ["--geo", geo]
+    if S.get("afrogdb_dir") and P(S["afrogdb_dir"]).is_dir():
+        cmd += ["--afrogdb", P(S["afrogdb_dir"])]
     snaps = BACKUP_REPO / "snapshots" / "admin"
     if snaps.is_dir():
         cmd += ["--backups", snaps]
@@ -685,6 +688,15 @@ def cmd_check(a):
                         "(look at 'compare live vNN --col NAME' before publishing)" % ", ".join(odd[:8]))
     else:
         info.append("rows differ in number, so no cell-by-cell comparison")
+    # 8. AFROGDB geo_code: the share of records with a code must not fall (names are not changed by this rule)
+    if "geo_code" in new.columns:
+        s1 = float(new["geo_code"].astype(str).str.strip().replace({"nan": "", "None": ""}).ne("").mean() * 100)
+        s0 = float(base["geo_code"].astype(str).str.strip().replace({"nan": "", "None": ""}).ne("").mean() * 100) if "geo_code" in base.columns else None
+        info.append("records with an AFROGDB geo_code: %s -> %.1f%%" % ("none" if s0 is None else "%.1f%%" % s0, s1))
+        if s0 is not None and s1 < s0 - 1.0:
+            warn.append("fewer records with an AFROGDB geo_code than before (%.1f%% -> %.1f%%): look at afrogdb_unmatched.csv" % (s0, s1))
+        if s0 is None:
+            info.append("first build with geo_code: the 'new columns' note above is expected")
     ok = not hard
     rep = ["# Check of v%d" % n, "", "Started from backup version %s (%s)." % (m["base"].get("backup_version"), m["base"].get("modified_by")),
            "", "Result: **%s**" % ("OK" if ok else "FAILED"), ""]
@@ -1452,6 +1464,7 @@ RULES = [
     ("cvpolio", "Coverage", "An empty CVPolio is filled with TotalNbrVaccPolio / PopPolio. Records with only a target (no vaccinated) stay empty.", "Request of 28 Oct 2026", "--no-fill-cvpolio"),
     ("district-fill", "Districts", "An empty District is filled from a recovered file, matched on country + Response + round + province: same PopPolio and total; same PopPolio and total within 10%; same total; total + the target implied by the coverage; the last unmatched pair; same PopPolio or total with unique pairing.", "Ethiopia file AFRO-ETH FIVE REGIONS R1 (282 of 282 filled)", "--district-source FILE"),
     ("addis", "Districts", "Addis Ababa rows that repeat the sub-city name (NIFAS SILK LAFTO x13) are renamed '<SUB-CITY> WOREDA NN' from the file, only when every row of the sub-city matches a different woreda. Rows without a source (round 2 and 4 sub-cities of round 1) are left; they stay possible duplicates until a woreda-level file exists.", "Request of 29 Oct 2026", "(with --district-source)"),
+    ("afrogdb-code", "Geography", "Two columns, geo_code and geo_match, are added at the end of the sheet: the AFROGDB district code of the Country / Province / District, found with the AFRO-Geo-Reference rules (exact name, same name ignoring accents and punctuation, the one district of that name in another province, or a reviewed crosswalk decision). The names themselves are NOT changed. A name that is not found has an empty code and is listed in review/afrogdb_unmatched.csv of the build (names and counts only). The check warns when the share of records with a code falls.", "Request of 16 Nov 2026 (same reference as LQAS, IM and SCOPE)", "--no-afrogdb-codes, --afrogdb DIR"),
     ("province", "Geography", "A Province that belongs to another country (per geo_reference.csv) is corrected when certain.", "Admin portal checks", "--no-fix-province"),
     ("country-names", "Geography", "A Country spelled another way (CAMEROUN, REPUBLIQUE CENTRAFRIQUE, TANZANIA ...) gets the standard name of the geography reference (CAMEROON, CENTRAL AFRICAN REPUBLIC, UNITED REPUBLIC OF TANZANIA). Only names of a fixed list whose standard name is in the reference.", "Request of 4 Nov 2026", "--no-fix-country-names"),
     ("province-spelling", "Geography", "A Province that is the same name as an Admin1 of the geography reference written differently (spaces, accents, punctuation, filler words: MAI NDOMBE = MAINDOMBE, PROVINCIA DE NAMPULA = NAMPULA, WADIFIRA = WADI FIRA, RS 3 = RS3) gets the reference's spelling. Exact match only, and only when the district does not belong to another province of the reference. Near matches and new Admin1s (Cuando, Sidama ...) are never changed: they are listed in the fix list.", "Request of 4 Nov 2026", "--no-fix-province-spelling"),

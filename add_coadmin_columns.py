@@ -225,6 +225,9 @@ def main():
     ap.add_argument("--geo", help="geography reference (country, province, district) for the province / country check "
                                   "(default: geo_reference.csv next to this script)")
     ap.add_argument("--no-quality", action="store_true", help="do not run the quality checks (merged from the admin portal)")
+    ap.add_argument("--afrogdb", metavar="DIR", help="the AFRO-Geo-Reference folder (default: next to this repository, or AFRO_GEO_REFERENCE_DIR)")
+    ap.add_argument("--no-afrogdb-codes", action="store_true",
+                    help="do not add the geo_code / geo_match columns (AFROGDB district code)")
     ap.add_argument("--no-fix-province", action="store_true",
                     help="do not correct a province that belongs to another country (it is then only reported)")
     ap.add_argument("--check-only", action="store_true",
@@ -780,6 +783,28 @@ def main():
     print("pairs merged:", int(drop.sum() - pre_drop.sum()), "| copied rounds removed:", int(copy_drop.sum()),
           "| duplicates removed:", int(dup_drop.sum()), "-> rows out:", int(keep.sum()), flush=True)
 
+    # ------------------------------------------------------------ AFROGDB geo_code (names are not changed)
+    geo_vals = None
+    if not a.no_afrogdb_codes:
+        gdir = find_afrogdb(a.afrogdb)
+        if gdir is None:
+            print("AFROGDB codes: AFRO-Geo-Reference not found (use --afrogdb DIR): geo_code / geo_match not updated", flush=True)
+        else:
+            try:
+                gref = load_afrogdb(gdir)
+                gc_, gm_, gun = afrogdb_codes(df, gref)
+                geo_vals = {"geo_code": gc_, "geo_match": gm_}
+                kept_ = ~drop
+                n_ok = int(gc_[kept_].notna().sum())
+                print("AFROGDB codes: %d of %d records have a geo_code (%.1f%%); %d name(s) not found" %
+                      (n_ok, int(kept_.sum()), 100.0 * n_ok / max(int(kept_.sum()), 1), len(gun)), flush=True)
+                try:
+                    gun.to_csv(os.path.join(rev_dir, "afrogdb_unmatched.csv"), index=False, encoding="utf-8-sig")
+                except Exception as e:
+                    print("AFROGDB codes: the list of names not found was not written (%s)" % e, flush=True)
+            except Exception as e:
+                print("AFROGDB codes skipped (%s)" % e, flush=True)
+
     # -------------------------------------------------------- new sheet build
     base_cols = [h for h in header if h not in BLOCK]
     new_header = []
@@ -793,6 +818,10 @@ def main():
     if "CVPolio" in new_header:
         new_header.remove("CVPolio")
         new_header.insert(new_header.index("TotalNbrVaccPolio") + 1, "CVPolio")
+    if geo_vals is not None:
+        for h in GEO_COLS:
+            if h not in new_header:
+                new_header.append(h)
     new_letter = {h: get_column_letter(i + 1) for i, h in enumerate(new_header)}
     ncol_new = len(new_header)
 
@@ -825,6 +854,8 @@ def main():
         "Total_Vacc_bOPV": out_tb, "CV_bOPV": out_cvb,
         "Vaccine_type": out_vt, "TotalNbrVaccPolio": out_total,
     }
+    if geo_vals is not None:
+        vals.update(geo_vals)
     total_style_src = tot_idx  # column index in original row tuples
     r_out = 2
     idxs = list(df.index[keep])
@@ -844,6 +875,8 @@ def main():
                 c = ws_new.cell(row=r_out, column=j + 1, value=v)
                 if h in header:
                     c._style = copy(row_cells[header.index(h)]._style)
+                elif h in GEO_COLS:
+                    c._style = copy(row_cells[header.index("District")]._style)
                 else:
                     c._style = copy(row_cells[total_style_src]._style)
                     if h.startswith("CV_"):
@@ -1671,6 +1704,122 @@ def find_geo(user_path, src):
         if c and os.path.isfile(c):
             return c
     return None
+
+
+# ---- AFROGDB geo_code (added 16 Nov 2026) -------------------------------------------------------------------
+# Adds the columns geo_code and geo_match at the end of the sheet. Country / Province / District are NOT changed
+# by this rule. The matching follows AFRO-Geo-Reference/R/afrogdb_standardize.R (exact, same after ignoring accents
+# and punctuation, the one district of that name in another province, reviewed crosswalk decision) and gives the
+# same answer for the same names. A name that is not found keeps an empty geo_code and is listed in
+# review/afrogdb_unmatched.csv (counts only).
+GEO_COLS = ["geo_code", "geo_match"]
+_GEO_FOUND = {"exact", "normalized", "other province", "crosswalk", "crosswalk (auto)"}
+
+
+def _gk(x):
+    """Matching key of AFRO-Geo-Reference (afro_nk): no accents, capitals, no 'RM ' prefix, letters and digits only."""
+    import unicodedata
+    s = "" if x is None or (isinstance(x, float) and x != x) else str(x)
+    s = "".join(ch for ch in unicodedata.normalize("NFKD", s.strip()) if not unicodedata.combining(ch)).upper()
+    s = re.sub(r"^RM[ -]+", "", s)
+    return re.sub(r"[^A-Z0-9]", "", s)
+
+
+def _gu(x):
+    return ("" if x is None or (isinstance(x, float) and x != x) else str(x)).strip().upper()
+
+
+def find_afrogdb(user_path):
+    cands = [user_path] if user_path else []
+    if os.environ.get("AFRO_GEO_REFERENCE_DIR"):
+        cands.append(os.environ["AFRO_GEO_REFERENCE_DIR"])
+    here = os.path.dirname(os.path.abspath(__file__))
+    for up in ("..", os.path.join("..", "..")):
+        cands.append(os.path.join(here, up, "AFRO-Geo-Reference"))
+    for c in cands:
+        if c and os.path.isfile(os.path.join(c, "reference", "afrogdb_geoname_master.csv")):
+            return c
+    return None
+
+
+def load_afrogdb(dirpath):
+    rd = lambda f: pd.read_csv(os.path.join(dirpath, "reference", f), encoding="utf-8-sig", dtype=str, keep_default_na=False, na_values=[""])
+    ex = lambda f: os.path.isfile(os.path.join(dirpath, "reference", f))
+    m = rd("afrogdb_geoname_master.csv")
+    rc = m[m["level"] == "country"][["country", "geo_code"]]
+    rp = m[m["level"] == "province"][["country", "province", "geo_code"]]
+    rdist = m[m["level"] == "district"][["country", "province", "district", "geo_code"]].copy()
+    if ex("legacy_units.csv"):                       # countries that still use legacy shapes: found, but no geo_code
+        lg = rd("legacy_units.csv")
+        p, d = lg[lg["level"] == "province"], lg[lg["level"] == "district"]
+        if len(p):
+            rp = pd.concat([rp, pd.DataFrame({"country": p["country"], "province": p["province"], "geo_code": None})], ignore_index=True)
+        if len(d):
+            rdist = pd.concat([rdist, pd.DataFrame({"country": d["country"], "province": d["province"], "district": d["district"], "geo_code": None})], ignore_index=True)
+    alias = {}
+    if ex("crosswalk_country.csv"):
+        cw = rd("crosswalk_country.csv")
+        alias = {_gk(a): _gk(b) for a, b in zip(cw["raw_name"], cw["std_country"])}
+    xw = {}
+    if ex("crosswalk_geonames.csv"):
+        x = rd("crosswalk_geonames.csv")
+        for r in x.itertuples(index=False):
+            xw.setdefault((_gk(r.country), _gk(r.province), _gk(r.district)), r)
+    rdist = rdist.reset_index(drop=True)
+    ref = {"alias": alias, "xw": xw, "cs": set(_gk(c) for c in rc["country"]), "dist": {}, "cd": {}, "by_code": {}}
+    for r in rdist.itertuples(index=False):
+        ck, pk, dk = _gk(r.country), _gk(r.province), _gk(r.district)
+        ref["dist"].setdefault((ck, pk, dk), (r.country, r.province, r.district, r.geo_code))
+        ref["cd"].setdefault((ck, dk), []).append((r.country, r.province, r.district, r.geo_code))
+        if r.geo_code is not None and r.geo_code == r.geo_code:
+            ref["by_code"].setdefault(r.geo_code, (r.country, r.province, r.district, r.geo_code))
+    return ref
+
+
+def afrogdb_codes(df, ref):
+    """geo_code and geo_match for every row of df (Country, Province, District). Returns (geo_code Series, geo_match Series,
+    DataFrame of the names that were not found, with their number of rows)."""
+    trip = list(zip(df["Country"].tolist(), df["Province"].tolist(), df["District"].tolist()))
+    cache = {}
+    for t in set(trip):
+        c, pv, d = t
+        ck0, pk, dk = _gk(c), _gk(pv), _gk(d)
+        ck = ref["alias"].get(ck0, ck0)
+        status, code = "unmatched", None
+        hit = ref["dist"].get((ck, pk, dk))
+        if hit is not None:
+            status = "exact" if (_gu(c), _gu(pv), _gu(d)) == (_gu(hit[0]), _gu(hit[1]), _gu(hit[2])) else "normalized"
+            code = hit[3]
+        elif ck in ref["cs"]:
+            lst = ref["cd"].get((ck, dk), [])
+            if len(lst) == 1:
+                status, code = "other province", lst[0][3]
+            elif len(lst) > 1:
+                status = "ambiguous"
+        if status in ("unmatched", "ambiguous", "other province"):
+            r = ref["xw"].get((ck0, pk, dk))
+            if r is not None:
+                dec = str(r.decision).strip().lower() if r.decision == r.decision and r.decision is not None else ""
+                if dec == "no_shape":
+                    status, code = "no shape", None
+                elif dec in ("ok", "auto"):
+                    gc = r.geo_code if r.geo_code == r.geo_code else None
+                    tgt = ref["by_code"].get(gc) if gc else None
+                    if tgt is not None:
+                        status, code = ("crosswalk" if dec == "ok" else "crosswalk (auto)"), tgt[3]
+                    elif r.std_district == r.std_district and r.std_district is not None:
+                        status, code = ("crosswalk" if dec == "ok" else "crosswalk (auto)"), None
+        cache[t] = (code if status in _GEO_FOUND else None, status)
+    codes = pd.Series([cache[t][0] for t in trip], index=df.index, dtype=object)
+    match = pd.Series([cache[t][1] for t in trip], index=df.index, dtype=object)
+    nf = match[~match.isin(_GEO_FOUND)]
+    un = pd.DataFrame({"Country": df.loc[nf.index, "Country"], "Province": df.loc[nf.index, "Province"],
+                       "District": df.loc[nf.index, "District"], "geo_match": nf})
+    if len(un):
+        un = un.groupby(["Country", "Province", "District", "geo_match"], dropna=False).size().reset_index(name="rows").sort_values("rows", ascending=False)
+    else:
+        un["rows"] = []
+    return codes, match, un
 
 
 def load_geo(path):
@@ -3332,6 +3481,8 @@ add("Response", "campaign", "Name of the response / campaign, e.g. GUI-2025-01-N
 add("Index", "tech", "Running record number inside the data-entry batch of a campaign (1 = first row).", "Internal; no analytical meaning.")
 add("SIAMTH", "tech", "Month of the SIA (1-12).", "Same as the month of SIA_date for 98% of records.")
 add("check_dp", "tech", "Helper key used to find duplicated records: formula joining Country, Province, District, SIA_date, TotalNbrVaccPolio and Response.", "Internal. A live formula in the admin data; it follows the columns, so keep it when columns are added.")
+add("geo_code", "tech", "AFROGDB district code of the Country / Province / District (for example NGA-SOK-WAW), found with the AFRO-Geo-Reference rules (exact name, same name ignoring accents and punctuation, the one district of that name in another province, or a reviewed crosswalk decision).", "Empty when the name is not in AFROGDB, and for countries that still use legacy shapes. The names themselves are not changed by this column. Use it to join admin data to LQAS, IM and the maps.")
+add("geo_match", "tech", "How geo_code was found: exact, normalized, other province, crosswalk, crosswalk (auto); or unmatched, ambiguous, no shape.", "Rebuilt on every run; names listed as not found are in review/afrogdb_unmatched.csv of the build.")
 add("AFRO_block", "tech", "Programme block of the country: WA (West Africa), LCB (Lake Chad Basin), ESA (East and Southern Africa), DRC, CA (Central Africa).", "'LBC' appears for 25 records of the Central African Republic: it should be LCB.")
 add("prov_candidates", "tech", "Helper column used when the province names were repaired.", "Empty.")
 
