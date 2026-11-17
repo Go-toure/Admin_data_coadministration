@@ -546,7 +546,7 @@ def cmd_build(a):
             auto_names = [n for n, _, _ in sm.auto_candidates(WORK / "submissions")]
             m["build"]["submissions_auto"] = auto_names
             if auto_names:
-                log("Submissions: %d file(s) taken by %s (nobody decided on them, only harmless findings): %s" % (len(auto_names), sm.AUTO_RULE, ", ".join(auto_names)))
+                log("Submissions: %d file(s) taken by the automatic rules 1 to 4 (nobody decided on them; a file with findings brings only its clean records, the rest is held back, see Held_back_records): %s" % (len(auto_names), ", ".join(auto_names)))
         if acc:
             log("Submissions: %d accepted file(s) will be added to this build: %s" % (len(acc), ", ".join(n for n, _ in acc)))
             for _, pth in acc:
@@ -640,7 +640,7 @@ def cmd_check(a):
     if added:
         info.append("records added from accepted submissions (%s): %d" % (", ".join(m["build"].get("submissions") or []), added))
     if m["build"].get("submissions_auto"):
-        info.append("files taken by automatic rule 1 (no person decided on them): %s" % ", ".join(m["build"]["submissions_auto"]))
+        info.append("files taken by the automatic rules (no person decided on them): %s" % ", ".join(m["build"]["submissions_auto"]))
     led = m["build"].get("submissions_ledger")
     if led and led != "adminops":
         warn.append("the decisions on the submissions were not read from the Operations Center (%s): files accepted in the app are not in this build" % led)
