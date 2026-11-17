@@ -1841,7 +1841,11 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     if len(iss) and "severity" in iss.columns:
         for _, r_ in iss[iss["severity"] == "Error"].iterrows():
             err_rows.setdefault(r_["Excel_row"], []).append(str(r_.get("check_label") or r_.get("check")))
-    bad_rows = set(det["bad_numbers"]["Row_in_file"]) if det["bad_numbers"] is not None and len(det["bad_numbers"]) else set()
+    # a record is held for a text where a figure of the target or of the children vaccinated should be; text in a calculated column (coverage, wastage,
+    # proportions, which the build recalculates, or an age-group label) does not hold it (a #DIV/0! of the country's own formulas, for example)
+    core_ = {"TotPop", "PopPolio", "TotalNbrVaccPolio", "Tot_Vacc_nOPV2", "Total_Vacc_bOPV"}
+    bn_ = det["bad_numbers"]
+    bad_rows = set(bn_.loc[bn_["Column"].isin(core_), "Row_in_file"]) if bn_ is not None and len(bn_) else set()
     hold = []
     for i in range(len(P)):
         r_ = []
@@ -1849,7 +1853,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         if rr_ in err_rows:
             r_.append("validation error: " + ", ".join(sorted(set(err_rows[rr_]))))
         if rr_ in bad_rows:
-            r_.append("a figure is not a number")
+            r_.append("the target or the number vaccinated is not a number")
         miss = [c for c in ("Country", "Province", "District", "SIA_date", "Round_Add", "Response", "Vaccine_type") if c in P.columns and
                 (pd.isna(P.at[i, c]) if c == "SIA_date" else is_empty(P.at[i, c]))]
         if miss:
