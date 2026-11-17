@@ -1953,7 +1953,8 @@ def apply_corrections(df, path):
     """DECIDED CORRECTIONS. A file of corrections a person decided (columns Country, Province, District, Response, Round_Add, SIA_date, Column, Found, Restored, and
     Reason, Decided_by, Decided_on) is applied to the data. A record is found by its identity and the date it has NOW (SIA_date of the line, as found); a change
     is made only when the cell still holds the value in `Found` (a line already applied, or a record changed since, is skipped and said so), so the file can stay
-    in place and the build can run again. Nothing is guessed: the new values are the decision. Returns (changes, report): changes = [(index, column, new value,
+    in place and the build can run again. A line without District applies to the whole campaign round (every record of Country + Response + Round_Add, optionally
+    one SIA_date), for example to give it the name the lookup has. Nothing is guessed: the new values are the decision. Returns (changes, report): changes = [(index, column, new value,
     found, reason, line)], report = {"applied", "already", "skipped": [(line, why)]}."""
     cor = pd.read_csv(path, dtype=str, keep_default_na=False)
     miss = [c for c in CORRECTION_COLS if c not in cor.columns]
@@ -1968,13 +1969,52 @@ def apply_corrections(df, path):
     # a record whose date the file corrects is found under its new date too, so that the same file can be used again after the correction is in the data
     newdate = {"|".join(_corr_text(r[c]) for c in ident) + "|" + _corr_text(r["SIA_date"]): _corr_text(r["Restored"])
                for _, r in cor.iterrows() if r["Column"].strip() == "SIA_date"}
+    ncty, nresp, nrnd, ndate = (df[c].map(_corr_text) for c in ("Country", "Response", "Round_Add", "SIA_date"))
     for n, r in cor.reset_index(drop=True).iterrows():
         line = n + 2
+        col = r["Column"].strip()
+        if not r["District"].strip():
+            # CAMPAIGN-WIDE line (District empty): every record of Country + Response + Round_Add (+ SIA_date when given) is changed; used to give a campaign
+            # the name the lookup has. `Found` is required and is the guard of every record.
+            if not r["Found"].strip() or not (r["Country"].strip() and r["Response"].strip() and r["Round_Add"].strip()):
+                skipped.append((line, "a line without District needs Country, Response, Round_Add and Found"))
+                continue
+            m = (ncty == _corr_text(r["Country"])) & (nresp == _corr_text(r["Response"])) & (nrnd == _corr_text(r["Round_Add"]))
+            if r["SIA_date"].strip():
+                m &= ndate == _corr_text(r["SIA_date"])
+            if col not in df.columns:
+                skipped.append((line, "no column %s in the data" % col))
+            elif not m.any():
+                m2 = (ncty == _corr_text(r["Country"])) & (nrnd == _corr_text(r["Round_Add"]))
+                if col == "Response" and (m2 & (nresp == _corr_text(r["Restored"]))).any():
+                    already += 1
+                else:
+                    skipped.append((line, "no record of %s %s %s" % (r["Country"], r["Response"], r["Round_Add"])))
+            else:
+                bad = 0
+                for i in df.index[m]:
+                    cur, new = _corr_text(df.at[i, col]), _corr_text(r["Restored"])
+                    if cur == new:
+                        already += 1
+                    elif cur != _corr_text(r["Found"]):
+                        bad += 1
+                    else:
+                        v = r["Restored"].strip()
+                        if col == "SIA_date":
+                            v = pd.Timestamp(v).to_pydatetime()
+                        elif re.fullmatch(r"-?\d+", v):
+                            v = int(v)
+                        elif re.fullmatch(r"-?\d*\.\d+", v):
+                            v = float(v)
+                        changes.append((i, col, v, df.at[i, col], "%s (decided by %s, %s)" % (r.get("Reason", "") or "decided correction", r.get("Decided_by", "") or "?", r.get("Decided_on", "") or "?"), line))
+                        applied += 1
+                if bad:
+                    skipped.append((line, "%d record(s) hold another value than %s: not applied" % (bad, r["Found"])))
+            continue
         k = "|".join(_corr_text(r[c]) for c in ident) + "|" + _corr_text(r["SIA_date"])
         hit = where.get(k, [])
         if not hit and k in newdate:
             hit = where.get("|".join(_corr_text(r[c]) for c in ident) + "|" + newdate[k], [])
-        col = r["Column"].strip()
         if col not in df.columns:
             skipped.append((line, "no column %s in the data" % col))
         elif not hit:
