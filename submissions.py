@@ -2795,11 +2795,175 @@ def summary(out_root, audit=None):
     return out
 
 
+def writable(path, log=print):
+    """The path itself, or the same name with the time added when the file is locked (open in Excel): a report is never lost because it was open."""
+    p = Path(path)
+    try:
+        with open(p, "ab"):
+            pass
+        return p
+    except PermissionError:
+        alt = p.with_name("%s_%s%s" % (p.stem, dt.datetime.now().strftime("%H%M%S"), p.suffix))
+        log("NOTE: %s is open in another program (Excel?): written as %s instead; close it and run again to replace it." % (p.name, alt.name))
+        return alt
+    except OSError:
+        return p
+
+
+PENDING_DAYS = 15
+
+
+def _pkey(country, campaign, rnd):
+    return "%s|%s|%s" % (str(country).strip().upper(), str(campaign).strip(), str(rnd).strip())
+
+
+def pending(out_root, nodata, days=PENDING_DAYS, since="2025-01-01", today=None, update=True, source="", live=None, near_days=10, near_min=5):
+    """PENDING ADMIN DATA. A lookup round whose admin data are not in the live file `days` days after its start (15 by default) is marked pending, so the
+    data can be followed until they arrive. `nodata` is the table 'lookup rounds with no records in the data' (builder.lookup_crosscheck(live, lookup)[1]:
+    Country, OBR Name, Round Number, Vaccines, Round Start Date, Round Status, Response_in_data).
+    What is pending is told apart: nothing received at all (ask the country), or received in a submitted file but not in the live file yet (a decision, the build or a
+    correction is what is missing). A register (pending_register.json) keeps the date each round was first flagged, when it was resolved (the data
+    arrived in the live file) and the rounds a person closed (the round did not take place); it is the follow-up list. Rounds that started before `since` are
+    kept in a reference sheet, they are old gaps and not pending. With `live` (the live file) a round of a country that has live records within `near_days` days of the
+    planned start (at least `near_min`, 5) is not asked of the country: the data may be there under another campaign name or date, so it goes to the sheet Check_other_name (a person aligns
+    the names), never to the country's list. Returns {sheet name: DataFrame}."""
+    out_root = Path(out_root)
+    near = {}
+    if live is not None and len(live) and {"Country", "SIA_date"} <= set(live.columns):
+        ld = pd.to_datetime(live["SIA_date"].astype(str).str[:10], errors="coerce")
+        for c_, g_ in pd.DataFrame({"c": live["Country"].astype(str).str.strip().str.upper(), "d": ld}).dropna().groupby("c"):
+            near[c_] = np.sort(g_["d"].values.astype("datetime64[D]"))
+    today = pd.Timestamp(today) if today else pd.Timestamp(dt.date.today())
+    reg_path = out_root / "pending_register.json"
+    try:
+        reg = json.loads(reg_path.read_text(encoding="utf-8")) if reg_path.is_file() else {}
+    except Exception:
+        reg = {}
+    reg.setdefault("rounds", {})
+    ledger = load_ledger(out_root)
+    st = {e["name"]: e for e in ledger["files"].values()}
+    rep = out_root / "Submissions_report.xlsx"
+    cv = None
+    if rep.is_file():
+        try:
+            cv = pd.read_excel(rep, sheet_name="Campaigns_vs_lookup")
+        except Exception:
+            cv = None
+
+    def rk(x):
+        return re.sub(r"[^a-z0-9]", "", str(x).lower())
+
+    def rnum(x):
+        m = re.search(r"(\d+)", str(x))
+        return int(m.group(1)) if m else None
+    if cv is not None and len(cv):
+        cv = cv.assign(_k=cv["Response"].map(rk), _r=cv["Round_Add"].map(rnum))
+    rows, old, notyet = [], [], []
+    for _, r in (nodata if nodata is not None else pd.DataFrame()).iterrows():
+        start = pd.to_datetime(str(r["Round Start Date"])[:10], errors="coerce")
+        if pd.isna(start):
+            continue
+        key = _pkey(r["Country"], r["OBR Name"], r["Round Number"])
+        base = {"Country": str(r["Country"]).strip().upper(), "Campaign": r["OBR Name"], "Round": r["Round Number"], "Vaccines": r.get("Vaccines", ""),
+                "Planned_start": start.strftime("%Y-%m-%d"), "Due_date": (start + pd.Timedelta(days=days)).strftime("%Y-%m-%d"),
+                "Live_file": "campaign is in the live file under other dates" if str(r.get("Response_in_data", "")).startswith("yes") else "no records of this campaign"}
+        if start < pd.Timestamp(since):
+            old.append(dict(base, Days_since_start=int((today - start).days)))
+            continue
+        if start + pd.Timedelta(days=days) > today:
+            notyet.append(dict(base, Days_to_due=int((start + pd.Timedelta(days=days) - today).days)))
+            continue
+        files, n_new = [], 0
+        if cv is not None and len(cv):
+            hit = cv[(cv["_k"] == rk(r["OBR Name"])) & (cv["_r"] == rnum(r["Round Number"]))]
+            files = [x for x in hit["File"].dropna().unique() if x in st and st[x].get("present", True) and not st[x].get("superseded")]
+            n_new = max([int(st[x].get("new") or 0) for x in files] or [0])
+        n_near = 0
+        if near.get(base["Country"]) is not None:
+            arr = near[base["Country"]]
+            n_near = int(((arr >= np.datetime64(start.date() - pd.Timedelta(days=near_days).to_pytimedelta())) & (arr <= np.datetime64(start.date() + pd.Timedelta(days=near_days).to_pytimedelta()))).sum())
+        if not files and n_near >= near_min:
+            status, nxt = "Check: live records of the country near the start date", ("The live file has %d record(s) of this country within %d days of the planned start: the data may be there under another campaign name or date; "
+                                                                                      "align the name (python admin.py find --country ... --date ...) before asking the country" % (n_near, near_days))
+        elif not files:
+            status, nxt = "Pending: nothing received", "Ask the country for the admin data of this round (AFRO template), or for confirmation that the round did not take place"
+        elif n_new:
+            status, nxt = "Received, not in the live file yet", "A submitted file has new records of this round: they go in with the next build (automatic rules or a decision in the Operations Center)"
+        else:
+            status, nxt = "Received, not in the live file yet", "A submitted file has records of this round but none can be added now (held back or already there under another name): see the country's feedback"
+        age = int((today - start).days)
+        rows.append(dict(base, Days_since_start=age, Days_overdue=age - days, Age_group=("15-30 days" if age <= 30 else "31-90 days" if age <= 90 else "over 90 days"),
+                         Status=status, Live_records_near_start=n_near, Files="; ".join(files[:3]), New_records_in_best_file=n_new, Next_step=nxt, _key=key))
+    cur = pd.DataFrame(rows)
+    # the register: first flagged, resolved, closed
+    now = today.strftime("%Y-%m-%d")
+    seen = set(cur["_key"]) if len(cur) else set()
+    if update:
+        for k in seen:
+            e = reg["rounds"].setdefault(k, {"first_flagged": now})
+            e["last_seen"] = now
+            e.pop("resolved", None)
+        for k, e in reg["rounds"].items():
+            if k not in seen and not e.get("resolved") and not e.get("closed"):
+                e["resolved"] = now
+        reg["updated"] = now
+        reg["source"] = source
+        reg["days"] = days
+        reg_path.write_text(json.dumps(reg, indent=1, ensure_ascii=False), encoding="utf-8")
+    if len(cur):
+        cur["First_flagged"] = cur["_key"].map(lambda k: reg["rounds"].get(k, {}).get("first_flagged", now))
+        cur["_closed"] = cur["_key"].map(lambda k: bool(reg["rounds"].get(k, {}).get("closed")))
+    out = {}
+    cols = ["Country", "Campaign", "Round", "Vaccines", "Planned_start", "Due_date", "Days_since_start", "Days_overdue", "Age_group", "Status", "Live_file",
+            "Live_records_near_start", "First_flagged", "Files", "New_records_in_best_file", "Next_step"]
+    live_ = cur[~cur["_closed"]] if len(cur) else cur
+    pend = live_[live_["Status"] == "Pending: nothing received"] if len(live_) else live_
+    chk = live_[live_["Status"].str.startswith("Check:")] if len(live_) else live_
+    recv = live_[live_["Status"].str.startswith("Received")] if len(live_) else live_
+    out["Pending_now"] = pend[cols].sort_values(["Country", "Planned_start"]) if len(pend) else pd.DataFrame(columns=cols)
+    out["Check_other_name"] = chk[cols].sort_values(["Country", "Planned_start"]) if len(chk) else pd.DataFrame(columns=cols)
+    out["Received_not_in_live"] = recv[cols].sort_values(["Country", "Planned_start"]) if len(recv) else pd.DataFrame(columns=cols)
+    out["By_country"] = (pend.groupby("Country").agg(Rounds_pending=("Campaign", "size"), Oldest_start=("Planned_start", "min"), Max_days_since_start=("Days_since_start", "max"))
+                         .reset_index().sort_values("Rounds_pending", ascending=False)) if len(pend) else pd.DataFrame(columns=["Country", "Rounds_pending", "Oldest_start", "Max_days_since_start"])
+    res = [{"Round": k, "First_flagged": e.get("first_flagged"), "Resolved_on": e.get("resolved")} for k, e in reg["rounds"].items() if e.get("resolved")]
+    out["Resolved"] = pd.DataFrame(res, columns=["Round", "First_flagged", "Resolved_on"])
+    clo = [{"Round": k, "Closed_on": e["closed"].get("on"), "By": e["closed"].get("by"), "Note": e["closed"].get("note")} for k, e in reg["rounds"].items() if e.get("closed")]
+    out["Closed"] = pd.DataFrame(clo, columns=["Round", "Closed_on", "By", "Note"])
+    out["Not_yet_due"] = pd.DataFrame(notyet).sort_values("Planned_start") if notyet else pd.DataFrame(columns=["Country", "Campaign", "Round", "Planned_start", "Due_date", "Days_to_due"])
+    out["Older_rounds_no_data"] = pd.DataFrame(old).sort_values(["Country", "Planned_start"]) if old else pd.DataFrame(columns=["Country", "Campaign", "Round", "Planned_start"])
+    out = {"Read_me": pd.DataFrame({"Pending admin data": [
+        "A round of the lookup (GPEI) is PENDING when its admin data are not in the live file %d days after its planned start date (checked on %s, rounds that started on or after %s)." % (days, now, since),
+        "Pending_now: nothing received for the round, in no submitted file, and no live record of the country near its start date: ask the country. Check_other_name: nothing received, but the live file has records of the country near the start date (the round may be there under another campaign name or date): a person checks and aligns before the country is asked. Received_not_in_live: a submitted file holds records of the round, they are not in the live file yet (next build, a decision, or a correction by the country).",
+        "Not_yet_due: rounds that started less than %d days ago, to watch. Older_rounds_no_data: rounds before %s with no data, kept for reference. Resolved: the data arrived in the live file. Closed: a person said the round did not take place or is not expected." % (days, since),
+        "First_flagged is the date the engine first saw the round pending (pending_register.json, kept in the workspace). To close a round: python admin.py submissions pending --close \"COUNTRY|campaign|Round n\" --note \"why\".",
+        "Source of the live and lookup rounds: %s." % (source or "the last inspection")]}), **out}
+    return out
+
+
+def pending_close(out_root, targets, note="", by=""):
+    """Mark pending rounds as closed (the round did not take place, or no data are expected). A target is a piece of 'COUNTRY|campaign|Round n' (not case sensitive);
+    it must match exactly one round of the register. Returns [(target, message)]."""
+    out_root = Path(out_root)
+    reg_path = out_root / "pending_register.json"
+    reg = json.loads(reg_path.read_text(encoding="utf-8")) if reg_path.is_file() else {"rounds": {}}
+    res = []
+    for t in targets:
+        hits = [k for k in reg["rounds"] if t.lower() in k.lower()]
+        if len(hits) != 1:
+            res.append((t, "NOT DONE: %s" % ("no pending round matches (run 'submissions pending' first)" if not hits else "%d rounds match, be more precise: %s" % (len(hits), "; ".join(hits[:4])))))
+            continue
+        reg["rounds"][hits[0]]["closed"] = {"on": dt.datetime.now().strftime("%Y-%m-%d"), "by": by, "note": note}
+        res.append((t, "closed: %s" % hits[0]))
+    reg_path.write_text(json.dumps(reg, indent=1, ensure_ascii=False), encoding="utf-8")
+    return res
+
+
 FR_MATTER = {"target population missing": "population cible manquante", "failed a check": "contrôle non satisfait", "empty fields": "champs vides",
              "text instead of numbers": "texte à la place de nombres", "other country": "autre pays", "unit not clear": "unité pas claire",
              "same place and date, other figures": "même lieu et même date, autres chiffres", "campaign name differs": "nom de campagne différent",
              "round differs": "round différent", "vaccine differs from the lookup": "vaccin différent du lookup", "wrong folder": "mauvais dossier",
-             "sheet not read": "feuille non lue", "error values in calculated columns": "valeurs en erreur dans des colonnes calculées"}
+             "sheet not read": "feuille non lue", "error values in calculated columns": "valeurs en erreur dans des colonnes calculées",
+             "data not received": "données non reçues"}
 
 
 def _top(series, n=3):
@@ -2919,6 +3083,25 @@ def feedback(out_root, ledger=None):
                     "vaccinated figures, so nothing is held back and no new file is needed; the country can clean them at the source (an error such as #DIV/0! in its own formulas)",
                     fr=("%d cellules qui ne sont pas des nombres dans %s" % (sum(soft.values()), ", ".join(sorted(soft)[:6])) if soft else "cellules qui ne sont pas des nombres",
                         "À titre d'information : ces cellules sont dans des colonnes calculées ou de vaccins autres que la polio, pas dans la population cible ni le nombre de vaccinés de la polio ; rien n'est bloqué et aucun nouveau fichier n'est nécessaire"))
+    # pending admin data: rounds of the lookup with nothing received 15 days after their start (written by 'inspect' / 'pending' in Pending_admin_data.xlsx)
+    pp = Path(out_root) / "Pending_admin_data.xlsx"
+    if pp.is_file():
+        try:
+            pn = pd.read_excel(pp, sheet_name="Pending_now", dtype=object)
+        except Exception:
+            pn = pd.DataFrame()
+        days = PENDING_DAYS
+        try:
+            days = int(json.loads((Path(out_root) / "pending_register.json").read_text(encoding="utf-8")).get("days") or PENDING_DAYS)
+        except Exception:
+            pass
+        for _, r in pn.iterrows():
+            lab = "%s %s" % (r["Campaign"], r["Round"])
+            add(str(r["Country"]).strip().upper(), "(no file received)", "data not received", "",
+                "No admin data received for %s (planned start %s, %s days ago; the data are due %d days after the start)" % (lab, r["Planned_start"], r["Days_since_start"], days),
+                "Send the admin data of this round (AFRO template), or tell us if the round did not take place",
+                fr=("Aucune donnée administrative reçue pour %s (début prévu le %s, il y a %s jours ; les données sont attendues %d jours après le début)" % (lab, r["Planned_start"], r["Days_since_start"], days),
+                    "Envoyer les données administratives de ce round (modèle AFRO), ou nous dire si le round n'a pas eu lieu"))
     f = pd.DataFrame(rows, columns=["Country", "File", "Matter", "Records", "What we found", "What the country does", "Constat", "Ce que le pays fait", "Sujet"]).drop_duplicates(
         ["Country", "File", "Matter", "What we found"]).sort_values(["Country", "File", "Matter"])
     lines = ["# What each country has to correct or confirm", "",
@@ -2960,6 +3143,15 @@ def feedback_files(out_root, folder, ledger=None):
     f, _ = feedback(out_root, ledger)
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
+    # the workbooks of an earlier run go to _previous: only the current ones are in the folder, so nothing stale is sent by mistake
+    old = list(folder.glob("Feedback_*.xlsx"))
+    if old:
+        (folder / "_previous").mkdir(exist_ok=True)
+        for o_ in old:
+            try:
+                shutil.move(str(o_), str(folder / "_previous" / o_.name))
+            except Exception:
+                pass
     keep = ["File", "Province", "District", "Admin_3", "SIA_date", "Response", "Round_Add", "Vaccine_type", "PopPolio", "TotalNbrVaccPolio", "Hold_reason"]
     out = []
     today = dt.datetime.now().strftime("%Y-%m-%d")
@@ -2986,6 +3178,7 @@ def feedback_files(out_root, folder, ledger=None):
         if "SIA_date" in R.columns:
             R["SIA_date"] = pd.to_datetime(R["SIA_date"], errors="coerce").dt.strftime("%Y-%m-%d")
         french = str(c).upper() in FRENCH_COUNTRIES
+        has_files = any((e.get("country_folder") or "") == c and e.get("present", True) and not e.get("superseded") for e in ledger["files"].values())
         if french and "Hold_reason" in R.columns:
             R["Pourquoi non ajouté"] = R["Hold_reason"].map(_fr_reason)
         R = R.rename(columns={"Hold_reason": "Why it was not added"})
@@ -2993,14 +3186,18 @@ def feedback_files(out_root, folder, ledger=None):
         D_fr = d.assign(**{"Action requise": d["Action needed"].map(lambda x: "Non, pour information" if x.startswith("No") else "Oui")})[
             ["File", "Action requise", "Sujet", "Records", "Constat", "Ce que le pays fait"]].rename(columns={"File": "Fichier", "Records": "Enregistrements"})
         intro = pd.DataFrame({"Admin data, %s, %s" % (c, today): [
-            "Thank you for the administrative vaccination data you sent. The records that passed all checks are already in the AFRO admin data file.",
-            "This workbook lists what we could not add yet, and what we ask you to correct or confirm.",
+            ("Thank you for the administrative vaccination data you sent. The records that passed all checks are already in the AFRO admin data file."
+             if has_files else "This workbook lists the campaign rounds of your country for which we have not received administrative vaccination data."),
+            "This workbook lists what we could not add yet, what we have not received, and what we ask you to correct, confirm or send.",
+            ("Matter 'data not received': the round started more than %d days ago and its admin data are not in the AFRO admin data file; please send them (AFRO template), or tell us if the round did not take place." % PENDING_DAYS)
+            if (d["Matter"] == "data not received").any() else "",
             "Sheet 'What to do': one line per file and matter ('Action needed': Yes = we ask you to correct or confirm; No = for your information). Sheet 'Records': the rows concerned (when there are any), with the reason.",
             "Please send the corrected file, or answer the questions in an email; nothing in the live data is changed without your confirmation."] + ([
             "Version française : merci pour les données administratives de vaccination envoyées. Les enregistrements qui ont passé tous les contrôles sont déjà dans le fichier AFRO.",
             "Ce classeur liste ce que nous n'avons pas pu ajouter pour l'instant et ce que nous vous demandons de corriger ou de confirmer (feuille « À faire » ; feuille « Records » : les lignes concernées).",
             "Merci de renvoyer le fichier corrigé ou de répondre par courriel ; rien n'est modifié dans les données sans votre confirmation."] if french else [])})
-        path = folder / ("Feedback_%s_%s%s.xlsx" % (re.sub(r"[^A-Za-z0-9]+", "_", c).strip("_"), today, "" if needs else "_information_only"))
+        intro = intro[intro.iloc[:, 0].astype(str).str.len() > 0]
+        path = writable(folder / ("Feedback_%s_%s%s.xlsx" % (re.sub(r"[^A-Za-z0-9]+", "_", c).strip("_"), today, "" if needs else "_information_only")))
         with pd.ExcelWriter(path, engine="openpyxl") as xw:
             intro.to_excel(xw, sheet_name="Read me", index=False)
             D_en.to_excel(xw, sheet_name="What to do", index=False)
