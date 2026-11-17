@@ -2795,6 +2795,13 @@ def summary(out_root, audit=None):
     return out
 
 
+FR_MATTER = {"target population missing": "population cible manquante", "failed a check": "contrôle non satisfait", "empty fields": "champs vides",
+             "text instead of numbers": "texte à la place de nombres", "other country": "autre pays", "unit not clear": "unité pas claire",
+             "same place and date, other figures": "même lieu et même date, autres chiffres", "campaign name differs": "nom de campagne différent",
+             "round differs": "round différent", "vaccine differs from the lookup": "vaccin différent du lookup", "wrong folder": "mauvais dossier",
+             "sheet not read": "feuille non lue", "error values in calculated columns": "valeurs en erreur dans des colonnes calculées"}
+
+
 def _top(series, n=3):
     vc = series.dropna().astype(str).value_counts().head(n)
     return ", ".join("%s %d" % (k, v) for k, v in vc.items())
@@ -2806,8 +2813,9 @@ def feedback(out_root, ledger=None):
     ledger = ledger or load_ledger(out_root)
     rows = []
 
-    def add(country, file, matter, records, text, action):
-        rows.append({"Country": country, "File": file, "Matter": matter, "Records": records, "What we found": text, "What the country does": action})
+    def add(country, file, matter, records, text, action, fr=None):
+        rows.append({"Country": country, "File": file, "Matter": matter, "Records": records, "What we found": text, "What the country does": action,
+                     "Constat": fr[0] if fr else "", "Ce que le pays fait": fr[1] if fr else "", "Sujet": FR_MATTER.get(matter, matter) if fr else ""})
 
     for h, e in ledger["files"].items():
         if e.get("superseded") or not e.get("present", True) or e.get("status") == "nothing new" and not e.get("aliases"):
@@ -2839,50 +2847,62 @@ def feedback(out_root, ledger=None):
                         lab = sorted({x.split("validation error: ")[1].split("; ")[0] for x in g["_r"] if "validation error: " in x})
                         if any("Target population missing" in x for x in lab):
                             add(ctry, name, "target population missing", n, "%d record(s) of %s have no target population (%s)" % (n, camp, where),
-                                "Fill in the target population (PopPolio) of these districts and send the file again")
+                                "Fill in the target population (PopPolio) of these districts and send the file again",
+                                fr=("%d enregistrement(s) de %s n'ont pas de population cible (%s)" % (n, camp, where), "Renseigner la population cible (PopPolio) de ces districts et renvoyer le fichier"))
                         else:
                             add(ctry, name, "failed a check", n, "%d record(s) of %s fail the check: %s (%s)" % (n, camp, "; ".join(lab) or "see the Issues sheet", where),
-                                "Correct these records and send the file again")
+                                "Correct these records and send the file again",
+                                fr=("%d enregistrement(s) de %s ne passent pas le contrôle : %s (%s)" % (n, camp, "; ".join(lab) or "voir la feuille Issues", where), "Corriger ces enregistrements et renvoyer le fichier"))
                     elif kind == "empty":
                         cols = sorted({c.strip() for x in g["_r"] for c in x.split("missing after standardising: ")[1].split(";")[0].split(",")})
                         add(ctry, name, "empty fields", n, "%d record(s) of %s still have no %s after the lookup was used (%s)" % (n, camp, ", ".join(cols), where),
-                            "Fill in %s for these records" % ", ".join(cols))
+                            "Fill in %s for these records" % ", ".join(cols),
+                            fr=("%d enregistrement(s) de %s n'ont toujours pas de %s après usage du lookup (%s)" % (n, camp, ", ".join(cols), where), "Renseigner %s pour ces enregistrements" % ", ".join(cols)))
                     elif kind == "text":
                         add(ctry, name, "text instead of numbers", n, "%d record(s) of %s have text where the target or the number vaccinated should be (%s)" % (n, camp, where),
-                            "Replace the text by the number")
+                            "Replace the text by the number",
+                            fr=("%d enregistrement(s) de %s contiennent du texte à la place de la population cible ou du nombre de vaccinés (%s)" % (n, camp, where), "Remplacer le texte par le nombre"))
                     elif kind == "country":
                         add(ctry, name, "other country", n, "%d record(s) carry another country than the folder (%s)" % (n, _top(g["Country"])),
-                            "Correct the country or send these records in their own country's folder")
+                            "Correct the country or send these records in their own country's folder",
+                            fr=("%d enregistrement(s) portent un autre pays que le dossier (%s)" % (n, _top(g["Country"])), "Corriger le pays ou envoyer ces enregistrements dans le dossier de leur pays"))
                     elif kind == "several":
                         ex = ", ".join(sorted({str(x) for x in g["District"].dropna()})[:4])
                         add(ctry, name, "unit not clear", n, "%d record(s) of %s have a province and district that match several records of the live file (for example %s)" % (n, camp, ex),
-                            "Say which unit (health zone, sub-district or other level) each of these rows is")
+                            "Say which unit (health zone, sub-district or other level) each of these rows is",
+                            fr=("%d enregistrement(s) de %s ont une province et un district qui correspondent à plusieurs enregistrements du fichier de référence (par exemple %s)" % (n, camp, ex), "Indiquer quelle unité (zone de santé, sous-district ou autre niveau) correspond à chacune de ces lignes"))
                     elif kind == "dup":
                         live = sorted(set(re.findall(r"\(([^,()]+ Rnd\d+), \d{4}-\d\d-\d\d\)", " ".join(g["_r"]))))[:3]
                         add(ctry, name, "same place and date, other figures", n,
                             "%d record(s) of %s look like records already in the live file (%s) with other figures" % (n, camp, ", ".join(live) or "another campaign name or round"),
-                            "Confirm the campaign and round, and which figures are the final ones")
+                            "Confirm the campaign and round, and which figures are the final ones",
+                            fr=("%d enregistrement(s) de %s ressemblent à des enregistrements déjà présents (%s) avec d'autres chiffres" % (n, camp, ", ".join(live) or "autre nom de campagne ou round"), "Confirmer la campagne et le round, et quels chiffres sont les chiffres définitifs"))
         # records matched to the live file under another campaign name or round
         for a_ in e.get("aliases") or []:
             same_round = str(a_["file_round"]).strip().lower() == str(a_["live_round"]).strip().lower()
             if same_round:
                 add(ctry, name, "campaign name differs", a_["records"], "%d record(s) are written as %s %s; the live file has the same districts and dates as %s %s" % (
                     a_["records"], a_["file_name"], a_["file_round"], a_["live_name"], a_["live_round"]),
-                    "Use the live campaign name in the next file (nothing else is needed: the records were matched automatically)")
+                    "Use the live campaign name in the next file (nothing else is needed: the records were matched automatically)",
+                    fr=("%d enregistrement(s) sont écrits %s %s ; le fichier de référence a les mêmes districts et dates sous %s %s" % (a_["records"], a_["file_name"], a_["file_round"], a_["live_name"], a_["live_round"]), "Utiliser le nom de campagne du fichier de référence dans le prochain fichier (rien d'autre n'est nécessaire : les enregistrements ont été rapprochés automatiquement)"))
             else:
                 add(ctry, name, "round differs", a_["records"], "%d record(s) are written as %s %s; the live file has the same districts and dates as %s %s" % (
                     a_["records"], a_["file_name"], a_["file_round"], a_["live_name"], a_["live_round"]),
-                    "Confirm the round (the file says %s, the live file says %s) and which figures are the final ones" % (a_["file_round"], a_["live_round"]))
+                    "Confirm the round (the file says %s, the live file says %s) and which figures are the final ones" % (a_["file_round"], a_["live_round"]),
+                    fr=("%d enregistrement(s) sont écrits %s %s ; le fichier de référence a les mêmes districts et dates sous %s %s" % (a_["records"], a_["file_name"], a_["file_round"], a_["live_name"], a_["live_round"]), "Confirmer le round (le fichier indique %s, le fichier de référence indique %s) et quels chiffres sont les chiffres définitifs" % (a_["file_round"], a_["live_round"])))
         why = str(e.get("why") or "")
         m = re.search(r"vaccine against the lookup: ([^;]+?)(?:; |$)", why)
         if "vaccine_vs_lookup" in codes and m:
-            add(ctry, name, "vaccine differs from the lookup", "", m.group(1).strip(), "Confirm the vaccine used in this campaign")
+            add(ctry, name, "vaccine differs from the lookup", "", m.group(1).strip(), "Confirm the vaccine used in this campaign",
+                fr=("le fichier écrit un vaccin différent de celui du lookup : %s" % m.group(1).strip(), "Confirmer le vaccin utilisé dans cette campagne"))
         if "wrong_place" in codes:
-            add(ctry, name, "wrong folder", "", why.split(";")[0], "Send the file in the folder of the right country, or tell us it is not needed")
+            add(ctry, name, "wrong folder", "", why.split(";")[0], "Send the file in the folder of the right country, or tell us it is not needed",
+                fr=(why.split(";")[0], "Envoyer le fichier dans le dossier du bon pays, ou nous dire qu'il n'est pas nécessaire"))
         if "sheets_skipped" in codes:
             m = re.search(r"not read: ([^;]+)", why)
             add(ctry, name, "sheet not read", "", "sheet(s) with column names that could not be read: %s" % (m.group(1) if m else "?"),
-                "Tell us if these sheets hold admin data; if so, put them in the AFRO template")
+                "Tell us if these sheets hold admin data; if so, put them in the AFRO template",
+                fr=("feuille(s) avec des noms de colonnes qui n'ont pas pu être lues : %s" % (m.group(1) if m else "?"), "Dites-nous si ces feuilles contiennent des données administratives ; si oui, les mettre dans le modèle AFRO"))
         if "non_numbers" in codes:
             bc = e.get("bad_cols") or {}
             core_ = {"TotPop", "PopPolio", "TotalNbrVaccPolio", "Tot_Vacc_nOPV2", "Total_Vacc_bOPV"}
@@ -2890,13 +2910,16 @@ def feedback(out_root, ledger=None):
             soft = {c: n for c, n in bc.items() if c not in core_}
             if hard and not any(r["File"] == name and r["Matter"] == "text instead of numbers" for r in rows):
                 add(ctry, name, "text instead of numbers", sum(hard.values()), "text where a number is expected in %s" % ", ".join("%s (%d cells)" % kv for kv in hard.items()),
-                    "Replace the text by the number")
+                    "Replace the text by the number",
+                    fr=("texte à la place d'un nombre dans %s" % ", ".join("%s (%d cellules)" % kv for kv in hard.items()), "Remplacer le texte par le nombre"))
             if soft or not bc:
                 add(ctry, name, "error values in calculated columns", "", ("%d cells that are not numbers in %s" % (sum(soft.values()), ", ".join(sorted(soft)[:6]))) if soft else
                     (re.search(r"\d+ cell\(s\) that are not numbers", why).group(0) if re.search(r"\d+ cell\(s\) that are not numbers", why) else "cells that are not numbers"),
                     "For information only: these cells are in calculated columns (coverage, wastage, proportions, month) or in columns of other vaccines, not in the polio target or "
-                    "vaccinated figures, so nothing is held back and no new file is needed; the country can clean them at the source (an error such as #DIV/0! in its own formulas)")
-    f = pd.DataFrame(rows, columns=["Country", "File", "Matter", "Records", "What we found", "What the country does"]).drop_duplicates(
+                    "vaccinated figures, so nothing is held back and no new file is needed; the country can clean them at the source (an error such as #DIV/0! in its own formulas)",
+                    fr=("%d cellules qui ne sont pas des nombres dans %s" % (sum(soft.values()), ", ".join(sorted(soft)[:6])) if soft else "cellules qui ne sont pas des nombres",
+                        "À titre d'information : ces cellules sont dans des colonnes calculées ou de vaccins autres que la polio, pas dans la population cible ni le nombre de vaccinés de la polio ; rien n'est bloqué et aucun nouveau fichier n'est nécessaire"))
+    f = pd.DataFrame(rows, columns=["Country", "File", "Matter", "Records", "What we found", "What the country does", "Constat", "Ce que le pays fait", "Sujet"]).drop_duplicates(
         ["Country", "File", "Matter", "What we found"]).sort_values(["Country", "File", "Matter"])
     lines = ["# What each country has to correct or confirm", "",
              "Written by the engine from the last inspection (`python admin.py submissions feedback`). Records that passed every check are already in the live file; this list is about the others.", ""]
@@ -2909,6 +2932,24 @@ def feedback(out_root, ledger=None):
     if not len(f):
         lines.append("Nothing to send back.")
     return f, "\n".join(lines) + "\n"
+
+
+FRENCH_COUNTRIES = {"ALGERIA", "BENIN", "BURKINA FASO", "BURUNDI", "CAMEROON", "CENTRAL AFRICAN REPUBLIC", "CHAD", "COMOROS", "CONGO", "COTE D'IVOIRE",
+                    "CÔTE D'IVOIRE", "DEMOCRATIC REPUBLIC OF THE CONGO", "GABON", "GUINEA", "MADAGASCAR", "MALI", "MAURITANIA", "NIGER", "SENEGAL", "TOGO"}
+FR_REASON = (("validation error: ", "erreur de validation : "), ("Target population missing or zero", "population cible manquante ou nulle"),
+             ("Missing key field", "champ clé manquant"), ("missing after standardising: ", "manquant après standardisation : "),
+             ("the target or the number vaccinated is not a number", "la population cible ou le nombre de vaccinés n'est pas un nombre"),
+             ("record of another country than the folder", "enregistrement d'un autre pays que le dossier"),
+             ("same names as several live records, none identical (not added): live rows", "mêmes noms que plusieurs enregistrements du fichier de référence, aucun identique (non ajouté) : lignes"),
+             ("possible duplicate: same place, date and vaccine as a live record of another campaign name or round, other figures: live row",
+              "doublon possible : même lieu, date et vaccin qu'un enregistrement d'une autre campagne ou d'un autre round, autres chiffres : ligne"))
+
+
+def _fr_reason(t):
+    t = str(t)
+    for a, b in FR_REASON:
+        t = t.replace(a, b)
+    return t
 
 
 def feedback_files(out_root, folder, ledger=None):
@@ -2944,16 +2985,27 @@ def feedback_files(out_root, folder, ledger=None):
         R = R[[k for k in keep if k in R.columns]].drop_duplicates()
         if "SIA_date" in R.columns:
             R["SIA_date"] = pd.to_datetime(R["SIA_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        french = str(c).upper() in FRENCH_COUNTRIES
+        if french and "Hold_reason" in R.columns:
+            R["Pourquoi non ajouté"] = R["Hold_reason"].map(_fr_reason)
         R = R.rename(columns={"Hold_reason": "Why it was not added"})
+        D_en = d.drop(columns=["Country", "Constat", "Ce que le pays fait", "Sujet"])
+        D_fr = d.assign(**{"Action requise": d["Action needed"].map(lambda x: "Non, pour information" if x.startswith("No") else "Oui")})[
+            ["File", "Action requise", "Sujet", "Records", "Constat", "Ce que le pays fait"]].rename(columns={"File": "Fichier", "Records": "Enregistrements"})
         intro = pd.DataFrame({"Admin data, %s, %s" % (c, today): [
             "Thank you for the administrative vaccination data you sent. The records that passed all checks are already in the AFRO admin data file.",
             "This workbook lists what we could not add yet, and what we ask you to correct or confirm.",
             "Sheet 'What to do': one line per file and matter ('Action needed': Yes = we ask you to correct or confirm; No = for your information). Sheet 'Records': the rows concerned (when there are any), with the reason.",
-            "Please send the corrected file, or answer the questions in an email; nothing in the live data is changed without your confirmation."]})
+            "Please send the corrected file, or answer the questions in an email; nothing in the live data is changed without your confirmation."] + ([
+            "Version française : merci pour les données administratives de vaccination envoyées. Les enregistrements qui ont passé tous les contrôles sont déjà dans le fichier AFRO.",
+            "Ce classeur liste ce que nous n'avons pas pu ajouter pour l'instant et ce que nous vous demandons de corriger ou de confirmer (feuille « À faire » ; feuille « Records » : les lignes concernées).",
+            "Merci de renvoyer le fichier corrigé ou de répondre par courriel ; rien n'est modifié dans les données sans votre confirmation."] if french else [])})
         path = folder / ("Feedback_%s_%s%s.xlsx" % (re.sub(r"[^A-Za-z0-9]+", "_", c).strip("_"), today, "" if needs else "_information_only"))
         with pd.ExcelWriter(path, engine="openpyxl") as xw:
             intro.to_excel(xw, sheet_name="Read me", index=False)
-            d.drop(columns=["Country"]).to_excel(xw, sheet_name="What to do", index=False)
+            D_en.to_excel(xw, sheet_name="What to do", index=False)
+            if french:
+                D_fr.to_excel(xw, sheet_name="À faire", index=False)
             if len(R):
                 R.to_excel(xw, sheet_name="Records", index=False)
             for ws in xw.book.worksheets:
