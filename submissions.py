@@ -2911,6 +2911,65 @@ def feedback(out_root, ledger=None):
     return f, "\n".join(lines) + "\n"
 
 
+def feedback_files(out_root, folder, ledger=None):
+    """One workbook per country, ready to send: sheet 'What to do' (what we found and what the country does, by file) and sheet 'Records' (the held-back
+    records themselves: province, district, campaign, round, date, the figures and the reason), so the focal point can correct the rows and send them back.
+    Returns [(country, path)]."""
+    ledger = ledger or load_ledger(out_root)
+    f, _ = feedback(out_root, ledger)
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    keep = ["File", "Province", "District", "Admin_3", "SIA_date", "Response", "Round_Add", "Vaccine_type", "PopPolio", "TotalNbrVaccPolio", "Hold_reason"]
+    out = []
+    today = dt.datetime.now().strftime("%Y-%m-%d")
+    INFO_ONLY = {"campaign name differs", "error values in calculated columns"}
+    for c, d in f.groupby("Country", sort=True):
+        d = d.copy()
+        d.insert(2, "Action needed", d["Matter"].map(lambda m: "No, for information" if m in INFO_ONLY else "Yes"))
+        d = d.sort_values(["Action needed", "File"], ascending=[False, True])
+        needs = bool((d["Action needed"] == "Yes").any())
+        recs = []
+        for h, e in ledger["files"].items():
+            if (e.get("country_folder") or "") != c or e.get("superseded") or not e.get("present", True) or not e.get("prepared"):
+                continue
+            hp = Path(out_root) / str(e["prepared"]).replace(".xlsx", "_held.xlsx")
+            if hp.is_file() and int(e.get("held_new") or 0) > 0:
+                try:
+                    x = pd.read_excel(hp, dtype=object)
+                    x.insert(0, "File", e["name"])
+                    recs.append(x)
+                except Exception:
+                    pass
+        R = pd.concat(recs, ignore_index=True) if recs else pd.DataFrame(columns=keep)
+        R = R[[k for k in keep if k in R.columns]].drop_duplicates()
+        if "SIA_date" in R.columns:
+            R["SIA_date"] = pd.to_datetime(R["SIA_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        R = R.rename(columns={"Hold_reason": "Why it was not added"})
+        intro = pd.DataFrame({"Admin data, %s, %s" % (c, today): [
+            "Thank you for the administrative vaccination data you sent. The records that passed all checks are already in the AFRO admin data file.",
+            "This workbook lists what we could not add yet, and what we ask you to correct or confirm.",
+            "Sheet 'What to do': one line per file and matter ('Action needed': Yes = we ask you to correct or confirm; No = for your information). Sheet 'Records': the rows concerned (when there are any), with the reason.",
+            "Please send the corrected file, or answer the questions in an email; nothing in the live data is changed without your confirmation."]})
+        path = folder / ("Feedback_%s_%s%s.xlsx" % (re.sub(r"[^A-Za-z0-9]+", "_", c).strip("_"), today, "" if needs else "_information_only"))
+        with pd.ExcelWriter(path, engine="openpyxl") as xw:
+            intro.to_excel(xw, sheet_name="Read me", index=False)
+            d.drop(columns=["Country"]).to_excel(xw, sheet_name="What to do", index=False)
+            if len(R):
+                R.to_excel(xw, sheet_name="Records", index=False)
+            for ws in xw.book.worksheets:
+                for col in ws.columns:
+                    w = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col[:60])
+                    ws.column_dimensions[col[0].column_letter].width = min(max(10, w + 2), 70)
+                from openpyxl.styles import Alignment, Font
+                for cell in ws[1]:
+                    cell.font = Font(bold=True)
+                for row in ws.iter_rows(min_row=2):
+                    for cell in row:
+                        cell.alignment = Alignment(wrap_text=True, vertical="top")
+        out.append((c, str(path)))
+    return out
+
+
 def accepted_files(out_root, auto=False):
     """Prepared record files of the accepted files: [(name, path)]. With auto=True the files of automatic rule 1 are added
     (never a file a person rejected or accepted otherwise: they are already decided)."""
