@@ -1523,6 +1523,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             out.append(x)
         P[c] = pd.Series(out, index=P.index, dtype=float)
     det["bad_numbers"] = pd.DataFrame(bad_num)
+    s["bad_cols"] = dict(Counter(b_["Column"] for b_ in bad_num).most_common(12))
     # eTally has no target population: the latest one of the same LGA in the live file
     if lay.get("etally"):
         pops, nfill = population_from_live(ctx), 0
@@ -1683,6 +1684,11 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     s["existing_different"] = int((cmp_["Status"] == "already in the live file, other figures").sum())
     s["existing_units"] = int(cmp_["Status"].str.startswith("same names as several").sum())
     # a record with the same place and the same figures as a live record of another name, round or date is a duplicate: it is removed (never added)
+    s["aliases"] = []
+    if "Live_campaign" in cmp_.columns and (cmp_["Live_campaign"] != "").any():
+        al = cmp_[cmp_["Live_campaign"] != ""].assign(_rs=lambda d: d["Response"].astype(str), _ro=lambda d: d["Round_Add"].astype(str))
+        for (rs_, ro_, ls_, lo_), g in al.groupby(["_rs", "_ro", "Live_campaign", "Live_round"]):
+            s["aliases"].append({"file_name": rs_, "file_round": ro_, "live_name": ls_, "live_round": lo_, "records": int(len(g))})
     s["dup_removed"] = int(cmp_["Status"].str.startswith("possible duplicate: same figures").sum())
     s["possible_dup"] = int(cmp_["Status"].str.startswith("possible duplicate").sum()) - s["dup_removed"]
     # derived columns and the live file's constants
@@ -1750,6 +1756,9 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("%d record(s) already in the live file with other figures (not changed)" % s["existing_different"]); codes.append("other_figures")
     if s["existing_units"]:
         reasons.append("%d record(s) with the same names as several live records and none identical (not added)" % s["existing_units"]); codes.append("several_units")
+    if s.get("aliases"):
+        infos.append("records matched to a live record under another campaign name or round (the live record is kept as it is): " +
+                     "; ".join("%s %s -> %s %s (%d)" % (a_["file_name"], a_["file_round"], a_["live_name"], a_["live_round"], a_["records"]) for a_ in s["aliases"][:4]))
     if s.get("dup_removed"):
         infos.append("%d duplicate record(s) removed (same place and figures as a live record under another campaign name, round or date): see the Records sheet" % s["dup_removed"])
     for m_ in det.get("date_std", []) or []:
@@ -2053,6 +2062,7 @@ def compare_with_live(P, ctx, prof):
     rows, diffs = [], []
     cols = [c for c in FIGURE_COLS + ["Date_Report"] if c in P.columns]
     for i in range(len(P)):
+        alias = None
         k = key.iat[i]
         cand = ctx.live_index.get(k)
         if not cand:
@@ -2062,6 +2072,14 @@ def compare_with_live(P, ctx, prof):
             # the same campaign and round at the same place, only the date, the province or the vaccine name differs: it is the live record
             same_c = [h for h in pl if (not is_empty(P.at[i, "Response"])) and str(h[5]).strip().lower() == str(P.at[i, "Response"]).strip().lower()
                       and str(h[6]).strip().lower() == str(P.at[i, "Round_Add"]).strip().lower()] if pl else []
+            aligned = False
+            # the same place on the same date (3 days at most) with the same vaccine, and only one such live record: it is that live record under another
+            # campaign name or round (CAM-2025-11-01 for CAM-2026-01, NOPV2 for bOPV-nOPV2, Rnd3 for Rnd1); the live record is not changed
+            if len(same_c) != 1 and pl and not pd.isna(P.at[i, "SIA_date"]):
+                fam0 = vaccine_family(b)(P.at[i, "Vaccine_type"])
+                cand = [h for h in pl if fam0 and h[2] and (fam0 & h[2]) and abs((pd.Timestamp(P.at[i, "SIA_date"]) - h[1]).days) <= 3]
+                if len(cand) == 1:
+                    same_c, aligned = cand, True
             if len(same_c) == 1:
                 lab, d_, v, tt, po, rs, ro = same_c[0]
                 tot = P.at[i, "TotalNbrVaccPolio"] if "TotalNbrVaccPolio" in P.columns else np.nan
@@ -2075,6 +2093,10 @@ def compare_with_live(P, ctx, prof):
                 st = "already in the live file, other figures" if dif else "already in the live file, same figures"
                 note = "live row %d: same place, campaign and round (%s %s); the date, province or vaccine name differs%s" % (
                     lab + 2, rs, ro, "" if pd.isna(dt_) or abs((pd.Timestamp(dt_) - d_).days) == 0 else " (file %s, live %s)" % (pd.Timestamp(dt_).strftime("%Y-%m-%d"), d_.strftime("%Y-%m-%d")))
+                if aligned:
+                    note = "live row %d: same place, date and vaccine; the campaign name or round differs (file %s %s, live %s %s)" % (
+                        lab + 2, P.at[i, "Response"], P.at[i, "Round_Add"], rs, ro)
+                    alias = (str(P.at[i, "Response"]), str(P.at[i, "Round_Add"]), str(rs), str(ro))
                 for c_, lv, sv in dif:
                     diffs.append({"Row_in_file": rowref(P, i), "Country": P.at[i, "Country"], "District": P.at[i, "District"],
                                   "SIA_date": "" if pd.isna(dt_) else pd.Timestamp(dt_).strftime("%Y-%m-%d"), "Response": P.at[i, "Response"],
@@ -2134,7 +2156,7 @@ def compare_with_live(P, ctx, prof):
         rows.append({"Row_in_file": rowref(P, i), "Country": P.at[i, "Country"], "Province": P.at[i, "Province"],
                      "District": P.at[i, "District"], "SIA_date": P.at[i, "SIA_date"].strftime("%Y-%m-%d"),
                      "Round_Add": P.at[i, "Round_Add"], "Vaccine_type": P.at[i, "Vaccine_type"], "Response": P.at[i, "Response"],
-                     "Status": st, "Note": note})
+                     "Status": st, "Note": note, "Live_campaign": alias[2] if alias else "", "Live_round": alias[3] if alias else ""})
     return pd.DataFrame(rows), pd.DataFrame(diffs)
 
 
@@ -2275,7 +2297,8 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
         e["possible_dup"] = s.get("possible_dup", 0)
         e["codes"], e["lookup_rounds"], e["lookup_ok"] = s.get("codes"), s.get("lookup_rounds", 0), s.get("lookup_ok", 0)
         e["stem"], e["country_folder"] = stem_, fc or ""
-        e.update({"prepared": prepared, "last_inspected": now, "present": True, "prepared_clean": clean_p, "clean_new": clean_n, "held_new": held_n})
+        e.update({"prepared": prepared, "last_inspected": now, "present": True, "prepared_clean": clean_p, "clean_new": clean_n, "held_new": held_n,
+                  "aliases": s.get("aliases", []), "bad_cols": s.get("bad_cols", {})})
         ledger["files"][h] = e
         rows.append(dict(s, decision=e["decision"] or "", decided_by=e["decided_by"]))
         details[h] = (s, det)
@@ -2748,6 +2771,122 @@ def summary(out_root, audit=None):
             r_["_d"] = r_["Planned_start"]
             out["Missing_rounds"] = r_[r_["_d"] >= "2025-01-01"].sort_values(["Country", "_d"]).drop(columns="_d")
     return out
+
+
+def _top(series, n=3):
+    vc = series.dropna().astype(str).value_counts().head(n)
+    return ", ".join("%s %d" % (k, v) for k, v in vc.items())
+
+
+def feedback(out_root, ledger=None):
+    """What each country has to correct, confirm or send again, written by the engine from the held-back records and the findings of the inspection.
+    Returns (DataFrame with one line per country, file and matter, markdown text). Plain words: the people who read it are the countries."""
+    ledger = ledger or load_ledger(out_root)
+    rows = []
+
+    def add(country, file, matter, records, text, action):
+        rows.append({"Country": country, "File": file, "Matter": matter, "Records": records, "What we found": text, "What the country does": action})
+
+    for h, e in ledger["files"].items():
+        if e.get("superseded") or not e.get("present", True) or e.get("status") == "nothing new" and not e.get("aliases"):
+            continue
+        ctry = e.get("country_folder") or e.get("countries") or "?"
+        name = e["name"]
+        codes = set(e.get("codes") or [])
+        if "not_admin" in codes:
+            continue
+        # held-back records of the file, by reason
+        hp = Path(out_root) / str(e.get("prepared") or "x").replace(".xlsx", "_held.xlsx")
+        if e.get("prepared") and hp.is_file() and int(e.get("held_new") or 0) > 0:
+            try:
+                d = pd.read_excel(hp, dtype=object)
+            except Exception:
+                d = pd.DataFrame()
+            if len(d):
+                d["_r"] = d["Hold_reason"].astype(str)
+                kinds = [("validation error", "validation"), ("missing after standardising", "empty"), ("target or the number vaccinated is not a number", "text"),
+                         ("record of another country", "country"), ("same names as several live records", "several"), ("possible duplicate", "dup")]
+                for key, kind in kinds:
+                    g = d[d["_r"].str.contains(key, regex=False)]
+                    if not len(g):
+                        continue
+                    camp = ", ".join(sorted({"%s %s" % (a, b) for a, b in zip(g["Response"].astype(str), g["Round_Add"].astype(str))})[:3])
+                    where = _top(g["Province"])
+                    n = len(g)
+                    if kind == "validation":
+                        lab = sorted({x.split("validation error: ")[1].split("; ")[0] for x in g["_r"] if "validation error: " in x})
+                        if any("Target population missing" in x for x in lab):
+                            add(ctry, name, "target population missing", n, "%d record(s) of %s have no target population (%s)" % (n, camp, where),
+                                "Fill in the target population (PopPolio) of these districts and send the file again")
+                        else:
+                            add(ctry, name, "failed a check", n, "%d record(s) of %s fail the check: %s (%s)" % (n, camp, "; ".join(lab) or "see the Issues sheet", where),
+                                "Correct these records and send the file again")
+                    elif kind == "empty":
+                        cols = sorted({c.strip() for x in g["_r"] for c in x.split("missing after standardising: ")[1].split(";")[0].split(",")})
+                        add(ctry, name, "empty fields", n, "%d record(s) of %s still have no %s after the lookup was used (%s)" % (n, camp, ", ".join(cols), where),
+                            "Fill in %s for these records" % ", ".join(cols))
+                    elif kind == "text":
+                        add(ctry, name, "text instead of numbers", n, "%d record(s) of %s have text where the target or the number vaccinated should be (%s)" % (n, camp, where),
+                            "Replace the text by the number")
+                    elif kind == "country":
+                        add(ctry, name, "other country", n, "%d record(s) carry another country than the folder (%s)" % (n, _top(g["Country"])),
+                            "Correct the country or send these records in their own country's folder")
+                    elif kind == "several":
+                        ex = ", ".join(sorted({str(x) for x in g["District"].dropna()})[:4])
+                        add(ctry, name, "unit not clear", n, "%d record(s) of %s have a province and district that match several records of the live file (for example %s)" % (n, camp, ex),
+                            "Say which unit (health zone, sub-district or other level) each of these rows is")
+                    elif kind == "dup":
+                        live = sorted(set(re.findall(r"\(([^,()]+ Rnd\d+), \d{4}-\d\d-\d\d\)", " ".join(g["_r"]))))[:3]
+                        add(ctry, name, "same place and date, other figures", n,
+                            "%d record(s) of %s look like records already in the live file (%s) with other figures" % (n, camp, ", ".join(live) or "another campaign name or round"),
+                            "Confirm the campaign and round, and which figures are the final ones")
+        # records matched to the live file under another campaign name or round
+        for a_ in e.get("aliases") or []:
+            same_round = str(a_["file_round"]).strip().lower() == str(a_["live_round"]).strip().lower()
+            if same_round:
+                add(ctry, name, "campaign name differs", a_["records"], "%d record(s) are written as %s %s; the live file has the same districts and dates as %s %s" % (
+                    a_["records"], a_["file_name"], a_["file_round"], a_["live_name"], a_["live_round"]),
+                    "Use the live campaign name in the next file (nothing else is needed: the records were matched automatically)")
+            else:
+                add(ctry, name, "round differs", a_["records"], "%d record(s) are written as %s %s; the live file has the same districts and dates as %s %s" % (
+                    a_["records"], a_["file_name"], a_["file_round"], a_["live_name"], a_["live_round"]),
+                    "Confirm the round (%s or %s) and which figures are the final ones" % (a_["file_round"], a_["live_round"]))
+        why = str(e.get("why") or "")
+        m = re.search(r"vaccine against the lookup: ([^;]+?)(?:; |$)", why)
+        if "vaccine_vs_lookup" in codes and m:
+            add(ctry, name, "vaccine differs from the lookup", "", m.group(1).strip(), "Confirm the vaccine used in this campaign")
+        if "wrong_place" in codes:
+            add(ctry, name, "wrong folder", "", why.split(";")[0], "Send the file in the folder of the right country, or tell us it is not needed")
+        if "sheets_skipped" in codes:
+            m = re.search(r"not read: ([^;]+)", why)
+            add(ctry, name, "sheet not read", "", "sheet(s) with column names that could not be read: %s" % (m.group(1) if m else "?"),
+                "Tell us if these sheets hold admin data; if so, put them in the AFRO template")
+        if "non_numbers" in codes:
+            bc = e.get("bad_cols") or {}
+            core_ = {"TotPop", "PopPolio", "TotalNbrVaccPolio", "Tot_Vacc_nOPV2", "Total_Vacc_bOPV"}
+            hard = {c: n for c, n in bc.items() if c in core_}
+            soft = {c: n for c, n in bc.items() if c not in core_}
+            if hard and not any(r["File"] == name and r["Matter"] == "text instead of numbers" for r in rows):
+                add(ctry, name, "text instead of numbers", sum(hard.values()), "text where a number is expected in %s" % ", ".join("%s (%d cells)" % kv for kv in hard.items()),
+                    "Replace the text by the number")
+            if soft or not bc:
+                add(ctry, name, "error values in calculated columns", "", ("%d cells that are not numbers in %s" % (sum(soft.values()), ", ".join(sorted(soft)[:6]))) if soft else
+                    (re.search(r"\d+ cell\(s\) that are not numbers", why).group(0) if re.search(r"\d+ cell\(s\) that are not numbers", why) else "cells that are not numbers"),
+                    "For information: these columns are calculated (coverage, wastage, proportions, age-group labels) and the build recalculates them, so no new file is needed; "
+                    "an error such as #DIV/0! in the country's own formulas can be fixed at the source")
+    f = pd.DataFrame(rows, columns=["Country", "File", "Matter", "Records", "What we found", "What the country does"]).drop_duplicates(
+        ["Country", "File", "Matter", "What we found"]).sort_values(["Country", "File", "Matter"])
+    lines = ["# What each country has to correct or confirm", "",
+             "Written by the engine from the last inspection (`python admin.py submissions feedback`). Records that passed every check are already in the live file; this list is about the others.", ""]
+    for c, d in f.groupby("Country", sort=True):
+        lines.append("## %s" % c)
+        lines.append("")
+        for _, r in d.iterrows():
+            lines.append("- **%s** (%s): %s. %s." % (r["Matter"], r["File"], r["What we found"], r["What the country does"]))
+        lines.append("")
+    if not len(f):
+        lines.append("Nothing to send back.")
+    return f, "\n".join(lines) + "\n"
 
 
 def accepted_files(out_root, auto=False):
