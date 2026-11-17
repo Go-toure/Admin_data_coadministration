@@ -2954,6 +2954,77 @@ def pending(out_root, nodata, days=PENDING_DAYS, since="2025-01-01", today=None,
     return out
 
 
+def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_days=7, same_day=3):
+    """LOOKUP ISSUES. Campaign rounds that are in the live file but that the lookup cannot place, written for the people who keep the lookup (the GPEI side) and,
+    when it helps, the country. `rep` is the first table of builder.lookup_crosscheck(live, lookup) (one row per campaign round of the data with its status).
+    Only two statuses are issues of the lookup: 'Response not in the lookup' and 'Date not in the lookup for this Response' (a difference of up to 7 days is a
+    date the build corrects, not an issue). Each is told apart: the campaign is not in the lookup at all; the name differs from ONE lookup campaign that starts within
+    `near_days` days (a proposal, a person confirms); TWO or more lookup campaigns start within `near_days` days (the data cannot say which one); the date is the start
+    date of ANOTHER lookup campaign of the country; or the lookup lists the campaign but not this round or date. The engine never renames on these findings. Returns
+    (issues of rounds starting since `since`, older ones), the same columns."""
+    import pandas as pd
+    cols = ["Country", "Campaign_in_live", "Round_in_live", "Start_in_live", "Records", "Issue", "Lookup_says", "Proposal", "Ask", "Message"]
+    empty = pd.DataFrame(columns=cols)
+    if rep is None or not len(rep) or lookup is None or not len(lookup):
+        return empty, empty.copy()
+    ck = ckey or (lambda s: str(s).strip().upper())
+    rk = rkey or (lambda s: str(s).strip().upper())
+    lk = lookup.copy()
+    lk["_dt"] = pd.to_datetime(lk["_d"], errors="coerce")
+    lk["_c"] = lk["Country"].map(ck)
+    lk["_n"] = lk["OBR Name"].map(rk)
+
+    def short(x):
+        return "%s %s (%s, %s)" % (x["OBR Name"], x["Round Number"], str(x["Round Start Date"])[:10], x.get("Vaccines", ""))
+    rows = []
+    sel = rep[rep["Status"].isin(["Response not in the lookup", "Date not in the lookup for this Response"])]
+    for r in sel.to_dict("records"):
+        d = pd.to_datetime(r["SIA_date"], errors="coerce")
+        if pd.isna(d):
+            continue
+        camp, rnd, n = str(r["Response"]), str(r["Round_Add"]), int(r["Records"])
+        mine = lk[lk["_c"] == ck(r["Country"])]
+        gap = (mine["_dt"] - d).abs().dt.days
+        near = mine[gap <= near_days]
+        me = "%s %s starting %s (%d record%s)" % (camp, rnd, str(d)[:10], n, "" if n == 1 else "s")
+        if r["Status"] == "Response not in the lookup":
+            names = sorted(set(near["OBR Name"].astype(str)))
+            if not len(names):
+                issue, says = "Campaign not in the lookup", "no campaign of the country starts within %d days" % near_days
+                prop, ask = "", "Lookup maintainers (add the campaign) and the country (is it a campaign that took place?)"
+                msg = "%s is in the live file, but the lookup has no campaign of that name and none of %s starting within %d days. Please add it to the lookup, or tell us which lookup campaign it is." % (me, r["Country"], near_days)
+            elif len(names) == 1:
+                x = near.iloc[(near["_dt"] - d).abs().argmin()]
+                issue, says = "Name differs from the lookup", short(x)
+                prop, ask = "If it is the same campaign, use the lookup name %s (a person confirms and decides the correction)" % x["OBR Name"], "Lookup maintainers and the country (confirm they are the same campaign)"
+                msg = "%s is in the live file, the lookup has no campaign of that name. The only campaign of the country starting within %d days is %s. Is it the same campaign? If yes, the live name will be aligned to the lookup." % (me, near_days, short(x))
+            else:
+                issue, says = "Two or more lookup campaigns on this date", "; ".join(short(x) for _, x in near.sort_values("_dt").iterrows())
+                prop, ask = "Cannot be decided from the data (names, vaccines and dates do not separate them)", "Lookup maintainers (are they one campaign entered twice, or two?) and the country (which one the records belong to)"
+                msg = "%s is in the live file, the lookup has no campaign of that name and %d lookup campaigns start within %d days: %s. Which one do the records belong to? If the lookup holds the same campaign twice, please remove one." % (me, len(names), near_days, says)
+        else:
+            has = mine[mine["_n"] == rk(camp)]
+            other = mine[(gap <= same_day) & (mine["_n"] != rk(camp))]
+            lists = "; ".join("%s (%s)" % (x["Round Number"], str(x["Round Start Date"])[:10]) for _, x in has.sort_values("_dt").iterrows())
+            if len(other):
+                issue = "The date belongs to another lookup campaign"
+                says = "%s starts on this date; %s is listed as %s" % ("; ".join(short(x) for _, x in other.iterrows()), camp, lists or "not at all")
+                prop, ask = "Cannot be decided from the data", "Lookup maintainers and the country (which campaign the records belong to)"
+                msg = "%s: the date is the start date of %s in the lookup, while the name in the live file is %s, which the lookup lists as %s. Which one is right?" % (me, "; ".join(short(x) for _, x in other.iterrows()), camp, lists or "not at all")
+            else:
+                issue, says = "Round or date not in the lookup", "the lookup lists %s (nearest %s day(s) away)" % (lists, r.get("Days_difference"))
+                prop, ask = "", "Lookup maintainers (add or correct the round) and the country (confirm the date)"
+                msg = "%s: the lookup lists %s, nearest %s day(s) away. Please add the round to the lookup, or confirm that the date in the live file is wrong." % (me, lists or "this campaign without rounds", r.get("Days_difference"))
+        rows.append({"Country": r["Country"], "Campaign_in_live": camp, "Round_in_live": rnd, "Start_in_live": str(d)[:10], "Records": n, "Issue": issue,
+                     "Lookup_says": says, "Proposal": prop, "Ask": ask, "Message": msg})
+    out = pd.DataFrame(rows, columns=cols)
+    if not len(out):
+        return empty, empty.copy()
+    out = out.sort_values(["Start_in_live", "Country"], ascending=[False, True])
+    recent = out["Start_in_live"] >= str(since)
+    return out[recent].reset_index(drop=True), out[~recent].reset_index(drop=True)
+
+
 def pending_close(out_root, targets, note="", by=""):
     """Mark pending rounds as closed (the round did not take place, or no data are expected). A target is a piece of 'COUNTRY|campaign|Round n' (not case sensitive);
     it must match exactly one round of the register. Returns [(target, message)]."""
