@@ -2055,6 +2055,23 @@ def vaccine_family(b):
     return lambda v: frozenset(b._vset(v)) or frozenset({cn(v)}) if isinstance(v, str) and v.strip() else frozenset()
 
 
+def lookup_round_at(ctx, response, country, date):
+    """The round number (numbered as the live file does) that the lookup gives for this campaign and country on this date (3 days of tolerance), or None."""
+    lk, b = getattr(ctx, "lookup", None), ctx.builder
+    if lk is None or is_empty(response) or is_empty(country) or pd.isna(date):
+        return None
+    e = lk[(lk["_ck"] == b._lkc(country)) & (lk["_rk"] == b._rk(response))]
+    if e.empty:
+        return None
+    d = (pd.to_datetime(e["_d"], errors="coerce") - pd.Timestamp(date)).abs().dt.days
+    e = e[d <= 3]
+    rn = list(dict.fromkeys(e["_rn"].dropna()))
+    if len(rn) != 1:
+        return None
+    offs = round_offsets(ctx)
+    return int(rn[0]) + offs["by_campaign"].get(e.iloc[0]["_rk"], offs["common"])
+
+
 def compare_with_live(P, ctx, prof):
     b = ctx.builder
     T = to_text(P.drop(columns=["_src_row", "_sheet"]), prof["numeric"])
@@ -2079,7 +2096,12 @@ def compare_with_live(P, ctx, prof):
                 fam0 = vaccine_family(b)(P.at[i, "Vaccine_type"])
                 cand = [h for h in pl if fam0 and h[2] and (fam0 & h[2]) and abs((pd.Timestamp(P.at[i, "SIA_date"]) - h[1]).days) <= 3]
                 if len(cand) == 1:
-                    same_c, aligned = cand, True
+                    ro_f, ro_l = P.at[i, "Round_Add"], cand[0][6]
+                    same_r = (not is_empty(ro_f)) and str(ro_f).strip().lower() == str(ro_l).strip().lower()
+                    # a round that differs is accepted only when the file's round is not a round at all (a date, Rnd0 typed for none), or when the lookup
+                    # gives the live record's round for this campaign and date: otherwise it may be another round, and the record is held, never dropped
+                    if same_r or is_empty(ro_f) or b._rnum(str(ro_f)) is None or lookup_round_at(ctx, P.at[i, "Response"], P.at[i, "Country"], P.at[i, "SIA_date"]) == b._rnum(str(ro_l)):
+                        same_c, aligned = cand, True
             if len(same_c) == 1:
                 lab, d_, v, tt, po, rs, ro = same_c[0]
                 tot = P.at[i, "TotalNbrVaccPolio"] if "TotalNbrVaccPolio" in P.columns else np.nan
@@ -2850,7 +2872,7 @@ def feedback(out_root, ledger=None):
             else:
                 add(ctry, name, "round differs", a_["records"], "%d record(s) are written as %s %s; the live file has the same districts and dates as %s %s" % (
                     a_["records"], a_["file_name"], a_["file_round"], a_["live_name"], a_["live_round"]),
-                    "Confirm the round (%s or %s) and which figures are the final ones" % (a_["file_round"], a_["live_round"]))
+                    "Confirm the round (the file says %s, the live file says %s) and which figures are the final ones" % (a_["file_round"], a_["live_round"]))
         why = str(e.get("why") or "")
         m = re.search(r"vaccine against the lookup: ([^;]+?)(?:; |$)", why)
         if "vaccine_vs_lookup" in codes and m:
@@ -2872,8 +2894,8 @@ def feedback(out_root, ledger=None):
             if soft or not bc:
                 add(ctry, name, "error values in calculated columns", "", ("%d cells that are not numbers in %s" % (sum(soft.values()), ", ".join(sorted(soft)[:6]))) if soft else
                     (re.search(r"\d+ cell\(s\) that are not numbers", why).group(0) if re.search(r"\d+ cell\(s\) that are not numbers", why) else "cells that are not numbers"),
-                    "For information: these columns are calculated (coverage, wastage, proportions, age-group labels) and the build recalculates them, so no new file is needed; "
-                    "an error such as #DIV/0! in the country's own formulas can be fixed at the source")
+                    "For information only: these cells are in calculated columns (coverage, wastage, proportions, month) or in columns of other vaccines, not in the polio target or "
+                    "vaccinated figures, so nothing is held back and no new file is needed; the country can clean them at the source (an error such as #DIV/0! in its own formulas)")
     f = pd.DataFrame(rows, columns=["Country", "File", "Matter", "Records", "What we found", "What the country does"]).drop_duplicates(
         ["Country", "File", "Matter", "What we found"]).sort_values(["Country", "File", "Matter"])
     lines = ["# What each country has to correct or confirm", "",
