@@ -1368,7 +1368,9 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     except Exception as e:
         kind_ = guess_kind(path, None)
         damaged = isinstance(e, (AssertionError, IndexError)) and str(path).lower().endswith(".xls")
-        s["why"] = ("looks like %s, not admin data; " % kind_ if kind_ else "") + (
+        if kind_:
+            s["codes"] = ["not_admin"]
+        s["why"] = ("NOT ADMIN DATA: looks like %s; " % kind_ if kind_ else "") + (
             "the old .xls file is damaged (its list of texts is cut; open it in Excel and save it again as .xlsx if it matters)" if damaged
             else "the file could not be opened (%s)" % type(e).__name__)
         det["layout"] = {"class": "not readable", "map": {}, "synonym": [], "ignored": [], "missing_keys": [], "notes": [str(e)[:200]]}
@@ -1378,7 +1380,11 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     s["sheet"] = ", ".join(str(x) for x in ([lay["sheet"]] + [L["sheet"] for L in lay.get("extra") or []]) if x is not None)
     if lay["class"] == "not usable":
         kind = guess_kind(path, lay)
-        s["why"] = ("looks like %s, not admin data; " % kind if kind else "") + "; ".join(lay["notes"])
+        if kind:
+            s["codes"] = ["not_admin"]
+            s["why"] = "NOT ADMIN DATA: looks like %s; %s" % (kind, "; ".join(lay["notes"]))
+        else:
+            s["why"] = "different layout from the AFRO template, not read (admin data in another template is kept visible, never ignored): " + "; ".join(lay["notes"])
         return s, None, det
     raw = et_raw if et_raw is not None else read_records(path, lay)
     s["rows_read"] = len(raw)
@@ -1830,7 +1836,37 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     if not hasattr(ctx, "_file_records"):
         ctx._file_records = {}
     ctx._file_records[s["hash"]] = (name, P[[c for c in ("Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response", "TotalNbrVaccPolio", "PopPolio") if c in P.columns]].copy())
-    P = P[(cmp_["Status"] == "new").values]                 # only the records the live file does not have go to the build
+    # nothing is lost: every record that is not a duplicate goes in; a record that fails a validation is held back with its reason (list: Held_back_records)
+    err_rows = {}
+    if len(iss) and "severity" in iss.columns:
+        for _, r_ in iss[iss["severity"] == "Error"].iterrows():
+            err_rows.setdefault(r_["Excel_row"], []).append(str(r_.get("check_label") or r_.get("check")))
+    bad_rows = set(det["bad_numbers"]["Row_in_file"]) if det["bad_numbers"] is not None and len(det["bad_numbers"]) else set()
+    hold = []
+    for i in range(len(P)):
+        r_ = []
+        rr_ = rowref(P, i)
+        if rr_ in err_rows:
+            r_.append("validation error: " + ", ".join(sorted(set(err_rows[rr_]))))
+        if rr_ in bad_rows:
+            r_.append("a figure is not a number")
+        miss = [c for c in ("Country", "Province", "District", "SIA_date", "Round_Add", "Response", "Vaccine_type") if c in P.columns and
+                (pd.isna(P.at[i, c]) if c == "SIA_date" else is_empty(P.at[i, c]))]
+        if miss:
+            r_.append("missing after standardising: " + ", ".join(miss))
+        if folder_country and P.at[i, "Country"] != folder_country:
+            r_.append("record of another country than the folder")
+        hold.append("; ".join(r_))
+    hold = np.array(hold, dtype=object)
+    isnew = (cmp_["Status"] == "new").values
+    other = cmp_["Status"].str.startswith("possible duplicate: same place") | cmp_["Status"].str.startswith("same names as several")
+    ho = P[other.values].drop(columns=["_src_row", "_sheet"])[template_cols].copy()
+    ho["Hold_reason"] = (cmp_.loc[other.values, "Status"] + ": " + cmp_.loc[other.values, "Note"].astype(str)).values
+    det["hold"] = hold[isnew]
+    det["held_other"] = ho
+    s["clean_new"] = int((hold[isnew] == "").sum())
+    s["held_new"] = int((hold[isnew] != "").sum()) + len(ho)
+    P = P[isnew]                 # only the records the live file does not have go to the build
     P = P.drop(columns=["_src_row", "_sheet"])
     P = P[template_cols]
     return s, P, det
@@ -2203,6 +2239,18 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
         if P is not None:
             prepared = "prepared/%s.xlsx" % h[:12]
             P.to_excel(out_root / prepared, sheet_name="Sheet1", index=False)
+        clean_p, clean_n, held_n = None, 0, 0
+        if P is not None and det.get("hold") is not None and len(det["hold"]) == len(P):
+            hold_ = pd.Series(det["hold"], index=P.index)
+            Pc = P[hold_ == ""]
+            Ph = pd.concat([P[hold_ != ""].assign(Hold_reason=hold_[hold_ != ""]), det["held_other"]], ignore_index=True)
+            if len(Pc):
+                clean_p = "prepared/%s_clean.xlsx" % h[:12]
+                Pc.to_excel(out_root / clean_p, sheet_name="Sheet1", index=False)
+            clean_n, held_n = len(Pc), len(Ph)
+            det["held_all"] = Ph
+            if len(Ph):
+                Ph.to_excel(out_root / ("prepared/%s_held.xlsx" % h[:12]), sheet_name="Sheet1", index=False)
         e = old or {"decision": None, "decided_by": "", "decided_at": "", "note": "", "first_seen": now}
         stem_ = name_stem(Path(rel).name)
         if not e.get("decision"):
@@ -2223,7 +2271,7 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
         e["possible_dup"] = s.get("possible_dup", 0)
         e["codes"], e["lookup_rounds"], e["lookup_ok"] = s.get("codes"), s.get("lookup_rounds", 0), s.get("lookup_ok", 0)
         e["stem"], e["country_folder"] = stem_, fc or ""
-        e.update({"prepared": prepared, "last_inspected": now, "present": True})
+        e.update({"prepared": prepared, "last_inspected": now, "present": True, "prepared_clean": clean_p, "clean_new": clean_n, "held_new": held_n})
         ledger["files"][h] = e
         rows.append(dict(s, decision=e["decision"] or "", decided_by=e["decided_by"]))
         details[h] = (s, det)
@@ -2267,11 +2315,11 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
 def write_report(path, rows, details, ctx, not_read=()):
     ov = pd.DataFrame(rows)
     cols = ["name", "path", "status", "decision", "layout", "countries", "rows_read", "rows_used", "excluded", "new", "existing_same",
-            "existing_different", "existing_units", "possible_dup", "in_file_duplicates_removed", "qc_errors", "qc_warnings", "why", "hash"]
+            "existing_different", "existing_units", "possible_dup", "in_file_duplicates_removed", "clean_new", "held_new", "qc_errors", "qc_warnings", "why", "hash"]
     ov = ov[[c for c in cols if c in ov.columns]].rename(columns={"name": "File", "path": "Path", "status": "Status", "decision": "Decision",
         "layout": "Layout", "countries": "Countries", "rows_read": "Rows read", "rows_used": "Rows used", "excluded": "Rows left out",
         "new": "New records", "existing_same": "Already there (same)", "existing_different": "Already there (other figures)", "existing_units": "Same names as several live records (not added)", "possible_dup": "Possible duplicates (not added)",
-        "in_file_duplicates_removed": "Exact copies removed", "qc_errors": "Records with an Error", "qc_warnings": "Records with a Warning",
+        "in_file_duplicates_removed": "Exact copies removed", "clean_new": "Clean new records (go in)", "held_new": "Held back (see Held_back_records)", "qc_errors": "Records with an Error", "qc_warnings": "Records with a Warning",
         "why": "Why not ready", "hash": "Content hash"})
     sheets = {"Overview": ov}
 
@@ -2317,7 +2365,7 @@ def write_report(path, rows, details, ctx, not_read=()):
     if gaps:
         sheets["Lookup_gaps"] = pd.DataFrame(gaps).drop_duplicates()
     for name, key in (("Campaign_to_set", "to_set"), ("eTally_vs_callin", "callin_check"), ("Tally_check", "tally_check"), ("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
-                      ("Normalised_cells", "notes"), ("Defaults_from_live", "defaults"), ("Left_out", "excluded_df"), ("Not_numbers", "bad_numbers"),
+                      ("Normalised_cells", "notes"), ("Defaults_from_live", "defaults"), ("Held_back_records", "held_all"), ("Left_out", "excluded_df"), ("Not_numbers", "bad_numbers"),
                       ("Values_not_seen", "unseen"), ("Duplicates_in_file", "dups"), ("Campaigns_vs_lookup", "campaigns")):
         if key == "excluded_df":
             parts = []
@@ -2563,10 +2611,37 @@ def auto_candidates(out_root, ledger=None):
         p = Path(out_root) / e["prepared"]
         if p.is_file():
             out.append((e["name"], str(p), "%s: %d new record(s), %s" % (AUTO_RULE, int(e.get("new") or 0), how)))
+    taken = {e.get("prepared") for e in ledger["files"].values() if any(Path(pp).name == Path(str(e.get("prepared"))).name for _, pp, _ in out)}
+    out += auto_clean_candidates(out_root, ledger, taken)
+    return out
+
+
+AUTO_RULE4 = "automatic rule 4"
+AUTO_HARD4 = {"wrong_place", "vaccine_vs_lookup"}
+
+
+def auto_clean_candidates(out_root, ledger, taken):
+    """Rule 4, nothing is lost: of a file that no rule takes whole, the records that passed every validation and the standardisation and are not duplicates
+    (file prepared/<hash>_clean.xlsx) go in; the others are held back with their reason (Held_back_records). Never a file a person decided, never a file in the
+    wrong folder or with a vaccine that disagrees with the lookup (the whole file waits for a person)."""
+    out = []
+    for h, e in ledger["files"].items():
+        if e.get("decision") or e.get("superseded") or not e.get("present", True) or e.get("status") in ("blocked", "nothing new"):
+            continue
+        if e.get("prepared") in taken or not e.get("prepared_clean") or int(e.get("clean_new") or 0) <= 0:
+            continue
+        codes = e.get("codes")
+        if codes is None or set(codes) & AUTO_HARD4:
+            continue
+        p = Path(out_root) / e["prepared_clean"]
+        if p.is_file():
+            out.append((e["name"], str(p), "%s: %d clean new record(s) (validated, standardised, not duplicates); %d held back, see Held_back_records" % (
+                AUTO_RULE4, int(e["clean_new"]), int(e.get("held_new") or 0))))
     return out
 
 
 CODE_MEANING = {
+    "not_admin": ("a file that is not admin data (IM, LQAS, AEFI, supplies, call-in, summaries)", "nobody: ignored"),
     "overlap": ("the new records are also new in another file", "engine: a copy with the same figures is harmless; other figures need a person"),
     "coverage_ceiling": ("records with more vaccinated than the target allows (reference only, no longer stops a file)", "nobody: the live file has its own coverage columns"),
     "date_standardized": ("records given the planned start date of the lookup for their campaign", "the engine when the lookup confirms it"),
@@ -2611,14 +2686,17 @@ def summary(out_root, audit=None):
     """What a person would otherwise work out by hand: where the new records are, what keeps them from going in by themselves, who can fix it,
     and which rounds of the lookup that have no data in the live file are in a submitted file. Returns {sheet: DataFrame}."""
     ledger = load_ledger(out_root)
-    auto = {n for n, _, _ in auto_candidates(out_root, ledger)}
+    auto_notes = {n: note for n, _, note in auto_candidates(out_root, ledger)}
+    auto = set(auto_notes)
     rows = []
     for h, e in ledger["files"].items():
         if not e.get("present", True) or e.get("superseded") or (e.get("new") or 0) <= 0:
             continue
         bl = blockers_of(e)
         rows.append({"File": e["name"], "Country": e.get("country_folder") or "", "New": int(e["new"]), "Status": e.get("status"),
-                     "Decision": e.get("decision") or "", "Auto": e["name"] in auto, "Blockers": bl})
+                     "Decision": e.get("decision") or "", "Auto": e["name"] in auto, "Blockers": bl,
+                     "Auto_new": (int(e.get("clean_new") or 0) if str(auto_notes.get(e["name"], "")).startswith(AUTO_RULE4) else int(e["new"])) if e["name"] in auto else 0,
+                     "Held_back": int(e.get("held_new") or 0)})
     f = pd.DataFrame(rows)
     out = {}
     if len(f):
@@ -2633,8 +2711,8 @@ def summary(out_root, audit=None):
         for c, d in f.groupby("Country"):
             todo = d[~d["Auto"] & (d["Decision"] == "")]
             top = pd.Series([x for b in todo["Blockers"] if b for x in b]).value_counts()
-            g.append({"Country": c, "Files_with_new_records": len(d), "New_records": int(d["New"].sum()), "Taken_by_rules": int(d.loc[d["Auto"], "New"].sum()),
-                      "Decided": int(d.loc[d["Decision"] != "", "New"].sum()), "Waiting_for_a_person": int(todo["New"].sum()),
+            g.append({"Country": c, "Files_with_new_records": len(d), "New_records": int(d["New"].sum()), "Taken_by_rules": int(d["Auto_new"].sum()), "Held_back_records": int(d["Held_back"].sum()),
+                      "Decided": int(d.loc[d["Decision"] != "", "New"].sum()), "Waiting_for_a_person": int((d["New"] - d["Auto_new"])[d["Decision"] == ""].sum()),
                       "Main_finding": top.index[0] if len(top) else ""})
         out["By_country"] = pd.DataFrame(g).sort_values("New_records", ascending=False)
         out["Files"] = f.drop(columns=["Blockers"]).sort_values(["Country", "New"], ascending=[True, False])

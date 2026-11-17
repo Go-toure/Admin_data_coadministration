@@ -11,5 +11,6 @@
   "max_row_drop_pct": 2.0,
   "scope_script_dir": "C:/Users/TOURE/Documents/Gith_repositories/scope/scripts",
   "scope_data_dir": "C:/Users/TOURE/Documents/Gith_repositories/scope/data/co_administration",
-  "excel_timeout_min": 20
+  "excel_timeout_min": 20,
+  "submissions_auto": true
 }
