@@ -2954,7 +2954,73 @@ def pending(out_root, nodata, days=PENDING_DAYS, since="2025-01-01", today=None,
     return out
 
 
-def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_days=7, same_day=3):
+def _scope_index(live, scope, ck):
+    """Districts of the live records per (country, campaign, round, date) and the districts the scope plans per (country, campaign, round, start date).
+    A district is its geo_code when there is one, else its upper-case name. Returns (live index, scope index) or (None, None) when either is missing."""
+    import pandas as pd
+    if live is None or scope is None or not len(live) or not len(scope):
+        return None, None
+    need_l, need_s = {"Country", "Response", "Round_Add", "SIA_date", "District"}, {"country", "response", "roundNumber", "round_start_date", "district"}
+    if not need_l <= set(live.columns) or not need_s <= set(scope.columns):
+        return None, None
+    def dk(df, code, name):
+        n = "~" + df[name].fillna("").astype(str).str.strip().str.upper()
+        return df[code].where(df[code].notna() & (df[code].astype(str).str.strip() != ""), n) if code in df.columns else n
+    L = pd.DataFrame({"c": live["Country"].map(ck), "r": live["Response"].astype(str), "n": live["Round_Add"].astype(str),
+                      "d": pd.to_datetime(live["SIA_date"], errors="coerce").dt.strftime("%Y-%m-%d"), "k": dk(live, "geo_code", "District")})
+    S = pd.DataFrame({"c": scope["country"].map(ck), "r": scope["response"].astype(str), "n": scope["roundNumber"].astype(str),
+                      "d": pd.to_datetime(scope["round_start_date"], errors="coerce"), "k": dk(scope, "geo_code", "district")})
+    li = {key: set(g["k"]) for key, g in L.dropna(subset=["d"]).groupby(["c", "r", "n", "d"])}
+    si = {}
+    for (c, r, n, d), g in S.dropna(subset=["d"]).groupby(["c", "r", "n", "d"]):
+        si.setdefault(c, []).append((r, n, d, set(g["k"])))
+    return li, si
+
+
+def scope_evidence(li, si, country_key, camp, rnd, date, days=60, min_districts=5, strong=0.9, same_name=False, rk=None):
+    """Which campaign does the scope plan for the districts of these live records? Returns (live districts, text, target campaign or "", share of its planned districts that have records, tied campaigns). The text says: the live districts are those planned for ONE
+    campaign (share of the live districts that are planned in it, share of its planned districts that have records); or the scope lists the same districts for two or more
+    campaigns (the campaign is entered twice); or no planned campaign of the country within `days` days matches. Rounds of one campaign share their districts, so the round
+    whose start date is nearest is taken for each campaign. Too few districts (< min_districts) cannot tell campaigns apart."""
+    import pandas as pd
+    if li is None:
+        return "", "scope not available", "", 0, []
+    L = li.get((country_key, camp, rnd, str(date)[:10]), set())
+    if len(L) < min_districts:
+        return len(L), "too few districts (%d) to tell the campaigns apart" % len(L), "", 0, []
+    d0 = pd.Timestamp(date)
+    if same_name:
+        # the campaign has a name the lookup knows: what does the scope say about THIS campaign (its rounds and districts)?
+        rk = rk or (lambda s: str(s).strip().upper())
+        mine = [(n, d, S) for r, n, d, S in si.get(country_key, []) if rk(r) == rk(camp)]
+        if not mine:
+            return len(L), "the scope does not list this campaign", "", 0, []
+        union = set().union(*[S for _, _, S in mine])
+        return len(L), "the scope lists %s: %s; %d%% of the %d live districts are planned in it" % (
+            camp, "; ".join("%s %s (%d districts)" % (n, str(d)[:10], len(S)) for n, d, S in sorted(mine, key=lambda t: t[1])),
+            round(100 * len(L & union) / len(L)), len(L)), "", 0, []
+    best = {}
+    for r, n, d, S in si.get(country_key, []):
+        gap = abs((d - d0).days)
+        if gap > days:
+            continue
+        inter = len(L & S)
+        if r not in best or gap < best[r][0]:
+            best[r] = (gap, n, d, inter / len(L), inter / max(len(S), 1), len(S))
+    cand = sorted(((v[3], v[4], r, v) for r, v in best.items() if v[3] >= strong), key=lambda t: (-t[0], -t[1]))
+    if not cand:
+        return len(L), "no campaign planned in the scope within %d days has %d%% of these %d districts" % (days, int(strong * 100), len(L)), "", 0, []
+    top = [t for t in cand if abs(t[0] - cand[0][0]) < 0.02 and abs(t[1] - cand[0][1]) < 0.02]
+    if len(top) > 1:
+        return len(L), "the scope plans the same districts for %d campaigns (%s): the campaign is entered more than once" % (
+            len(top), "; ".join("%s %s, %s" % (t[2], t[3][1], str(t[3][2])[:10]) for t in top)), "", 0, [t[2] for t in top]
+    o, cv, r, v = cand[0]
+    also = ("; also compatible: " + ", ".join(t[2] for t in cand[1:3])) if len(cand) > 1 else ""
+    return len(L), "the districts are those planned for %s %s (start %s): %d%% of the %d live districts are planned in it, %d%% of its %d planned districts have records%s" % (
+        r, v[1], str(v[2])[:10], round(o * 100), len(L), round(cv * 100), v[5], also), r, cv, []
+
+
+def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_days=7, same_day=3, live=None, scope=None):
     """LOOKUP ISSUES. Campaign rounds that are in the live file but that the lookup cannot place, written for the people who keep the lookup (the GPEI side) and,
     when it helps, the country. `rep` is the first table of builder.lookup_crosscheck(live, lookup) (one row per campaign round of the data with its status).
     Only two statuses are issues of the lookup: 'Response not in the lookup' and 'Date not in the lookup for this Response' (a difference of up to 7 days is a
@@ -2963,12 +3029,13 @@ def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_da
     date of ANOTHER lookup campaign of the country; or the lookup lists the campaign but not this round or date. The engine never renames on these findings. Returns
     (issues of rounds starting since `since`, older ones), the same columns."""
     import pandas as pd
-    cols = ["Country", "Campaign_in_live", "Round_in_live", "Start_in_live", "Records", "Issue", "Lookup_says", "Proposal", "Ask", "Message"]
+    cols = ["Country", "Campaign_in_live", "Round_in_live", "Start_in_live", "Records", "Issue", "Lookup_says", "Live_districts", "Scope_says", "Scope_target", "Scope_coverage_pct", "Scope_tie", "Proposal", "Ask", "Message"]
     empty = pd.DataFrame(columns=cols)
     if rep is None or not len(rep) or lookup is None or not len(lookup):
         return empty, empty.copy()
     ck = ckey or (lambda s: str(s).strip().upper())
     rk = rkey or (lambda s: str(s).strip().upper())
+    li, si = _scope_index(live, scope, ck)
     lk = lookup.copy()
     lk["_dt"] = pd.to_datetime(lk["_d"], errors="coerce")
     lk["_c"] = lk["Country"].map(ck)
@@ -3015,14 +3082,99 @@ def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_da
                 issue, says = "Round or date not in the lookup", "the lookup lists %s (nearest %s day(s) away)" % (lists, r.get("Days_difference"))
                 prop, ask = "", "Lookup maintainers (add or correct the round) and the country (confirm the date)"
                 msg = "%s: the lookup lists %s, nearest %s day(s) away. Please add the round to the lookup, or confirm that the date in the live file is wrong." % (me, lists or "this campaign without rounds", r.get("Days_difference"))
+        nd, sev, tgt, cvg, tie = scope_evidence(li, si, ck(r["Country"]), camp, rnd, d, same_name=(issue == "Round or date not in the lookup"), rk=rk)
+        if li is not None and sev.startswith("the districts are those planned"):
+            msg += " Scope: %s." % sev
+        elif li is not None and sev.startswith("the scope lists"):
+            msg += " Scope: %s." % sev
+        elif li is not None and "entered more than once" in sev:
+            msg += " Scope: %s." % sev
+            prop = "The scope and the lookup both hold the campaign more than once: one entry should be removed at the source"
         rows.append({"Country": r["Country"], "Campaign_in_live": camp, "Round_in_live": rnd, "Start_in_live": str(d)[:10], "Records": n, "Issue": issue,
-                     "Lookup_says": says, "Proposal": prop, "Ask": ask, "Message": msg})
+                     "Lookup_says": says, "Live_districts": nd, "Scope_says": sev, "Scope_target": tgt, "Scope_coverage_pct": round(100 * cvg), "Scope_tie": " | ".join(tie), "Proposal": prop, "Ask": ask, "Message": msg})
     out = pd.DataFrame(rows, columns=cols)
     if not len(out):
         return empty, empty.copy()
     out = out.sort_values(["Start_in_live", "Country"], ascending=[False, True])
     recent = out["Start_in_live"] >= str(since)
     return out[recent].reset_index(drop=True), out[~recent].reset_index(drop=True)
+
+
+NAME_ISSUES = ("Name differs from the lookup", "Campaign not in the lookup", "Two or more lookup campaigns on this date", "The date belongs to another lookup campaign")
+
+
+def propose_fixes(issues, lookup, ckey=None, rkey=None, choose=None, min_districts=20, min_coverage=50, near_days=7):
+    """FROM THE LOOKUP ISSUES TO DECIDED CHANGES. For the rows whose scope evidence is strong (the districts are those planned for ONE campaign of the lookup, and either at
+    least `min_districts` live districts or `min_coverage`% of its planned districts have records) it proposes: (1) a corrections line that renames the live campaign to the
+    lookup's name (campaign-wide, Country + Response + Round); (2) a lookup change `add` when the lookup lacks the round of that campaign the live records belong to (no round
+    of it within `near_days` days and not that round number). For a campaign the scope plans TWICE (same districts), `choose` = {live campaign: lookup campaign to keep} turns the
+    row into a rename to the chosen one plus a lookup change `remove` of the other entry. Nothing is applied here. Returns (corrections rows, lookup change rows, not proposed
+    [(row text, reason)])."""
+    import pandas as pd
+    ck = ckey or (lambda s_: str(s_).strip().upper())
+    rk = rkey or (lambda s_: str(s_).strip().upper())
+    choose = {k.strip().upper(): v.strip() for k, v in (choose or {}).items()}
+    lk = lookup.copy()
+    lk["_c"] = lk["Country"].map(ck)
+    lk["_n"] = lk["OBR Name"].map(rk)
+    lk["_dt"] = pd.to_datetime(lk["_d"], errors="coerce")
+    corr, chg, skipped, seen = [], [], [], {}
+
+    def lk_name(name, c):
+        h = lk[(lk["_c"] == c) & (lk["_n"] == rk(name))]
+        return (h["OBR Name"].iloc[0], h) if len(h) else (None, h)
+    for r in issues.to_dict("records"):
+        who = "%s | %s %s | %s" % (r["Country"], r["Campaign_in_live"], r["Round_in_live"], r["Start_in_live"])
+        if r["Issue"] not in NAME_ISSUES:
+            continue
+        c = ck(r["Country"])
+        tie = [t for t in str(r.get("Scope_tie") or "").split(" | ") if t]
+        target, drop = r.get("Scope_target") or "", []
+        if tie:
+            keep = choose.get(str(r["Campaign_in_live"]).strip().upper())
+            if not keep:
+                skipped.append((who, "the scope plans the same districts for %d campaigns (%s): say which to keep with --choose \"%s=<lookup name>\"" % (len(tie), "; ".join(tie), r["Campaign_in_live"])))
+                continue
+            if keep not in tie:
+                skipped.append((who, "--choose names %s, which is not one of the tied campaigns (%s)" % (keep, "; ".join(tie))))
+                continue
+            target, drop = keep, [t for t in tie if t != keep]
+        if not target:
+            skipped.append((who, "no campaign of the scope matches the districts (%s)" % str(r.get("Scope_says"))[:90]))
+            continue
+        nd, cvg = int(r["Live_districts"] or 0), float(r.get("Scope_coverage_pct") or 0)
+        if not tie and nd < min_districts and cvg < min_coverage:
+            skipped.append((who, "weak evidence: %d districts, %d%% of the planned districts of %s have records" % (nd, cvg, target)))
+            continue
+        name, hit = lk_name(target, c)
+        if name is None:
+            skipped.append((who, "%s is planned in the scope but is not in the lookup" % target))
+            continue
+        key = (c, str(r["Campaign_in_live"]), str(r["Round_in_live"]))
+        if key in seen and seen[key] != name:
+            skipped.append((who, "the same live campaign and round would go to two names (%s and %s)" % (seen[key], name)))
+            continue
+        if str(r["Campaign_in_live"]) != name and key not in seen:
+            corr.append({"Country": r["Country"], "Province": "", "District": "", "Response": r["Campaign_in_live"], "Round_Add": r["Round_in_live"], "SIA_date": "",
+                         "Column": "Response", "Found": r["Campaign_in_live"], "Restored": name,
+                         "Reason": ("Scope: " + str(r["Scope_says"]))[:300] if not tie else "Campaign entered twice in the lookup and the scope; kept %s" % name})
+        seen[key] = name
+        for dn in drop:
+            nm, hh = lk_name(dn, c)
+            for _, x in hh.iterrows():
+                chg.append({"Action": "remove", "Country": x["Country"], "OBR Name": x["OBR Name"], "Round Number": x["Round Number"], "Round Start Date": str(x["Round Start Date"])[:10],
+                            "Vaccines": x.get("Vaccines", ""), "Round Status": x.get("Round Status", ""), "New_Round_Start_Date": "",
+                            "Reason": "Same districts and dates as %s in the scope and the lookup: the campaign was entered twice" % name})
+        rn = pd.to_numeric(pd.Series([str(r["Round_in_live"])]).str.extract(r"(\d+)")[0], errors="coerce").iloc[0]
+        d0 = pd.Timestamp(r["Start_in_live"])
+        near = ((hit["_dt"] - d0).abs().dt.days <= near_days).any()
+        if not near and not pd.isna(rn) and rn >= 1 and not (hit["_rn"] == rn).any():
+            chg.append({"Action": "add", "Country": hit["Country"].iloc[0], "OBR Name": name, "Round Number": "Round %d" % int(rn), "Round Start Date": str(d0)[:10],
+                        "Vaccines": hit["Vaccines"].iloc[0] if "Vaccines" in hit.columns else "", "Round Status": "Finished", "New_Round_Start_Date": "",
+                        "Reason": "Live records (%d districts, all planned in %s in the scope) of a round the lookup does not list" % (nd, name)})
+    cc = pd.DataFrame(corr)
+    ch = pd.DataFrame(chg).drop_duplicates() if chg else pd.DataFrame(chg)
+    return cc, ch, skipped
 
 
 def pending_close(out_root, targets, note="", by=""):

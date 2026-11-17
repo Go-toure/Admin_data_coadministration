@@ -57,6 +57,7 @@ DEFAULTS = {
     "district_source": "",                    # optional recovered file used by --district-source
     "submissions_dir": "workspace/submissions_in",   # the files of the countries: 'submissions pull' copies them here from SharePoint
     "submissions_auto": False,                # true: the build also takes the files of automatic rule 1 (see submissions.py), no decision needed
+    "lookup_overrides_file": "workspace/lookup_overrides.csv",   # changes a person decided to the lookup (a campaign entered twice removed, a round added, a start date moved); applied every time the lookup is read
     "corrections_file": "workspace/corrections.csv",   # corrections a person decided; the build applies them (a cell changes only while it holds the value in Found)
     "pending_days": 15,                       # a lookup round with no admin data in the live file this many days after its start is marked pending (submissions pending)
     "pending_since": "2025-01-01",            # rounds that started before this date are old gaps (reference sheet), not pending
@@ -66,6 +67,7 @@ DEFAULTS = {
     "key_columns": ["Country", "Province", "District", "SIA_date", "Round_Add", "Vaccine_type", "Response"],
     "scope_script_dir": "",
     "scope_data_dir": "",
+    "scope_file": "",
     "excel_timeout_min": 30,
     "excel_method": "python",                 # "python": values written into the file, no Excel needed; "excel": desktop Excel
     "excel_visible": True,                    # show the Excel window while it saves (any pop-up can then be answered)
@@ -523,6 +525,8 @@ def cmd_build(a):
          "build": {}}
     save_manifest(rd, m)
     cmd = [sys.executable, P(S["builder"]), base, "--out-dir", out, "--lookup", P(S["lookup"])]
+    if lookup_overrides_path():
+        cmd += ["--lookup-overrides", lookup_overrides_path()]
     geo = P(S["geo"])
     if geo.is_file():
         cmd += ["--geo", geo]
@@ -631,7 +635,7 @@ def cmd_check(a):
     base = load_norm(base_path)
     new = load_norm(final)
     builder = import_builder()
-    lk = builder.load_lookup(str(P(S["lookup"])))
+    lk = builder.load_lookup(str(P(S["lookup"])), lookup_overrides_path())
     hard, warn, info = [], [], []
 
     # 1. header
@@ -1243,6 +1247,8 @@ def cmd_inspect(a):
     od = WORK / "inspect" / stamp
     od.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, P(S["builder"]), path, "--check-only", "--out-dir", od, "--lookup", P(S["lookup"])]
+    if lookup_overrides_path():
+        cmd += ["--lookup-overrides", lookup_overrides_path()]
     if P(S["geo"]).is_file():
         cmd += ["--geo", P(S["geo"])]
     if a.country:
@@ -1252,7 +1258,7 @@ def cmd_inspect(a):
         die("the quality check failed (see %s)." % (od / "inspect.log"))
     pd = _pd()
     builder = import_builder()
-    lk = builder.load_lookup(str(P(S["lookup"])))
+    lk = builder.load_lookup(str(P(S["lookup"])), lookup_overrides_path())
     df = load_norm(path)
     if a.country:
         df = df[df["Country"].map(builder._qcountry) == builder._qcountry(a.country)]
@@ -1331,7 +1337,7 @@ def _submissions_ctx(builder):
     live = load_norm(path)
     gp, lp = P(S["geo"]), P(S["lookup"])
     geo = builder.load_geo(str(gp)) if gp.is_file() else None
-    lk = builder.load_lookup(str(lp)) if lp.is_file() else None
+    lk = builder.load_lookup(str(lp), lookup_overrides_path()) if lp.is_file() else None
     key, blank = builder.dup_key(live)
     index = {}
     for i, k, bl in zip(live.index, key.values, blank.values):
@@ -1389,7 +1395,8 @@ def write_pending(sm, builder, ctx, out_root):
     nodata = cc[1]
     days, since = int(S.get("pending_days") or 15), str(S.get("pending_since") or "2025-01-01")
     res = sm.pending(out_root, nodata, days=days, since=since, update=True, source="the live file (%s) and the lookup of this run" % ctx.live_label, live=ctx.live)
-    li_new, li_old = sm.lookup_issues(cc[0], ctx.lookup, since=since, ckey=builder._lkc, rkey=builder._rk)
+    scope = read_scope()
+    li_new, li_old = sm.lookup_issues(cc[0], ctx.lookup, since=since, ckey=builder._lkc, rkey=builder._rk, live=ctx.live, scope=scope)
     res["Lookup_issues"], res["Lookup_issues_older"] = li_new, li_old
     target = sm.writable(Path(out_root) / "Pending_admin_data.xlsx", log)
     with pd.ExcelWriter(target, engine="openpyxl") as xw:
@@ -1411,6 +1418,110 @@ def write_pending(sm, builder, ctx, out_root):
         print(res["By_country"].head(15).to_string(index=False))
     print("Written: %s (register: %s)\n" % (target, Path(out_root) / "pending_register.json"))
     return res
+
+
+def lookup_overrides_path():
+    """The file of lookup changes a person decided (setting lookup_overrides_file), or None when there is none."""
+    f = S.get("lookup_overrides_file")
+    p = P(f) if f else None
+    return str(p) if p and p.is_file() else None
+
+
+def read_scope():
+    """scope_.csv (districts planned per campaign) from the setting scope_file, or from one level above scope_data_dir; None when there is none."""
+    pd = _pd()
+    sf = S.get("scope_file") or (str(P(S.get("scope_data_dir")).parent / "scope_.csv") if S.get("scope_data_dir") else "")
+    if sf and Path(sf).is_file():
+        try:
+            df = pd.read_csv(sf, dtype=str)
+            log("Scope file %s (%d rows) is used as evidence (districts planned per campaign)." % (Path(sf).name, len(df)))
+            return df
+        except Exception as e:
+            log("The scope file %s could not be read (%s): without it." % (sf, e))
+    else:
+        log("No scope file (setting scope_file, or scope_.csv one level above scope_data_dir): without the scope evidence.")
+    return None
+
+
+def cmd_lookup_fix(a):
+    """From the lookup issues to DECIDED changes. `propose` (default) lists, from the live file, the lookup and the scope, the corrections (live campaign renamed to the lookup
+    name) and the lookup changes (a round added, a campaign entered twice removed) that the evidence supports, and writes them to workspace/lookup_fix_proposals.xlsx: nothing is
+    applied. `adopt --by NAME` writes them as decided lines into corrections.csv and lookup_overrides.csv (the build applies both); old files are kept as .bak copies."""
+    pd = _pd()
+    sm = import_submissions()
+    builder = import_builder()
+    path, label = resolve_source("live")
+    log("Reading the live file (%s) ..." % label)
+    live = load_norm(path)
+    lk = builder.load_lookup(str(P(S["lookup"])), lookup_overrides_path())
+    scope = read_scope()
+    if scope is None:
+        die("lookup-fix needs the scope file: set scope_file (or scope_data_dir) in admin_settings.json.")
+    cc = builder.lookup_crosscheck(live, lk)
+    since = str(S.get("pending_since") or "2025-01-01")
+    n_, o_ = sm.lookup_issues(cc[0], lk, since=since, ckey=builder._lkc, rkey=builder._rk, live=live, scope=scope)
+    issues = pd.concat([n_, o_], ignore_index=True) if getattr(a, "older", False) else n_   # older rounds (before pending_since) only with --older: they were not reviewed
+    choose = {}
+    for c in (a.choose or []):
+        if "=" not in c:
+            die("--choose wants LIVE CAMPAIGN=LOOKUP CAMPAIGN, got: %s" % c)
+        k, v = c.split("=", 1)
+        choose[k.strip()] = v.strip()
+    corr, chg, skipped = sm.propose_fixes(issues, lk, ckey=builder._lkc, rkey=builder._rk, choose=choose)
+    print("\nLookup issues considered: %d (rounds since %s%s). Supported by the scope evidence: %d correction(s) of a live campaign name, %d lookup change(s). Not proposed: %d.\n" % (
+        len(issues), since, ", and the older ones" if getattr(a, "older", False) else "; %d older ones are not proposed (--older)" % len(o_), len(corr), len(chg), len(skipped)))
+    if len(corr):
+        print("Corrections (live campaign -> lookup name):")
+        print(corr[["Country", "Response", "Round_Add", "Restored"]].to_string(index=False))
+    if len(chg):
+        print("\nLookup changes:")
+        print(chg[["Action", "Country", "OBR Name", "Round Number", "Round Start Date"]].to_string(index=False))
+    if skipped:
+        print("\nNot proposed:")
+        for w_, why in skipped:
+            print("  %s\n      %s" % (w_, why))
+    out = P("workspace/lookup_fix_proposals.xlsx")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    target = sm.writable(out, log)
+    with pd.ExcelWriter(target, engine="openpyxl") as xw:
+        (corr if len(corr) else pd.DataFrame(columns=["Country", "Response", "Round_Add", "Restored"])).to_excel(xw, sheet_name="Corrections", index=False)
+        (chg if len(chg) else pd.DataFrame(columns=builder.OVERRIDE_COLS)).to_excel(xw, sheet_name="Lookup_changes", index=False)
+        pd.DataFrame(skipped, columns=["Round", "Why not proposed"]).to_excel(xw, sheet_name="Not_proposed", index=False)
+        issues.to_excel(xw, sheet_name="Lookup_issues", index=False)
+    print("\nWritten: %s" % target)
+    if a.action != "adopt":
+        print("Nothing was changed. To decide them: python admin.py lookup-fix adopt --by \"Your name\"  (a campaign the scope plans twice needs --choose \"LIVE NAME=LOOKUP NAME TO KEEP\").\n")
+        return
+    if not a.by:
+        die("adopt needs --by \"name\": the decision is written with the name of the person who decides.")
+    import datetime as dt
+    stamp, today = dt.datetime.now().strftime("%Y%m%d_%H%M%S"), dt.datetime.now().strftime("%Y-%m-%d")
+
+    def append(path_s, new, keycols, cols):
+        p = P(path_s)
+        cols = list(dict.fromkeys(cols))
+        old = pd.read_csv(p, dtype=str, keep_default_na=False, encoding="utf-8-sig") if p.is_file() else pd.DataFrame(columns=cols)
+        if p.is_file():
+            import shutil
+            shutil.copyfile(p, str(p) + ".bak_" + stamp)
+        new = new.copy()
+        new["Decided_by"], new["Decided_on"] = a.by, today
+        have = set(tuple(str(x) for x in r) for r in old.reindex(columns=keycols).fillna("").values.tolist())
+        keep = new[[tuple(str(x) for x in r) not in have for r in new.reindex(columns=keycols).fillna("").values.tolist()]]
+        allc = list(dict.fromkeys(list(old.columns) + list(cols)))
+        res = pd.concat([old, keep], ignore_index=True).reindex(columns=allc).fillna("")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        res.to_csv(p, index=False, encoding="utf-8-sig")
+        return len(keep), len(new) - len(keep), p
+    if len(corr):
+        n1, d1, p1 = append(S.get("corrections_file") or "workspace/corrections.csv", corr, ["Country", "Response", "Round_Add", "Column", "Found", "Restored"],
+                            ["Country", "Province", "District", "Response", "Round_Add", "SIA_date", "Column", "Found", "Restored", "Reason", "Decided_by", "Decided_on"])
+        print("corrections: %d line(s) added to %s, %d already there." % (n1, p1.name, d1))
+    if len(chg):
+        n2, d2, p2 = append(S.get("lookup_overrides_file") or "workspace/lookup_overrides.csv", chg, ["Action", "Country", "OBR Name", "Round Number", "Round Start Date"],
+                            builder.OVERRIDE_COLS + ["Decided_by", "Decided_on"])
+        print("lookup changes: %d line(s) added to %s, %d already there." % (n2, p2.name, d2))
+    print("Decided by %s on %s. The next build applies them; `python admin.py corrections` shows what the corrections would change in the live file.\n" % (a.by, today))
 
 
 def cmd_corrections(a):
@@ -1699,7 +1810,8 @@ RULES = [
     ("submissions", "Intake", "The files the countries send (SharePoint folder Admin_data_submissions, copied read-only to workspace/submissions_in by 'admin.py submissions pull', which 'submissions inspect' runs first) are inspected one by one. The decisions (accept / reject, who, the note) are made in the Operations Center and kept in its AdminOps folder; a build on the PC reads that ledger first (read only, ADMIN_STORE_SHARE_URL) so that it adds exactly what the app accepted, and says so in the manifest and in the check when it could not: layout (template, template with other header spellings, mapped by certain synonyms, or not usable), normalisation of every cell (capitals, spaces, country / province / vaccine / round spelling, dates, numbers as text, percentages, Year / SIAMTH / Ctry_Code / AFRO_block, the constants the live file has), the portal quality checks, the campaigns against the lookup, duplicates inside the file, and every record against the live file (new / same / other figures). A file with no campaign name (a Nigeria eTally or tally) is wired to the lookup by its date: a campaign keeps its planned start date, so data dated on or after a planned start belong to that campaign until the next planned start (at most 60 days back), data of a campaign that ran up to 21 days before its planned start belong to that campaign, and anything else stays unwired for a person; Response, round and the planned date are written and the date in the file is kept in the note. When the file gives a round the lookup does not have (Cycle_2 in the file name, a round column, a hint) and the campaign that started last before the date has its last lookup round just below it, within 60 days, the records are the next round of the same campaign: same Response, that round, the date of the records; the lookup is then missing a round, which is listed in the report sheet Lookup_gaps, and a person confirms. An operator accepts or rejects each file; only accepted files are used, and only their NEW records are added at the end of the next build, before every other rule. Records already in the live file are never changed by a submission: the differences are listed.", "Request of 5 Nov 2026", "admin.py submissions inspect | list | accept | reject; build --no-submissions"),
     ("submissions-clean", "Intake", "What the intake no longer asks a person about (16 Nov 2026). NO LOSS (17 Nov 2026, automatic rule 4): every new record that passed the validation and the standardisation and is not a duplicate goes into the live file, also when its file has other findings; a record that fails (an Error of the quality checks, the target or the number vaccinated is not a number (text in a calculated column does not hold a record), a key field still empty, another country than the folder) is held back with its reason in the sheet Held_back_records and in prepared/<hash>_held.xlsx, as are records that look like live ones with other figures or match several live records. Files in the wrong folder or with a vaccine that disagrees with the lookup wait whole. NAME ALIGNMENT (17 Nov 2026): a record at the same place, within 3 days of the same date and with the same vaccine as exactly one live record is that live record under another campaign name (CAM-2025-11-01 for CAM-2026-01, NOPV2 for bOPV-nOPV2): it is not added, not held, and the pair is listed as an alias in the inspection. A DIFFERENT ROUND is accepted as the same record only when the file gives no real round (a date, empty) or when the lookup gives the live record's round for that campaign and date; otherwise the record is held for the country to confirm, never dropped (the live file may number a campaign's rounds differently from the lookup). FEEDBACK TO THE COUNTRIES: `python admin.py submissions feedback` writes Feedback_to_countries.md and .xlsx (one line per country, file and matter: target population missing, failed check, empty fields, text instead of numbers, unit not clear, same place and date with other figures, campaign name or round differs, vaccine differs from the lookup, sheet not read, wrong folder, calculated columns with errors), from the held-back records and the findings, in plain words with what the country does; nobody has to write it by hand. It also writes one workbook per country, ready to send, in workspace/submissions/feedback_by_country (sheet What to do with an Action needed column, sheet Records with the held-back rows and the reason; a country with nothing to do gets a file marked information_only); the francophone countries (list FRENCH_COUNTRIES in submissions.py) get the sheet À faire and a French read-me beside the English ones; every inspect writes them too, so one command (inspect, which also pulls the files from SharePoint) gives the report, the summary, the feedback and the country workbooks. NOT ADMIN DATA: a file with no admin columns whose name says IM, LQAS, AEFI, supplies, call-in or a summary is labelled NOT ADMIN DATA and ignored; a file with no template columns and no such name is NOT ignored (it is reported as another layout). (1) Coverage above the ceiling is for reference only: the live file has its own coverage columns, so the records are kept and the inspection only says how many there are. (2) Duplicates are removed: a record with the same place and the same figures as a live record under another campaign name, round or date is not added (the report counts it as removed); a copy of the same new records in two files with the same figures is kept once by the build. Only records with other figures than their twin are left for a person. (3) New records are standardised with the lookup: an empty or near-spelled Response gets the lookup name, an empty round gets the lookup round, and a named campaign whose records carry another date gets the lookup's PLANNED start date (the file's date goes in the notes); this uses the same date rules as the wiring of records without a campaign name, and the round the file gives is respected. Standardised dates are listed (code date_standardized) and the lookup-confirmed rule can accept them.", "Request of 16 Nov 2026", "none: always on in submissions inspect"),
     ("submissions-pending", "Intake", "PENDING ADMIN DATA (17 Nov 2026). A round of the lookup (GPEI) whose admin data are not in the live file 15 days after its planned start date is marked pending, so the data can be followed until they arrive. Every `submissions inspect` (and `submissions pending`, which only reads the live file and the lookup, about a minute) compares the live file with the lookup of the run and writes Pending_admin_data.xlsx in workspace/submissions: Pending_now (nothing received for the round, in no submitted file, and no live record of the country near its start date: ask the country), Date_differs_in_live (the live file has the campaign and round at another date than the lookup, within 35 days: a date to correct, not missing data; a file is matched to a lookup round by the lookup date of its records, never by the round number it writes), Check_other_name (nothing received but the live file has at least 5 records of the country within 10 days of the start: the round may be there under another campaign name or date; a person aligns the name before the country is asked), Received_not_in_live (a submitted file holds records of the round that are not in the live file yet: the next build, a decision or a correction is what is missing), Not_yet_due (started less than 15 days ago), Resolved (the data arrived), Closed, Older_rounds_no_data (rounds before pending_since, reference only), By_country. Each round has an age group (15-30, 31-90, over 90 days) and the date the engine first flagged it. pending_register.json (workspace/submissions) is the follow-up list: first flagged, resolved when the round is no longer missing, closed when a person says the round did not take place (`python admin.py submissions pending --close \"COUNTRY|campaign|Round n\" --note \"why\"`, then run `submissions pending` again). The rounds of Pending_now are also written into the feedback to the countries (matter: data not received, in English and, for the francophone countries, in French: send the admin data of the round in the AFRO template or tell us the round did not take place); a country with only pending rounds gets a workbook too. The workbooks of an earlier run move to feedback_by_country/_previous so that only the current ones are in the folder; a report that is open in Excel is written under the same name with the time added.", "Request of 17 Nov 2026", "settings pending_days (default 15) and pending_since (default 2025-01-01)"),
-    ("submissions-lookup-issues", "Intake", "LOOKUP ISSUES (17 Nov 2026). Campaign rounds that are in the live file but that the lookup (GPEI) cannot place are listed in Pending_admin_data.xlsx, sheets Lookup_issues (rounds starting since pending_since) and Lookup_issues_older, with a message for the lookup maintainers and, when it helps, the country. Five kinds: the campaign is not in the lookup at all; the name differs from ONE lookup campaign starting within 7 days (a proposal, a person confirms); TWO or more lookup campaigns start within 7 days (e.g. DRC 28 Aug 2025: two campaigns, same date, same vaccines, so the data cannot say which one); the date is the start date of ANOTHER lookup campaign of the country; the lookup lists the campaign but not this round or date (e.g. Nigeria Round 2). A difference of up to 7 days is a date the build corrects, not an issue. The engine never renames a campaign because of these findings: the lookup is the reference, and an ambiguous case is a decision for a person (a line in workspace/corrections.csv once decided) or a fix at the source.", "Found 17 Nov 2026 (DRC and Nigeria rounds the lookup does not place)", "(always, with the pending admin data)"),
+    ("submissions-lookup-issues", "Intake", "LOOKUP ISSUES (17 Nov 2026). Campaign rounds that are in the live file but that the lookup (GPEI) cannot place are listed in Pending_admin_data.xlsx, sheets Lookup_issues (rounds starting since pending_since) and Lookup_issues_older, with a message for the lookup maintainers and, when it helps, the country. Five kinds: the campaign is not in the lookup at all; the name differs from ONE lookup campaign starting within 7 days (a proposal, a person confirms); TWO or more lookup campaigns start within 7 days (e.g. DRC 28 Aug 2025: two campaigns, same date, same vaccines, so the data cannot say which one); the date is the start date of ANOTHER lookup campaign of the country; the lookup lists the campaign but not this round or date (e.g. Nigeria Round 2). A difference of up to 7 days is a date the build corrects, not an issue. SCOPE EVIDENCE: when the scope file is available (setting scope_file, or scope_.csv one level above scope_data_dir) each row also compares the DISTRICTS of the live records with the districts the scope plans for each campaign of the country within 60 days (geo_code, else the district name): the districts are those planned for ONE campaign (a strong proposal, never applied); the scope plans the same districts for two campaigns (the campaign is entered twice, e.g. DRC 28 Aug 2025: 518 identical districts); or, for a campaign the lookup knows, what the scope lists for it (rounds, districts). Fewer than 5 districts cannot tell campaigns apart. The engine never renames a campaign on its own because of these findings: the lookup is the reference, and a case is a decision for a person (a line in workspace/corrections.csv, a change in lookup_overrides.csv: `python admin.py lookup-fix adopt` writes the ones the scope evidence supports) or a fix at the source.", "Found 17 Nov 2026 (DRC and Nigeria rounds the lookup does not place); scope evidence added the same day", "(always, with the pending admin data)"),
+    ("lookup-overrides", "Build", "DECIDED CHANGES TO THE LOOKUP (17 Nov 2026). The lookup is the GPEI calendar and is refreshed from GPEI, so a change made in lookup.xlsx would be lost at the next refresh. A change a person decides is a line in workspace/lookup_overrides.csv (setting lookup_overrides_file; columns Action, Country, OBR Name, Round Number, Round Start Date, Vaccines, Round Status, New_Round_Start_Date, Reason, Decided_by, Decided_on) and is applied every time the lookup is read (the build, the check, the inspection, the pending data): `remove` drops a campaign entered twice, `add` adds a round the lookup lacks (not when it already has that round of that campaign or one within 7 days), `move` changes a start date. A line already made by GPEI counts as already in the lookup; a line that matches nothing is reported, never guessed. `python admin.py lookup-fix` (propose, nothing is changed) lists what the lookup issues and the scope evidence support: the live campaigns to rename to the lookup name (corrections lines) and the lookup changes; `lookup-fix adopt --by NAME [--choose \"LIVE NAME=LOOKUP NAME TO KEEP\"]` writes them as decided lines into corrections.csv and lookup_overrides.csv (old files kept as .bak copies; lines already there are not repeated); the next build applies both. Only rounds since pending_since are proposed (--older for the rest, not reviewed). Proposed only when the scope evidence is strong: the districts are those planned for ONE campaign, and at least 20 live districts or 50% of its planned districts have records; a campaign the scope plans twice needs --choose. Checked on v35 (17 Nov 2026): 10 renames (2,515 records) and 2 lookup changes (remove DRC-2025-06-01_nOPV_NID Round 1 of 28 Aug 2025 as the duplicate of DRC-2025-08-01_n-bOPV_NID; add Round 2 of DRC-2025-11-01_n-bOPV_NID on 2025-12-11) bring the lookup issues since 2025 from 19 to 6, the rest being gaps at the source (Nigeria Round 2 of NIE-2025-08-01_n-bOPV_sNID and others).", "Request of 17 Nov 2026 (wire the DRC cases, update the lookup)", "setting lookup_overrides_file (default workspace/lookup_overrides.csv; no file, no changes)"),
     ("build-corrections", "Build", "DECIDED CORRECTIONS (17 Nov 2026). The engine does not change a live record on its own when a submitted file has other figures or another date for it; a person decides, and the decision is a line in workspace/corrections.csv (columns Country, Province, District, Response, Round_Add, SIA_date, Column, Found, Restored, Reason, Decided_by, Decided_on; one line per cell, the record is found by its identity and the date it has now). The build applies the file (--corrections, setting corrections_file) before the duplicate check and lists every change in the Repairs of the audit file (rule: Decided correction, with the reason and who decided). A cell is changed only while it still holds the value in Found: a line already applied is counted as already in place (also when the record's date was corrected by the same file), and a record or cell changed since is skipped and reported, never overwritten. `python admin.py corrections` shows what the file would change in the live file (applied, already in place, skipped with the reason) and changes nothing. A line with District empty is campaign-wide: it changes every record of Country + Response + Round_Add (optionally one SIA_date) and needs Found, which guards each record; it is how a campaign gets the name the lookup has. Uses so far (17 Nov 2026): Zimbabwe Round 2 of ZIM-2026-03-01_nOPV_sNID (27 districts), dated 2026-06-02 as the lookup says instead of 2026-07-02, with the vaccinated figures of the file Zimbabwe R1 and R2 adminstrative coverage 2026 (vaccinated, nOPV2 total, coverage recalculated; the target population of the live record is kept); Zimbabwe Round 1 figures of the same file; Zimbabwe Round 3 renamed from the placeholder POLIO to the lookup campaign; five DRC campaigns renamed to the lookup name (29 Jan, 26 Feb, 16 Apr 2026, June 2025 Round 2, June 2026 Round 2; 1,282 records). Two DRC cases are NOT renamed: 28 Aug 2025 (the lookup has two campaigns on that date) and 3 Sept 2026 (the live name matches the other lookup campaign of that name).", "Request of 17 Nov 2026", "setting corrections_file (default workspace/corrections.csv; no file, no corrections)"),
     ("submissions-auto", "Intake", "Automatic rule 1 (switch: submissions_auto in admin_settings.json, off by default). A file nobody has decided on is taken into the build by itself only when every finding of its inspection is harmless: records already in the live file with other figures (never changed by a submission), a header mapping that was certain, records left out, many warnings. A file with an Error, a coverage above the ceiling, a date far from its campaign, a campaign guessed from the live file or the file name, values never seen, cells that are not numbers, a possible duplicate, records also new in another file or an eTally conversion always waits for a person. A decision of a person, accepted or rejected, always wins. Rule 3 (the engine learns from the people): a file with the same name pattern, country folder and layout as a file a person accepted is taken again when it shows no kind of finding that one did not show and none of the hard ones (an Error, several live units, a possible duplicate, an overlap, another country, cells that are not numbers, a vaccine that differs from the lookup, an unreadable sheet). admin.py submissions summary lists, by country, where the new records are, what holds them back and who can fix it, and which lookup rounds with no data are in a submitted file. Rule 2 (needs an inspection made by this version): when every campaign round of the file is a round of the lookup (same country, campaign, date and round) and the vaccine agrees, a campaign taken from the lookup or the file name, a year typed wrongly and an eTally export added up by LGA are harmless too. The files taken are listed in the log, in the manifest and in the check.", "Request of 16 Nov 2026", "--no-auto-submissions; admin.py submissions auto lists what the rule would take"),
     ("text-clean", "Hygiene", "Stray control characters (carriage returns), line breaks and double / edge spaces in Country, Province, District, Response, Vaccine_type and Round_Add are removed.", "Found in District (KAJIADO EAST) 30 Oct 2026", "--no-clean-text"),
@@ -1791,6 +1903,11 @@ def main():
     s.add_argument("--note", help="accept / reject: a note kept in the ledger"); s.add_argument("--by", help="who decides (default: the user name)")
     s.add_argument("--no-refresh-lookup", action="store_true")
     s.add_argument("--close", action="store_true", help="pending: mark the given rounds ('COUNTRY|campaign|Round n') as closed: the round did not take place or no data are expected")
+    s = sub.add_parser("lookup-fix", help="from the lookup issues and the scope to decided changes: propose (default, nothing is changed) or adopt (writes corrections.csv and lookup_overrides.csv)")
+    s.add_argument("action", nargs="?", choices=["propose", "adopt"], default="propose")
+    s.add_argument("--by", help="adopt: who decides (written in the decided lines)")
+    s.add_argument("--older", action="store_true", help="also propose for rounds before pending_since (not reviewed: check each line)")
+    s.add_argument("--choose", action="append", help="a campaign the scope plans twice: LIVE NAME=LOOKUP NAME TO KEEP (the other entry is removed from the lookup); repeatable")
     sub.add_parser("corrections", help="show what the corrections file (decided corrections) would change in the live file; nothing is changed")
     s = sub.add_parser("duplicates", help="list the duplicates of a file and what removing them would do (nothing is changed)")
     s.add_argument("--source", help="live (default), vNN build, bN backup version, or a file"); s.add_argument("--country")
@@ -1811,7 +1928,7 @@ def main():
           "excel": cmd_excel, "publish": cmd_publish, "dictionary": cmd_dictionary, "all": cmd_all, "commit": cmd_commit,
           "sync-scope": cmd_sync_scope, "doctor": cmd_doctor, "inspect": cmd_inspect, "find": cmd_find,
           "compare": cmd_compare, "rules": cmd_rules, "baseinfo": cmd_baseinfo, "duplicates": cmd_duplicates,
-          "submissions": cmd_submissions, "corrections": cmd_corrections}[a.cmd]
+          "submissions": cmd_submissions, "corrections": cmd_corrections, "lookup-fix": cmd_lookup_fix}[a.cmd]
     log("admin.py %s" % " ".join(sys.argv[1:]), quiet=True)
     try:
         fn(a)

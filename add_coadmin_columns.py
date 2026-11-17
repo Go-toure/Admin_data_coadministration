@@ -207,6 +207,8 @@ def main():
                                      "of every campaign (default: lookup.xlsx next to this script, kept up to date by the "
                                      "lookup fetch pipeline)")
     ap.add_argument("--no-lookup", action="store_true", help="do not use the campaign lookup")
+    ap.add_argument("--lookup-overrides", help="CSV of changes a person decided to the lookup (remove a campaign entered twice, add a round, move a start date); "
+                                               "applied after the lookup is read, see apply_lookup_overrides")
     ap.add_argument("--keep-copied-rounds", action="store_true",
                     help="do not remove the rounds that the lookup does not have and that copy another round of the "
                          "same Response and date (they are removed by default and listed in the audit)")
@@ -354,7 +356,7 @@ def main():
         lk_path = find_lookup(a.lookup, a.src)
         if lk_path:
             try:
-                lk = load_lookup(lk_path)
+                lk = load_lookup(lk_path, getattr(a, "lookup_overrides", None))
                 print("lookup: %s (%d rounds, %d countries)" % (lk_path, len(lk), lk["_ck"].nunique()), flush=True)
             except Exception as e:
                 print("lookup not used (%s): %s" % (lk_path, e), flush=True)
@@ -3019,13 +3021,90 @@ def find_lookup(user_path, src):
     return None
 
 
-def load_lookup(path):
+OVERRIDE_COLS = ["Action", "Country", "OBR Name", "Round Number", "Round Start Date", "Vaccines", "Round Status", "New_Round_Start_Date", "Reason", "Decided_by", "Decided_on"]
+
+
+def apply_lookup_overrides(L, path):
+    """DECIDED CHANGES TO THE LOOKUP. The lookup is the GPEI calendar and is refreshed from GPEI; a person can decide a change that stays until GPEI has made it: one line
+    per change in a CSV file (columns Action, Country, OBR Name, Round Number, Round Start Date, Vaccines, Round Status, New_Round_Start_Date, Reason, Decided_by, Decided_on).
+    Action `remove`: drop the lookup rows of Country + OBR Name (+ Round Number, + Round Start Date when given), e.g. a campaign entered twice. Action `add`: add a round
+    (Country, OBR Name, Round Number, Round Start Date, Vaccines, Round Status), unless the lookup already has that round of that campaign or a round of it within 7 days.
+    Action `move`: change Round Start Date to New_Round_Start_Date for the matching row. A line whose change is already in the lookup counts as 'already in place', a line that
+    matches nothing as 'not matched'; nothing else is touched. Returns (lookup, {'applied': n, 'already': n, 'not_matched': [(line, reason)]})."""
+    rep = {"applied": 0, "already": 0, "not_matched": []}
+    try:
+        C = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    except Exception as e:
+        rep["not_matched"].append((0, "file not readable: %s" % e))
+        return L, rep
+    L = L.copy()
+    L["_x_ck"] = L["Country"].map(_lkc)
+    L["_x_rk"] = L["OBR Name"].map(_rk)
+    L["_x_d"] = pd.to_datetime(L["Round Start Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    L["_x_rn"] = L["Round Number"].map(_rnum)
+    for n, r in enumerate(C.to_dict("records"), start=2):
+        act = (r.get("Action") or "").strip().lower()
+        if not act:
+            continue
+        ck, rk_ = _lkc(r.get("Country", "")), _rk(r.get("OBR Name", ""))
+        rn = _rnum(r["Round Number"]) if (r.get("Round Number") or "").strip() else None
+        d = pd.to_datetime(r.get("Round Start Date") or None, errors="coerce")
+        d = d.strftime("%Y-%m-%d") if not pd.isna(d) else None
+        m = (L["_x_ck"] == ck) & (L["_x_rk"] == rk_)
+        if rn is not None and not pd.isna(rn):
+            m &= (L["_x_rn"] == rn)
+        if d:
+            m &= (L["_x_d"] == d)
+        if act == "remove":
+            if m.any():
+                L = L[~m]
+                rep["applied"] += 1
+            else:
+                rep["already"] += 1
+        elif act == "add":
+            if not d:
+                rep["not_matched"].append((n, "add needs a Round Start Date"))
+                continue
+            same = L[(L["_x_ck"] == ck) & (L["_x_rk"] == rk_)]
+            have = (rn is not None and not pd.isna(rn) and (same["_x_rn"] == rn).any()) or \
+                   ((pd.to_datetime(same["_x_d"], errors="coerce") - pd.Timestamp(d)).abs().dt.days <= 7).any()
+            if have:
+                rep["already"] += 1
+                continue
+            row = {c: None for c in L.columns}
+            row.update({"Round Number": r.get("Round Number") or "", "OBR Name": r["OBR Name"], "Country": r["Country"], "Vaccines": r.get("Vaccines") or "",
+                        "Round Start Date": pd.Timestamp(d), "Round Status": r.get("Round Status") or "Finished", "_x_ck": ck, "_x_rk": rk_, "_x_d": d, "_x_rn": rn})
+            L = pd.concat([L, pd.DataFrame([row])], ignore_index=True)
+            rep["applied"] += 1
+        elif act == "move":
+            nd = pd.to_datetime(r.get("New_Round_Start_Date") or None, errors="coerce")
+            if pd.isna(nd):
+                rep["not_matched"].append((n, "move needs New_Round_Start_Date"))
+            elif m.any():
+                L.loc[m, "Round Start Date"] = nd
+                L.loc[m, "_x_d"] = nd.strftime("%Y-%m-%d")
+                rep["applied"] += 1
+            elif ((L["_x_ck"] == ck) & (L["_x_rk"] == rk_) & (L["_x_d"] == nd.strftime("%Y-%m-%d"))).any():
+                rep["already"] += 1
+            else:
+                rep["not_matched"].append((n, "no lookup row of that campaign / round / start date"))
+        else:
+            rep["not_matched"].append((n, "unknown Action '%s' (remove, add, move)" % act))
+    return L.drop(columns=["_x_ck", "_x_rk", "_x_d", "_x_rn"]).reset_index(drop=True), rep
+
+
+def load_lookup(path, overrides=None):
     L = pd.read_excel(path)
     need = ["Round Number", "OBR Name", "Country", "Round Start Date"]
     miss = [c for c in need if c not in L.columns]
     if miss:
         raise ValueError("columns missing: " + ", ".join(miss))
     L = L[L["OBR Name"].notna()].copy()
+    if overrides and os.path.isfile(overrides):
+        L, rp = apply_lookup_overrides(L, overrides)
+        print("lookup overrides (%s): %d change(s) applied, %d already in the lookup%s" % (
+            os.path.basename(overrides), rp["applied"], rp["already"],
+            ("; NOT MATCHED: " + "; ".join("line %s: %s" % x for x in rp["not_matched"])) if rp["not_matched"] else ""), flush=True)
     L["_ck"] = L["Country"].map(_lkc)
     L["_rk"] = L["OBR Name"].map(_rk)
     L["_d"] = pd.to_datetime(L["Round Start Date"], errors="coerce").dt.strftime("%Y-%m-%d")
