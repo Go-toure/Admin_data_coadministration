@@ -252,6 +252,9 @@ def main():
     ap.add_argument("--add-records", action="append", default=[], metavar="FILE",
                     help="records prepared by 'admin.py submissions' (template layout): the ones whose key is not in the input are "
                          "added at the end of the data before anything else is done; may be given several times")
+    ap.add_argument("--corrections", metavar="FILE",
+                    help="corrections a person decided (CSV: Country, Province, District, Response, Round_Add, SIA_date, Column, Found, Restored, Reason, Decided_by, Decided_on); "
+                         "a cell is changed only while it still holds the value in Found")
     ap.add_argument("--no-fix-list", action="store_true", help="do not write the per-country fix list (Fix_list_by_country.xlsx)")
     ap.add_argument("--no-fill-cvpolio", action="store_true",
                     help="do not fill an empty CVPolio with TotalNbrVaccPolio / PopPolio")
@@ -518,6 +521,22 @@ def main():
                   (os.path.basename(a.district_source), len(rfills),
                    sum(1 for v in rfills.values() if v["confidence"] == "high"),
                    sum(1 for v in rfills.values() if v["confidence"] != "high")), flush=True)
+
+    # corrections a person decided (--corrections): applied with the value they were found with, and listed with the repairs
+    if getattr(a, "corrections", None):
+        try:
+            cchg, crep = apply_corrections(df, a.corrections)
+        except Exception as e:
+            cchg, crep = [], {"applied": 0, "already": 0, "skipped": [(0, "the corrections file could not be read: %s" % e)]}
+        for i, col, val, old_, why, line in cchg:
+            df.at[i, col] = val
+            repl[(i, col)] = val
+            repairs.append({"Excel row": int(df.at[i, "_row"]), "Country": df.at[i, "Country"], "Province": df.at[i, "Province"],
+                            "District": df.at[i, "District"], "SIA_date": _dkey(df.at[i, "SIA_date"]), "Column": col,
+                            "Found": old_, "Rule": "Decided correction (line %d of the corrections file)" % line, "Restored": val,
+                            "Source": why, "Confidence": "decided", "Check": ""})
+        print("decided corrections: %d change(s) applied, %d already in place, %d skipped%s" % (
+            crep["applied"], crep["already"], len(crep["skipped"]), "".join("\n  line %s: %s" % x for x in crep["skipped"][:10])), flush=True)
 
     # SIA_date written as text ("18-sept-20", "2020-09-18 00:00:00 UTC" ...) is turned into a real date
     date_log = []
@@ -1909,6 +1928,77 @@ def fix_province_spelling(df, geo):
                 continue          # the district belongs to another province of the reference: not a spelling difference
             out[i] = (prov, target)
     return out
+
+
+CORRECTION_COLS = ["Country", "Province", "District", "Response", "Round_Add", "SIA_date", "Column", "Found", "Restored"]
+
+
+def _corr_text(v):
+    """A cell as comparable text: dates as YYYY-MM-DD, whole numbers without decimals, numbers rounded to 6 decimals, text upper-cased and trimmed."""
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return ""
+    if hasattr(v, "strftime"):
+        return v.strftime("%Y-%m-%d")
+    t = str(v).strip()
+    if re.fullmatch(r"\d{4}-\d\d-\d\d([ T].*)?", t):
+        return t[:10]
+    try:
+        f = float(t)
+        return str(int(f)) if f == int(f) else str(round(f, 6))
+    except ValueError:
+        return t.upper()
+
+
+def apply_corrections(df, path):
+    """DECIDED CORRECTIONS. A file of corrections a person decided (columns Country, Province, District, Response, Round_Add, SIA_date, Column, Found, Restored, and
+    Reason, Decided_by, Decided_on) is applied to the data. A record is found by its identity and the date it has NOW (SIA_date of the line, as found); a change
+    is made only when the cell still holds the value in `Found` (a line already applied, or a record changed since, is skipped and said so), so the file can stay
+    in place and the build can run again. Nothing is guessed: the new values are the decision. Returns (changes, report): changes = [(index, column, new value,
+    found, reason, line)], report = {"applied", "already", "skipped": [(line, why)]}."""
+    cor = pd.read_csv(path, dtype=str, keep_default_na=False)
+    miss = [c for c in CORRECTION_COLS if c not in cor.columns]
+    if miss:
+        raise ValueError("the corrections file %s has no column %s" % (path, ", ".join(miss)))
+    ident = ["Country", "Province", "District", "Response", "Round_Add"]
+    key = pd.Series(["|".join(_corr_text(r[c]) for c in ident) + "|" + _corr_text(r["SIA_date"]) for _, r in df[ident + ["SIA_date"]].iterrows()], index=df.index)
+    where = {}
+    for i, k in key.items():
+        where.setdefault(k, []).append(i)
+    changes, skipped, applied, already = [], [], 0, 0
+    # a record whose date the file corrects is found under its new date too, so that the same file can be used again after the correction is in the data
+    newdate = {"|".join(_corr_text(r[c]) for c in ident) + "|" + _corr_text(r["SIA_date"]): _corr_text(r["Restored"])
+               for _, r in cor.iterrows() if r["Column"].strip() == "SIA_date"}
+    for n, r in cor.reset_index(drop=True).iterrows():
+        line = n + 2
+        k = "|".join(_corr_text(r[c]) for c in ident) + "|" + _corr_text(r["SIA_date"])
+        hit = where.get(k, [])
+        if not hit and k in newdate:
+            hit = where.get("|".join(_corr_text(r[c]) for c in ident) + "|" + newdate[k], [])
+        col = r["Column"].strip()
+        if col not in df.columns:
+            skipped.append((line, "no column %s in the data" % col))
+        elif not hit:
+            skipped.append((line, "record not found (changed since, or already corrected under another date)"))
+        elif len(hit) > 1:
+            skipped.append((line, "%d records have this identity: not applied" % len(hit)))
+        else:
+            i = hit[0]
+            cur, new = _corr_text(df.at[i, col]), _corr_text(r["Restored"])
+            if cur == new:
+                already += 1
+            elif r["Found"].strip() != "" and cur != _corr_text(r["Found"]):
+                skipped.append((line, "%s holds %s, not %s: not applied" % (col, df.at[i, col], r["Found"])))
+            else:
+                v = r["Restored"].strip()
+                if col == "SIA_date":
+                    v = pd.Timestamp(v).to_pydatetime()
+                elif re.fullmatch(r"-?\d+", v):
+                    v = int(v)
+                elif re.fullmatch(r"-?\d*\.\d+", v):
+                    v = float(v)
+                changes.append((i, col, v, df.at[i, col], "%s (decided by %s, %s)" % (r.get("Reason", "") or "decided correction", r.get("Decided_by", "") or "?", r.get("Decided_on", "") or "?"), line))
+                applied += 1
+    return changes, {"applied": applied, "already": already, "skipped": skipped}
 
 
 def append_records(ws, header, files):

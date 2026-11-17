@@ -2779,11 +2779,12 @@ def summary(out_root, audit=None):
             def rnum(x):
                 m = re.search(r"(\d+)", str(x))
                 return int(m.group(1)) if m else None
-            cv = cv.assign(_k=cv["Response"].map(rk), _r=cv["Round_Add"].map(rnum))
+            cv = cv.assign(_k=cv["Response"].map(rk), _ld=pd.to_datetime(cv["Lookup_start_date"].astype(str).str[:10], errors="coerce"))
             st = {e["name"]: e for e in ledger["files"].values()}
             rec = []
             for _, r in nd.iterrows():
-                hit = cv[(cv["_k"] == rk(r["OBR Name"])) & (cv["_r"] == rnum(r["Round Number"]))]
+                _sd = pd.to_datetime(str(r["Round Start Date"])[:10], errors="coerce")
+                hit = cv[(cv["_k"] == rk(r["OBR Name"])) & cv["_ld"].notna() & ((cv["_ld"] - _sd).abs().dt.days <= 7)]
                 files = [x for x in hit["File"].dropna().unique() if x in st and st[x].get("present", True) and not st[x].get("superseded")]
                 n_new = max([int(st[x].get("new") or 0) for x in files] or [0])
                 rec.append({"Country": r["Country"], "Campaign": r["OBR Name"], "Round": r["Round Number"], "Planned_start": str(r["Round Start Date"])[:10],
@@ -2857,7 +2858,15 @@ def pending(out_root, nodata, days=PENDING_DAYS, since="2025-01-01", today=None,
         m = re.search(r"(\d+)", str(x))
         return int(m.group(1)) if m else None
     if cv is not None and len(cv):
-        cv = cv.assign(_k=cv["Response"].map(rk), _r=cv["Round_Add"].map(rnum))
+        # a file is matched to a lookup round by the lookup date of its records, not by the round number the file writes (the live file may number rounds
+        # differently from the lookup: a file that says Round 3 on 6 October is the lookup's Round 1)
+        cv = cv.assign(_k=cv["Response"].map(rk), _ld=pd.to_datetime(cv["Lookup_start_date"].astype(str).str[:10], errors="coerce"))
+    inlive = {}      # (campaign, round number) -> dates of the live records: the same round at another date (a typo in the month or the day)
+    if live is not None and len(live) and {"Response", "Round_Add", "SIA_date"} <= set(live.columns):
+        _d = pd.to_datetime(live["SIA_date"].astype(str).str[:10], errors="coerce")
+        for a_, b_, d_ in zip(live["Response"], live["Round_Add"], _d):
+            if not pd.isna(d_):
+                inlive.setdefault((rk(a_), rnum(b_)), set()).add(d_)
     rows, old, notyet = [], [], []
     for _, r in (nodata if nodata is not None else pd.DataFrame()).iterrows():
         start = pd.to_datetime(str(r["Round Start Date"])[:10], errors="coerce")
@@ -2875,14 +2884,17 @@ def pending(out_root, nodata, days=PENDING_DAYS, since="2025-01-01", today=None,
             continue
         files, n_new = [], 0
         if cv is not None and len(cv):
-            hit = cv[(cv["_k"] == rk(r["OBR Name"])) & (cv["_r"] == rnum(r["Round Number"]))]
+            hit = cv[(cv["_k"] == rk(r["OBR Name"])) & cv["_ld"].notna() & ((cv["_ld"] - start).abs().dt.days <= 7)]
             files = [x for x in hit["File"].dropna().unique() if x in st and st[x].get("present", True) and not st[x].get("superseded")]
             n_new = max([int(st[x].get("new") or 0) for x in files] or [0])
         n_near = 0
         if near.get(base["Country"]) is not None:
             arr = near[base["Country"]]
             n_near = int(((arr >= np.datetime64(start.date() - pd.Timedelta(days=near_days).to_pytimedelta())) & (arr <= np.datetime64(start.date() + pd.Timedelta(days=near_days).to_pytimedelta()))).sum())
-        if not files and n_near >= near_min:
+        if any(abs((d_ - start).days) <= 35 for d_ in inlive.get((rk(r["OBR Name"]), rnum(r["Round Number"])), ())):
+            status, nxt = "In the live file under another date", ("The live file has this campaign and round, but not at the lookup's planned start date (%s): check the date of the live records "
+                                                                  "(a typo in the date is the usual cause); a submitted file may carry other figures for it" % start.strftime("%Y-%m-%d"))
+        elif not files and n_near >= near_min:
             status, nxt = "Check: live records of the country near the start date", ("The live file has %d record(s) of this country within %d days of the planned start: the data may be there under another campaign name or date; "
                                                                                       "align the name (python admin.py find --country ... --date ...) before asking the country" % (n_near, near_days))
         elif not files:
@@ -2919,8 +2931,10 @@ def pending(out_root, nodata, days=PENDING_DAYS, since="2025-01-01", today=None,
     live_ = cur[~cur["_closed"]] if len(cur) else cur
     pend = live_[live_["Status"] == "Pending: nothing received"] if len(live_) else live_
     chk = live_[live_["Status"].str.startswith("Check:")] if len(live_) else live_
+    dd = live_[live_["Status"].str.startswith("In the live file")] if len(live_) else live_
     recv = live_[live_["Status"].str.startswith("Received")] if len(live_) else live_
     out["Pending_now"] = pend[cols].sort_values(["Country", "Planned_start"]) if len(pend) else pd.DataFrame(columns=cols)
+    out["Date_differs_in_live"] = dd[cols].sort_values(["Country", "Planned_start"]) if len(dd) else pd.DataFrame(columns=cols)
     out["Check_other_name"] = chk[cols].sort_values(["Country", "Planned_start"]) if len(chk) else pd.DataFrame(columns=cols)
     out["Received_not_in_live"] = recv[cols].sort_values(["Country", "Planned_start"]) if len(recv) else pd.DataFrame(columns=cols)
     out["By_country"] = (pend.groupby("Country").agg(Rounds_pending=("Campaign", "size"), Oldest_start=("Planned_start", "min"), Max_days_since_start=("Days_since_start", "max"))
@@ -2933,7 +2947,7 @@ def pending(out_root, nodata, days=PENDING_DAYS, since="2025-01-01", today=None,
     out["Older_rounds_no_data"] = pd.DataFrame(old).sort_values(["Country", "Planned_start"]) if old else pd.DataFrame(columns=["Country", "Campaign", "Round", "Planned_start"])
     out = {"Read_me": pd.DataFrame({"Pending admin data": [
         "A round of the lookup (GPEI) is PENDING when its admin data are not in the live file %d days after its planned start date (checked on %s, rounds that started on or after %s)." % (days, now, since),
-        "Pending_now: nothing received for the round, in no submitted file, and no live record of the country near its start date: ask the country. Check_other_name: nothing received, but the live file has records of the country near the start date (the round may be there under another campaign name or date): a person checks and aligns before the country is asked. Received_not_in_live: a submitted file holds records of the round, they are not in the live file yet (next build, a decision, or a correction by the country).",
+        "Pending_now: nothing received for the round, in no submitted file, and no live record of the country near its start date: ask the country. Date_differs_in_live: the live file has the campaign and round but at another date than the lookup (a person corrects the date). Check_other_name: nothing received, but the live file has records of the country near the start date (the round may be there under another campaign name or date): a person checks and aligns before the country is asked. Received_not_in_live: a submitted file holds records of the round, they are not in the live file yet (next build, a decision, or a correction by the country).",
         "Not_yet_due: rounds that started less than %d days ago, to watch. Older_rounds_no_data: rounds before %s with no data, kept for reference. Resolved: the data arrived in the live file. Closed: a person said the round did not take place or is not expected." % (days, since),
         "First_flagged is the date the engine first saw the round pending (pending_register.json, kept in the workspace). To close a round: python admin.py submissions pending --close \"COUNTRY|campaign|Round n\" --note \"why\".",
         "Source of the live and lookup rounds: %s." % (source or "the last inspection")]}), **out}
