@@ -2977,6 +2977,52 @@ def _scope_index(live, scope, ck):
     return li, si
 
 
+def _scope_windows(scope, ck, rk):
+    """Round windows the scope carries (round_end_date, mop_up_*; added from the GPEI API by scripts/enrich_scope.py): {(country, campaign, round): (start, end, [(mop-up start, mop-up end)])}.
+    Empty when the scope has no round_end_date."""
+    import pandas as pd
+    if scope is None or not len(scope) or "round_end_date" not in scope.columns:
+        return {}
+    S = scope.copy()
+    S["_c"] = S["country"].map(ck)
+    S["_r"] = S["response"].map(rk)
+    S["_s"] = pd.to_datetime(S["round_start_date"], errors="coerce")
+    S["_e"] = pd.to_datetime(S["round_end_date"], errors="coerce")
+    for c in ("mop_up_start_date", "mop_up_end_date"):
+        S["_" + c] = pd.to_datetime(S[c], errors="coerce") if c in S.columns else pd.NaT
+    out = {}
+    for (c, r, n), g in S.dropna(subset=["_s", "_e"]).groupby(["_c", "_r", "roundNumber"]):
+        x = g.iloc[0]
+        mop = [(x["_mop_up_start_date"], x["_mop_up_end_date"])] if pd.notna(x["_mop_up_start_date"]) and pd.notna(x["_mop_up_end_date"]) else []
+        out[(c, r, str(n))] = (x["_s"], x["_e"], mop)
+    return out
+
+
+def window_accepts(win, li, si, country_key, camp, rnd, date, rk, slack_days=35, min_districts=5, strong=0.9):
+    """Can the GPEI round window place a live round the lookup could not? Returns the reason, or "". (1) the live date is inside the round's window (start to end, or the mop-up window): the lookup only holds the start date;
+    (2) the date is within `slack_days` days of the window and the live districts are those the scope plans for that very round (>= `strong`, at least `min_districts` districts): the round ran earlier or later than planned."""
+    import pandas as pd
+    w = win.get((country_key, rk(camp), str(rnd)))
+    if not w:
+        return ""
+    s, e, mop = w
+    d = pd.Timestamp(date)
+    if s <= d <= e:
+        return "the live date %s is inside the round window in GPEI (%s to %s)" % (str(d)[:10], str(s)[:10], str(e)[:10])
+    for ms, me in mop:
+        if ms <= d <= me:
+            return "the live date %s is inside the mop-up window in GPEI (%s to %s)" % (str(d)[:10], str(ms)[:10], str(me)[:10])
+    gap = (s - d).days if d < s else (d - e).days
+    L = (li or {}).get((country_key, camp, str(rnd), str(d)[:10]), set())
+    if gap <= slack_days and len(L) >= min_districts:
+        for r, n, dd, S in si.get(country_key, []) if si else []:
+            if rk(r) == rk(camp) and str(n) == str(rnd):
+                if len(L & S) / len(L) >= strong:
+                    return "the live districts are those planned for this round, which GPEI dates %s to %s (the live date is %d days %s)" % (str(s)[:10], str(e)[:10], gap, "before" if d < s else "after")
+                break
+    return ""
+
+
 def scope_evidence(li, si, country_key, camp, rnd, date, days=60, min_districts=5, strong=0.9, same_name=False, rk=None):
     """Which campaign does the scope plan for the districts of these live records? Returns (live districts, text, target campaign or "", share of its planned districts that have records, tied campaigns). The text says: the live districts are those planned for ONE
     campaign (share of the live districts that are planned in it, share of its planned districts that have records); or the scope lists the same districts for two or more
@@ -3020,14 +3066,15 @@ def scope_evidence(li, si, country_key, camp, rnd, date, days=60, min_districts=
         r, v[1], str(v[2])[:10], round(o * 100), len(L), round(cv * 100), v[5], also), r, cv, []
 
 
-def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_days=7, same_day=3, live=None, scope=None):
+def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_days=7, same_day=3, live=None, scope=None, accepted=None):
     """LOOKUP ISSUES. Campaign rounds that are in the live file but that the lookup cannot place, written for the people who keep the lookup (the GPEI side) and,
     when it helps, the country. `rep` is the first table of builder.lookup_crosscheck(live, lookup) (one row per campaign round of the data with its status).
     Only two statuses are issues of the lookup: 'Response not in the lookup' and 'Date not in the lookup for this Response' (a difference of up to 7 days is a
     date the build corrects, not an issue). Each is told apart: the campaign is not in the lookup at all; the name differs from ONE lookup campaign that starts within
     `near_days` days (a proposal, a person confirms); TWO or more lookup campaigns start within `near_days` days (the data cannot say which one); the date is the start
     date of ANOTHER lookup campaign of the country; or the lookup lists the campaign but not this round or date. The engine never renames on these findings. Returns
-    (issues of rounds starting since `since`, older ones), the same columns."""
+    (issues of rounds starting since `since`, older ones), the same columns. When the scope carries the GPEI round windows (round_end_date) a round whose date the window explains is not an issue: it is appended to the list `accepted`, when given.
+    Campaigns GPEI flags as test (is_test) are left out of the scope evidence."""
     import pandas as pd
     cols = ["Country", "Campaign_in_live", "Round_in_live", "Start_in_live", "Records", "Issue", "Lookup_says", "Live_districts", "Scope_says", "Scope_target", "Scope_coverage_pct", "Scope_tie", "Proposal", "Ask", "Message"]
     empty = pd.DataFrame(columns=cols)
@@ -3035,7 +3082,10 @@ def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_da
         return empty, empty.copy()
     ck = ckey or (lambda s: str(s).strip().upper())
     rk = rkey or (lambda s: str(s).strip().upper())
+    if scope is not None and "is_test" in scope.columns:
+        scope = scope[scope["is_test"].astype(str).str.lower() != "true"]
     li, si = _scope_index(live, scope, ck)
+    win = _scope_windows(scope, ck, rk)
     lk = lookup.copy()
     lk["_dt"] = pd.to_datetime(lk["_d"], errors="coerce")
     lk["_c"] = lk["Country"].map(ck)
@@ -3079,6 +3129,12 @@ def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_da
                 prop, ask = "Cannot be decided from the data", "Lookup maintainers and the country (which campaign the records belong to)"
                 msg = "%s: the date is the start date of %s in the lookup, while the name in the live file is %s, which the lookup lists as %s. Which one is right?" % (me, "; ".join(short(x) for _, x in other.iterrows()), camp, lists or "not at all")
             else:
+                why = window_accepts(win, li, si, ck(r["Country"]), camp, rnd, d, rk) if win else ""
+                if why:
+                    if accepted is not None:
+                        accepted.append({"Country": r["Country"], "Campaign_in_live": camp, "Round_in_live": rnd, "Start_in_live": str(d)[:10], "Records": n,
+                                         "Lookup_says": "the lookup lists %s" % lists, "Engine_reading": why})
+                    continue
                 issue, says = "Round or date not in the lookup", "the lookup lists %s (nearest %s day(s) away)" % (lists, r.get("Days_difference"))
                 prop, ask = "", "Lookup maintainers (add or correct the round) and the country (confirm the date)"
                 msg = "%s: the lookup lists %s, nearest %s day(s) away. Please add the round to the lookup, or confirm that the date in the live file is wrong." % (me, lists or "this campaign without rounds", r.get("Days_difference"))
