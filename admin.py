@@ -1490,7 +1490,7 @@ def read_scope():
 
 def cmd_lookup_fix(a):
     """From the lookup issues to DECIDED changes. `propose` (default) lists, from the live file, the lookup and the scope, the corrections (live campaign renamed to the lookup
-    name) and the lookup changes (a round added, a campaign entered twice removed) that the evidence supports, and writes them to workspace/lookup_fix_proposals.xlsx: nothing is
+    name) and the lookup changes (a round added, a campaign entered twice removed) that the evidence supports, and writes them to workspace/submissions/lookup_fix_proposals.xlsx: nothing is
     applied. `adopt --by NAME` writes them as decided lines into corrections.csv and lookup_overrides.csv (the build applies both); old files are kept as .bak copies."""
     pd = _pd()
     sm = import_submissions()
@@ -1534,7 +1534,7 @@ def cmd_lookup_fix(a):
         print("\nNot proposed:")
         for w_, why in skipped:
             print("  %s\n      %s" % (w_, why))
-    out = P("workspace/lookup_fix_proposals.xlsx")
+    out = WORK / "submissions" / "lookup_fix_proposals.xlsx"      # in the synced folder: the Operations Center shows it
     out.parent.mkdir(parents=True, exist_ok=True)
     target = sm.writable(out, log)
     with pd.ExcelWriter(target, engine="openpyxl") as xw:
