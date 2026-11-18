@@ -3103,41 +3103,95 @@ def lookup_issues(rep, lookup, since="2025-01-01", ckey=None, rkey=None, near_da
 NAME_ISSUES = ("Name differs from the lookup", "Campaign not in the lookup", "Two or more lookup campaigns on this date", "The date belongs to another lookup campaign")
 
 
-def propose_fixes(issues, lookup, ckey=None, rkey=None, choose=None, min_districts=20, min_coverage=50, near_days=7):
+def propose_fixes(issues, lookup, ckey=None, rkey=None, choose=None, min_districts=20, min_coverage=50, near_days=7, rep=None, vset=None, live=None):  # rep is kept for callers that pass it
     """FROM THE LOOKUP ISSUES TO DECIDED CHANGES. For the rows whose scope evidence is strong (the districts are those planned for ONE campaign of the lookup, and either at
     least `min_districts` live districts or `min_coverage`% of its planned districts have records) it proposes: (1) a corrections line that renames the live campaign to the
     lookup's name (campaign-wide, Country + Response + Round); (2) a lookup change `add` when the lookup lacks the round of that campaign the live records belong to (no round
-    of it within `near_days` days and not that round number). For a campaign the scope plans TWICE (same districts), `choose` = {live campaign: lookup campaign to keep} turns the
-    row into a rename to the chosen one plus a lookup change `remove` of the other entry. Nothing is applied here. Returns (corrections rows, lookup change rows, not proposed
-    [(row text, reason)])."""
+    of it within `near_days` days and not that round number). For a campaign the scope plans TWICE (the lookup entered it twice: same districts, same start date, same round
+    and vaccines) the entry whose planning month (YYYY-MM in its name) is the month of the start date is kept and the other removed from the lookup, when that is unique;
+    `choose` = {live campaign: lookup campaign to keep} overrides it.
+    Each proposal has a Tier. `auto` = the engine can decide it alone: strong evidence AND the rename changes nothing in how the engine treats the vaccines. The
+    co-administration rule reads the NAME of the campaign (a name with nOPV and bOPV makes a single-vaccine record without a partner a co-administered one), so a rename is `auto`
+    when both names say the same about the vaccines, or when no single-vaccine record is left without a partner in its district and date; otherwise `review`, with the reason in
+    Tier_note (for example the 264 Nigerian records of NIE-2026-01-SNID, whose new name names both vaccines). `vset` and `live` give the vaccines of the live records. Nothing is applied here. Returns (corrections rows, lookup change rows, not proposed [(row text, reason)])."""
+    import re
     import pandas as pd
     ck = ckey or (lambda s_: str(s_).strip().upper())
     rk = rkey or (lambda s_: str(s_).strip().upper())
+    vs = vset or (lambda s_: set())
     choose = {k.strip().upper(): v.strip() for k, v in (choose or {}).items()}
     lk = lookup.copy()
     lk["_c"] = lk["Country"].map(ck)
     lk["_n"] = lk["OBR Name"].map(rk)
     lk["_dt"] = pd.to_datetime(lk["_d"], errors="coerce")
+    has_live = live is not None and len(live) and {"Country", "Response", "Round_Add", "Vaccine_type", "District", "SIA_date"} <= set(live.columns)
+    if has_live:
+        live = live.assign(_c=live["Country"].map(ck))
+
+    def both(n_):
+        """The engine's co-administration rule looks at the NAME of the campaign: a name that holds nOPV and bOPV makes a single-vaccine record without a partner a co-administered one."""
+        l_ = str(n_).lower()
+        return "nopv" in l_ and "bopv" in l_
+
+    def unpaired(c_, camp_, rnd_):
+        """Single-vaccine records of the campaign that have no record of the other vaccine in the same district and date: the only ones the name can change. None when not known."""
+        if not has_live:
+            return None
+        g_ = live[(live["_c"] == c_) & (live["Response"].astype(str) == camp_) & (live["Round_Add"].astype(str) == rnd_)]
+        sets_ = g_["Vaccine_type"].map(lambda x: frozenset(vs(x)))
+        g_ = g_[sets_.map(len) == 1].assign(_v=[next(iter(x)) for x in sets_[sets_.map(len) == 1]])
+        if not len(g_):
+            return 0
+        # a campaign that shows the "separate records" practice (a district with an nOPV2 record AND a bOPV record on the same date, or a combined record with two different
+        # vaccinated totals) keeps its single-vaccine records as they are, whatever its name says
+        pairs_ = g_.groupby([g_["District"].astype(str), g_["SIA_date"].astype(str)])["_v"].transform("nunique")
+        if (pairs_ >= 2).any():
+            return 0
+        if {"Tot_Vacc_nOPV2", "Total_Vacc_bOPV"} <= set(live.columns):
+            allg = live[(live["_c"] == c_) & (live["Response"].astype(str) == camp_) & (live["Round_Add"].astype(str) == rnd_)]
+            two = allg[allg["Vaccine_type"].map(lambda x: len(vs(x)) == 2)]
+            if len(two) and (two["Tot_Vacc_nOPV2"].astype(str) != two["Total_Vacc_bOPV"].astype(str)).any():
+                return 0
+        per = g_.groupby([g_["Province"].astype(str) if "Province" in g_.columns else "", g_["District"].astype(str), g_["SIA_date"].astype(str)])["_v"].transform("nunique")
+        return int((per < 2).sum())
     corr, chg, skipped, seen = [], [], [], {}
 
     def lk_name(name, c):
         h = lk[(lk["_c"] == c) & (lk["_n"] == rk(name))]
         return (h["OBR Name"].iloc[0], h) if len(h) else (None, h)
+
+    def month_gap(name, d0):
+        m = re.search(r"(20\d\d)-(\d\d)", str(name))
+        if not m:
+            return None
+        return abs((d0.year - int(m.group(1))) * 12 + d0.month - int(m.group(2)))
     for r in issues.to_dict("records"):
         who = "%s | %s %s | %s" % (r["Country"], r["Campaign_in_live"], r["Round_in_live"], r["Start_in_live"])
         if r["Issue"] not in NAME_ISSUES:
             continue
         c = ck(r["Country"])
+        d0 = pd.Timestamp(r["Start_in_live"])
         tie = [t for t in str(r.get("Scope_tie") or "").split(" | ") if t]
-        target, drop = r.get("Scope_target") or "", []
+        target, drop, tie_note, by_choice = r.get("Scope_target") or "", [], "", False
         if tie:
             keep = choose.get(str(r["Campaign_in_live"]).strip().upper())
-            if not keep:
-                skipped.append((who, "the scope plans the same districts for %d campaigns (%s): say which to keep with --choose \"%s=<lookup name>\"" % (len(tie), "; ".join(tie), r["Campaign_in_live"])))
-                continue
-            if keep not in tie:
-                skipped.append((who, "--choose names %s, which is not one of the tied campaigns (%s)" % (keep, "; ".join(tie))))
-                continue
+            if keep:
+                if keep not in tie:
+                    skipped.append((who, "--choose names %s, which is not one of the tied campaigns (%s)" % (keep, "; ".join(tie))))
+                    continue
+                by_choice = True
+            else:
+                rows_ = pd.concat([lk_name(t, c)[1] for t in tie])
+                same = rows_["Vaccines"].astype(str).nunique() == 1 and rows_["_d"].nunique() == 1 and rows_["_rn"].nunique() == 1
+                gaps = {t: month_gap(t, d0) for t in tie}
+                best = sorted((g, t) for t, g in gaps.items() if g is not None)
+                if same and len(best) == len(tie) and (len(best) == 1 or best[0][0] < best[1][0]):
+                    keep = best[0][1]
+                    tie_note = "kept %s: the planning month in its name is the start month (%s); the other entries are the same campaign (same start date, round, vaccines, districts)" % (keep, str(d0)[:7])
+                else:
+                    skipped.append((who, "the scope plans the same districts for %d campaigns (%s) and nothing in the lookup separates them: say which to keep with --choose \"%s=<lookup name>\"" % (
+                        len(tie), "; ".join(tie), r["Campaign_in_live"])))
+                    continue
             target, drop = keep, [t for t in tie if t != keep]
         if not target:
             skipped.append((who, "no campaign of the scope matches the districts (%s)" % str(r.get("Scope_says"))[:90]))
@@ -3154,24 +3208,37 @@ def propose_fixes(issues, lookup, ckey=None, rkey=None, choose=None, min_distric
         if key in seen and seen[key] != name:
             skipped.append((who, "the same live campaign and round would go to two names (%s and %s)" % (seen[key], name)))
             continue
+        # tier: the vaccines of the records against the vaccines the lookup lists for the target
+        if by_choice:
+            tier, tnote = "decided", "chosen with --choose"
+        elif both(name) == both(r["Campaign_in_live"]):
+            tier, tnote = "auto", "the engine treats the vaccines the same under both names"
+        else:
+            unp = unpaired(c, str(r["Campaign_in_live"]), str(r["Round_in_live"]))
+            if unp is None:
+                tier, tnote = "review", "the vaccines of the records are not known"
+            elif unp == 0:
+                tier, tnote = "auto", "no single-vaccine record is left without a partner, so the name changes nothing for the vaccines"
+            else:
+                tier, tnote = "review", "%d single-vaccine record(s) have no record of the other vaccine in the same district and date; the name %s %s, so the engine would treat them as %s" % (
+                    unp, name, "names both vaccines" if both(name) else "no longer names both vaccines", "co-administered (it copies the vaccinated figure to the other vaccine)" if both(name) else "single-vaccine again")
         if str(r["Campaign_in_live"]) != name and key not in seen:
             corr.append({"Country": r["Country"], "Province": "", "District": "", "Response": r["Campaign_in_live"], "Round_Add": r["Round_in_live"], "SIA_date": "",
                          "Column": "Response", "Found": r["Campaign_in_live"], "Restored": name,
-                         "Reason": ("Scope: " + str(r["Scope_says"]))[:300] if not tie else "Campaign entered twice in the lookup and the scope; kept %s" % name})
+                         "Reason": (tie_note or ("Scope: " + str(r["Scope_says"])))[:300], "Tier": tier, "Tier_note": tnote})
         seen[key] = name
         for dn in drop:
             nm, hh = lk_name(dn, c)
             for _, x in hh.iterrows():
                 chg.append({"Action": "remove", "Country": x["Country"], "OBR Name": x["OBR Name"], "Round Number": x["Round Number"], "Round Start Date": str(x["Round Start Date"])[:10],
                             "Vaccines": x.get("Vaccines", ""), "Round Status": x.get("Round Status", ""), "New_Round_Start_Date": "",
-                            "Reason": "Same districts and dates as %s in the scope and the lookup: the campaign was entered twice" % name})
+                            "Reason": "Same districts and dates as %s in the scope and the lookup: the campaign was entered twice" % name, "Tier": tier, "Tier_note": tnote})
         rn = pd.to_numeric(pd.Series([str(r["Round_in_live"])]).str.extract(r"(\d+)")[0], errors="coerce").iloc[0]
-        d0 = pd.Timestamp(r["Start_in_live"])
         near = ((hit["_dt"] - d0).abs().dt.days <= near_days).any()
         if not near and not pd.isna(rn) and rn >= 1 and not (hit["_rn"] == rn).any():
             chg.append({"Action": "add", "Country": hit["Country"].iloc[0], "OBR Name": name, "Round Number": "Round %d" % int(rn), "Round Start Date": str(d0)[:10],
                         "Vaccines": hit["Vaccines"].iloc[0] if "Vaccines" in hit.columns else "", "Round Status": "Finished", "New_Round_Start_Date": "",
-                        "Reason": "Live records (%d districts, all planned in %s in the scope) of a round the lookup does not list" % (nd, name)})
+                        "Reason": "Live records (%d districts, all planned in %s in the scope) of a round the lookup does not list" % (nd, name), "Tier": tier, "Tier_note": tnote})
     cc = pd.DataFrame(corr)
     ch = pd.DataFrame(chg).drop_duplicates() if chg else pd.DataFrame(chg)
     return cc, ch, skipped
