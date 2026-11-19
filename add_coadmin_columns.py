@@ -334,6 +334,10 @@ def main():
     added_log = []
     if a.add_records:
         added_log = append_records(ws, header, a.add_records)
+        if added_log:     # where each added record came from: the Operations Center keeps it per build (Live data tab)
+            os.makedirs(rev_dir, exist_ok=True)
+            pd.DataFrame([{k: v for k, v in r.items() if k != "Excel row"} for r in added_log]).rename(columns={"file": "Source_file"}).to_csv(
+                os.path.join(rev_dir, "records_added_from_submissions.csv"), index=False, encoding="utf-8-sig")
     cells = list(ws.iter_rows(min_row=2, max_col=ncol))
     cells = [r for r in cells if any(c.value is not None for c in r)]
     n = len(cells)
@@ -2104,8 +2108,13 @@ def append_records(ws, header, files):
             for h, (fm, origin) in formulas.items():
                 ws.cell(row=last, column=idx[h] + 1).value = Translator(fm, origin=origin).translate_formula(
                     ws.cell(row=last, column=idx[h] + 1).coordinate)
-            out.append({"Excel row": last, "Country": sub.iloc[i]["Country"], "Province": sub.iloc[i]["Province"],
-                        "District": sub.iloc[i]["District"], "Response": sub.iloc[i]["Response"], "file": Path(f).name})
+            rec = {"Excel row": last, "Country": sub.iloc[i]["Country"], "Province": sub.iloc[i]["Province"],
+                   "District": sub.iloc[i]["District"], "Response": sub.iloc[i]["Response"], "file": Path(f).name}
+            for extra in ("SIA_date", "Round_Add", "Vaccine_type"):
+                if extra in sub.columns:
+                    v = sub.iloc[i][extra]
+                    rec[extra] = "" if v is None or (not isinstance(v, str) and pd.isna(v)) else str(v)[:10] if extra == "SIA_date" else str(v)
+            out.append(rec)
     print("records added from submissions: %d (%d already in the file or without a key, skipped; %d of them the same record as one of an earlier accepted file, with other figures)" % (len(out), skipped, skipped_other), flush=True)
     return out
 

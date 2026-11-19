@@ -22,6 +22,7 @@ import datetime as dt
 import difflib
 import hashlib
 import json
+import os
 import re
 import shutil
 import unicodedata
@@ -1875,6 +1876,15 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     other = cmp_["Status"].str.startswith("possible duplicate: same place") | cmp_["Status"].str.startswith("same names as several")
     ho = P[other.values].drop(columns=["_src_row", "_sheet"])[template_cols].copy()
     ho["Hold_reason"] = (cmp_.loc[other.values, "Status"] + ": " + cmp_.loc[other.values, "Note"].astype(str)).values
+    co = cmp_.loc[other.values]
+    ho["Triage"] = [triage_label(a, b, c, d, e) for a, b, c, d, e in zip(co["Status"], co["Fig_file_vacc"], co["Fig_live_vacc"], co["Fig_file_pop"], co["Fig_live_pop"])]
+    ho["Live_vacc"], ho["Live_pop"] = co["Fig_live_vacc"].values, co["Fig_live_pop"].values
+    ho["Held_key"] = [held_key(r.Country, r.Province, r.District, r.SIA_date, r.Response, r.Round_Add, r.Vaccine_type) for r in ho.itertuples()]
+    closed_ = getattr(ctx, "_closed_keys", set())
+    if closed_:                                  # closed by a person as 'duplicate, not added': listed in s['closed_dup'], no longer held
+        was = len(ho)
+        ho = ho[~ho["Held_key"].isin(closed_)].copy()
+        s["closed_dup"] = was - len(ho)
     det["hold"] = hold[isnew]
     det["held_other"] = ho
     s["clean_new"] = int((hold[isnew] == "").sum())
@@ -2080,6 +2090,7 @@ def compare_with_live(P, ctx, prof):
     cols = [c for c in FIGURE_COLS + ["Date_Report"] if c in P.columns]
     for i in range(len(P)):
         alias = None
+        figs = None
         k = key.iat[i]
         cand = ctx.live_index.get(k)
         if not cand:
@@ -2145,6 +2156,7 @@ def compare_with_live(P, ctx, prof):
                     if gap <= 10 and not same_fig and st == "new":
                         st = "possible duplicate: same place, date and vaccine as a live record of another campaign name or round, other figures"
                         note = "live row %d (%s %s, %s)" % (lab + 2, rs, ro, d_.strftime("%Y-%m-%d"))
+                        figs = (tot, tt, pop, po)          # the figures of both records: the triage of the held records (triage_label)
         else:
             best, best_d = None, None
             for j in cand:
@@ -2178,8 +2190,57 @@ def compare_with_live(P, ctx, prof):
         rows.append({"Row_in_file": rowref(P, i), "Country": P.at[i, "Country"], "Province": P.at[i, "Province"],
                      "District": P.at[i, "District"], "SIA_date": P.at[i, "SIA_date"].strftime("%Y-%m-%d"),
                      "Round_Add": P.at[i, "Round_Add"], "Vaccine_type": P.at[i, "Vaccine_type"], "Response": P.at[i, "Response"],
-                     "Status": st, "Note": note, "Live_campaign": alias[2] if alias else "", "Live_round": alias[3] if alias else ""})
+                     "Status": st, "Note": note, "Live_campaign": alias[2] if alias else "", "Live_round": alias[3] if alias else "",
+                     "Fig_file_vacc": "" if figs is None or pd.isna(figs[0]) else figs[0], "Fig_live_vacc": "" if figs is None or pd.isna(figs[1]) else figs[1],
+                     "Fig_file_pop": "" if figs is None or pd.isna(figs[2]) else figs[2], "Fig_live_pop": "" if figs is None or pd.isna(figs[3]) else figs[3]})
     return pd.DataFrame(rows), pd.DataFrame(diffs)
+
+
+TRIAGE_SAME = "Probably the same campaign re-sent"
+TRIAGE_FAR = "Figures differ a lot from the live record"
+TRIAGE_LOOK = "Needs a look"
+
+
+def triage_label(status, file_vacc, live_vacc, file_pop, live_pop):
+    """A held record that looks like a live record under another campaign name, round or date, sorted for the person who closes it:
+    the target within 1% and the children vaccinated within 5% of the live record = probably the same campaign sent again; the target more than 25%
+    or the vaccinated more than 50% away = the figures differ a lot (another campaign or a correction); anything else needs a look.
+    A record with the same names as several live records always needs a look. The triage only sorts: nothing is closed by it."""
+    if not str(status).startswith("possible duplicate"):
+        return TRIAGE_LOOK
+
+    def num(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return float("nan")
+    fv, lv, fp, lp = num(file_vacc), num(live_vacc), num(file_pop), num(live_pop)
+    vd = abs(fv - lv) / lv if lv == lv and lv > 0 and fv == fv else None
+    pdiff = abs(fp - lp) / lp if lp == lp and lp > 0 and fp == fp else None
+    if vd is None and pdiff is None:
+        return TRIAGE_LOOK
+    if (pdiff is not None and pdiff > 0.25) or (vd is not None and vd > 0.5):
+        return TRIAGE_FAR
+    if (pdiff is None or pdiff <= 0.01) and (vd is None or vd <= 0.05):
+        return TRIAGE_SAME
+    return TRIAGE_LOOK
+
+
+def held_key(country, province, district, date, response, round_, vaccine):
+    """The identity of a record for the 'closed' list (held_closed.json): the same place, date, campaign, round and vaccine."""
+    def t(x):
+        return "" if x is None or (isinstance(x, float) and x != x) else str(x).strip().lower()
+    d = t(date)[:10]
+    return "|".join([t(country), t(province), t(district), d, t(response), t(round_), t(vaccine)])
+
+
+def load_closed_keys(out_root):
+    """The held records a person closed as 'duplicate, not added' (kept by the Operations Center in submissions/held_closed.json): {key}."""
+    try:
+        d = json.loads((Path(out_root) / "held_closed.json").read_text(encoding="utf-8"))
+        return {k for g in d.get("closed", []) for k in g.get("keys", [])}
+    except (OSError, ValueError, AttributeError):
+        return set()
 
 
 def quality_issues(P, ctx, prof):
@@ -2231,6 +2292,100 @@ def folder_country_of(rel_path, geo, b):
     return None
 
 
+# ---- incremental inspection: the result of a file is kept while nothing it depends on changed ----------------------------------------------
+CACHE_VERSION = 1
+
+
+def _frame_hash(df):
+    """A hash of the whole content of a table (None when it cannot be hashed: the cache is then not used)."""
+    try:
+        return hashlib.sha256(pd.util.hash_pandas_object(df.astype(str), index=False).values.tobytes()).hexdigest()[:20]
+    except Exception:
+        return None
+
+
+def inspect_context_key(ctx, template_cols, out_root, files):
+    """Everything an inspection result depends on besides the file itself: the engine code, the live file, the lookup, the geo reference, the learned headers, the
+    campaign hints, the held records closed by a person, and the call-in / eTally files of the folder. None when one part cannot be fingerprinted."""
+    parts = [str(CACHE_VERSION), "day:" + dt.date.today().isoformat()]      # some checks depend on today's date
+    for mod in (Path(__file__), Path(getattr(ctx.builder, "__file__", "") or "")):
+        try:
+            parts.append(sha256_of(mod))
+        except OSError:
+            return None
+    for name, df in (("live", ctx.live), ("lookup", ctx.lookup), ("geo", ctx.geo)):
+        if df is None:
+            parts.append(name + ":none")
+            continue
+        hh = _frame_hash(df)
+        if hh is None:
+            return None
+        parts.append("%s:%s:%s" % (name, len(df), hh))
+    parts.append("cols:" + "|".join(map(str, template_cols)))
+    parts.append("syn:" + json.dumps(sorted(SYNONYMS.items())))
+    parts.append("hints:" + json.dumps(getattr(ctx, "_campaign_hints", {}), sort_keys=True, default=str))
+    parts.append("closed:" + str(len(getattr(ctx, "_closed_keys", ()) or ())) + ":" + hashlib.sha256("|".join(sorted(getattr(ctx, "_closed_keys", ()) or ())).encode()).hexdigest()[:12])
+    for p0, rel0 in sorted(files, key=lambda x: x[1]):
+        nm = Path(rel0).name.lower()
+        if re.search(r"call[\s_\-]*in", nm) or "etally" in nm or "tally" in nm:
+            try:
+                parts.append("ctxfile:%s:%s" % (rel0, sha256_of(p0)))
+            except OSError:
+                return None
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:24]
+
+
+def _cache_file(out_root, ctx_key, h, rel, fc):
+    k = hashlib.sha256(("%s|%s|%s|%s" % (ctx_key, h, rel, fc or "")).encode("utf-8")).hexdigest()[:24]
+    return Path(out_root) / "_inspect_cache" / (k + ".pkl")
+
+
+def _cache_load(out_root, ctx_key, h, rel, fc):
+    import pickle
+    if not ctx_key:
+        return None
+    f = _cache_file(out_root, ctx_key, h, rel, fc)
+    try:
+        with open(f, "rb") as fh:
+            c = pickle.load(fh)
+    except Exception:
+        return None
+    for key in ("prepared", "clean_p"):                 # the files the result points to must still be there
+        if c.get(key) and not (Path(out_root) / c[key]).is_file():
+            return None
+    if c.get("held_n") and not (Path(out_root) / ("prepared/%s_held.xlsx" % h[:12])).is_file():
+        return None
+    return c
+
+
+def _cache_save(out_root, ctx_key, h, rel, fc, payload):
+    import pickle
+    if not ctx_key:
+        return
+    f = _cache_file(out_root, ctx_key, h, rel, fc)
+    try:
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_suffix(".tmp")
+        with open(tmp, "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(f)
+    except Exception:
+        pass
+
+
+def _cache_sweep(out_root, keep_names):
+    """Only the results of the last inspection are useful: a result no longer used is removed."""
+    d = Path(out_root) / "_inspect_cache"
+    if not d.is_dir():
+        return
+    for f in d.iterdir():
+        if f.name not in keep_names:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+
 def inspect_folder(ctx, folder, out_root, template_cols, log=print):
     """Inspect every file of a folder. Writes out_root/Submissions_report.xlsx, out_root/prepared/<hash>.xlsx and updates the ledger."""
     out_root = Path(out_root)
@@ -2253,6 +2408,9 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
             log("campaign values given for %d file(s) in %s" % (len(ctx._campaign_hints), hp.name))
         except (OSError, ValueError):
             log("WARNING: %s could not be read" % hp)
+    ctx._closed_keys = load_closed_keys(out_root)           # held records a person closed as 'duplicate, not added' (held_closed.json)
+    if ctx._closed_keys:
+        log("%d held record(s) were closed as 'duplicate, not added' by a person (held_closed.json): they are not held again." % len(ctx._closed_keys))
     scratch = out_root / "_unzipped"
     if scratch.is_dir():
         shutil.rmtree(scratch, ignore_errors=True)
@@ -2275,30 +2433,61 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
     rows, details = [], {}
     seen_hashes = set()
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    use_cache = os.environ.get("OPS_NO_INSPECT_CACHE", "") not in ("1", "true", "yes")
+    ctx_key = inspect_context_key(ctx, template_cols, out_root, files) if use_cache else None
+    if use_cache and not ctx_key:
+        log("The inspection results cannot be reused this time (a part of the context could not be fingerprinted): every file is read.")
+    n_reused, cache_names = 0, set()
     for n_file, (p, rel) in enumerate(files, 1):
         h = sha256_of(p)
         seen_hashes.add(h)
         old = ledger["files"].get(h)
         fc = folder_country_of(rel, ctx.geo, ctx.builder)
-        log("  [%d/%d] inspecting %s%s" % (n_file, len(files), rel, ("  (folder country: %s)" % fc) if fc else ""))
-        s, P, det = prepare_file(p, ctx, prof, template_cols, folder_country=fc)
-        s["path"] = rel
-        prepared = None
-        if P is not None:
-            prepared = "prepared/%s.xlsx" % h[:12]
-            P.to_excel(out_root / prepared, sheet_name="Sheet1", index=False)
-        clean_p, clean_n, held_n = None, 0, 0
-        if P is not None and det.get("hold") is not None and len(det["hold"]) == len(P):
-            hold_ = pd.Series(det["hold"], index=P.index)
-            Pc = P[hold_ == ""]
-            Ph = pd.concat([P[hold_ != ""].assign(Hold_reason=hold_[hold_ != ""]), det["held_other"]], ignore_index=True)
-            if len(Pc):
-                clean_p = "prepared/%s_clean.xlsx" % h[:12]
-                Pc.to_excel(out_root / clean_p, sheet_name="Sheet1", index=False)
-            clean_n, held_n = len(Pc), len(Ph)
-            det["held_all"] = Ph
-            if len(Ph):
-                Ph.to_excel(out_root / ("prepared/%s_held.xlsx" % h[:12]), sheet_name="Sheet1", index=False)
+        cached = _cache_load(out_root, ctx_key, h, rel, fc)
+        if cached is not None:
+            n_reused += 1
+            cache_names.add(_cache_file(out_root, ctx_key, h, rel, fc).name)
+            log("  [%d/%d] unchanged since the last inspection, result reused: %s" % (n_file, len(files), rel))
+            s, det = cached["s"], cached["det"]
+            det["_builder"] = ctx.builder
+            prepared, clean_p, clean_n, held_n = cached["prepared"], cached["clean_p"], cached["clean_n"], cached["held_n"]
+            if cached.get("tally"):
+                if not hasattr(ctx, "_tallies"):
+                    ctx._tallies = {}
+                ctx._tallies[h] = cached["tally"]
+            if cached.get("records") is not None:
+                if not hasattr(ctx, "_file_records"):
+                    ctx._file_records = {}
+                ctx._file_records[h] = cached["records"]
+            if cached.get("gaps"):
+                ctx._lookup_gaps = list(getattr(ctx, "_lookup_gaps", None) or []) + list(cached["gaps"])
+        else:
+            log("  [%d/%d] inspecting %s%s" % (n_file, len(files), rel, ("  (folder country: %s)" % fc) if fc else ""))
+            n_gaps0 = len(getattr(ctx, "_lookup_gaps", None) or [])
+            s, P, det = prepare_file(p, ctx, prof, template_cols, folder_country=fc)
+            s["path"] = rel
+            prepared = None
+            if P is not None:
+                prepared = "prepared/%s.xlsx" % h[:12]
+                P.to_excel(out_root / prepared, sheet_name="Sheet1", index=False)
+            clean_p, clean_n, held_n = None, 0, 0
+            if P is not None and det.get("hold") is not None and len(det["hold"]) == len(P):
+                hold_ = pd.Series(det["hold"], index=P.index)
+                Pc = P[hold_ == ""]
+                Ph = pd.concat([P[hold_ != ""].assign(Hold_reason=hold_[hold_ != ""]), det["held_other"]], ignore_index=True)
+                if len(Pc):
+                    clean_p = "prepared/%s_clean.xlsx" % h[:12]
+                    Pc.to_excel(out_root / clean_p, sheet_name="Sheet1", index=False)
+                clean_n, held_n = len(Pc), len(Ph)
+                det["held_all"] = Ph
+                if len(Ph):
+                    Ph.to_excel(out_root / ("prepared/%s_held.xlsx" % h[:12]), sheet_name="Sheet1", index=False)
+            if ctx_key:
+                cache_names.add(_cache_file(out_root, ctx_key, h, rel, fc).name)
+                _cache_save(out_root, ctx_key, h, rel, fc, {
+                    "s": s, "det": {k: v for k, v in det.items() if k != "_builder"}, "prepared": prepared, "clean_p": clean_p, "clean_n": clean_n, "held_n": held_n,
+                    "tally": (getattr(ctx, "_tallies", {}) or {}).get(h), "records": (getattr(ctx, "_file_records", {}) or {}).get(h),
+                    "gaps": list((getattr(ctx, "_lookup_gaps", None) or [])[n_gaps0:])})
         e = old or {"decision": None, "decided_by": "", "decided_at": "", "note": "", "first_seen": now}
         stem_ = name_stem(Path(rel).name)
         if not e.get("decision"):
@@ -2356,6 +2545,10 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
         e["superseded"] = bool(newer) and h not in seen_hashes
     save_ledger(out_root, ledger)
     shutil.rmtree(scratch, ignore_errors=True)
+    if ctx_key:
+        _cache_sweep(out_root, cache_names)
+        log("Incremental inspection: %d of %d file(s) were unchanged (same file, same live file, lookup and rules) and their result was reused; %d read again." % (
+            n_reused, len(files), len(files) - n_reused))
     write_report(out_root / "Submissions_report.xlsx", rows, details, ctx, not_read)
     log("report: %s" % (out_root / "Submissions_report.xlsx"))
     return rows

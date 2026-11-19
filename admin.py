@@ -591,7 +591,8 @@ def cmd_build(a):
                       (out / "review" / "AFRO_admin_data_coadmin_audit.xlsx", "AFRO_admin_data_coadmin_audit_v%d.xlsx" % n),
                       (out / "review" / "AFRO_admin_data_quality_report.xlsx", "AFRO_admin_data_quality_report_v%d.xlsx" % n),
                       (out / "review" / "Feedback_suspicious_coverage.xlsx", "Feedback_suspicious_coverage_v%d.xlsx" % n),
-                      (out / "review" / "Fix_list_by_country.xlsx", "Fix_list_by_country_v%d.xlsx" % n)):
+                      (out / "review" / "Fix_list_by_country.xlsx", "Fix_list_by_country_v%d.xlsx" % n),
+                      (out / "review" / "records_added_from_submissions.csv", "records_added_from_submissions_v%d.csv" % n)):
         if src.is_file():
             shutil.copy2(src, rd / name)
     mm = re.search(r"\((\d+) records with an Error", text) or re.search(r"(\d+) records with an Error", text)
