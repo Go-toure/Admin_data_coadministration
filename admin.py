@@ -1452,6 +1452,8 @@ def submissions_state_pull(dry_run=False):
     """Copy the DECISIONS on the submissions (ledger, report, prepared records) from the AdminOps folder of the Operations Center
     to workspace/submissions, read only: the app decides, the PC build adds exactly what the app accepted. The ledger in place is kept
     in workspace/submissions/ledger_backups. Returns 'adminops' (read), 'no link' (ADMIN_STORE_SHARE_URL not set) or 'failed'."""
+    if os.environ.get("OPS_LEDGER_FROM_APP"):
+        return "adminops"      # run by the Operations Center: the app reads its own ledger itself just before the job (workspace/submissions/ledger.json)
     tool = HERE / "pull_submissions.py"
     if not tool.is_file():
         return "no tool"
