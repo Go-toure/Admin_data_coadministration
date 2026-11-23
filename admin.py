@@ -1440,15 +1440,14 @@ def _submissions_ctx(builder):
     gp, lp = P(S["geo"]), P(S["lookup"])
     geo = builder.load_geo(str(gp)) if gp.is_file() else None
     lk = builder.load_lookup(str(lp), lookup_overrides_path()) if lp.is_file() else None
-    # the lookup is the authority for the round number: the live file as the next build will have it (the build relabels the live records the same way)
-    n_relabel = 0
-    if lk is not None and hasattr(builder, "lookup_round_labels"):
-        new_rd, rl = builder.lookup_round_labels(live, lk)
+    # the lookup is the authority for the Response, the start date and the round number: the live file as the next build will have it
+    if lk is not None and hasattr(builder, "align_to_lookup"):
+        resp, dts, rnd, rl, _skipped = builder.align_to_lookup(live, lk)
         if len(rl):
-            live["Round_Add"] = new_rd
-            n_relabel = int(rl["Records"].sum())
-            log("Round numbers: %d live record(s) in %d campaign round(s) are numbered differently from the lookup; the inspection uses the lookup's numbers "
-                "(the next build relabels them in the live file)." % (n_relabel, len(rl)))
+            live["Response"], live["SIA_date"], live["Round_Add"] = resp, builder.dates_like(live["SIA_date"], dts), rnd
+            by = rl.groupby("Field")["Records"].sum().to_dict()
+            log("Live file read with the lookup's names, dates and round numbers (%s); the next build writes them in the live file." %
+                ", ".join("%s %d record(s)" % kv for kv in by.items()))
     key, blank = builder.dup_key(live)
     index = {}
     for i, k, bl in zip(live.index, key.values, blank.values):

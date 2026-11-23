@@ -210,7 +210,7 @@ def main():
     ap.add_argument("--lookup-overrides", help="CSV of changes a person decided to the lookup (remove a campaign entered twice, add a round, move a start date); "
                                                "applied after the lookup is read, see apply_lookup_overrides")
     ap.add_argument("--no-lookup-rounds", action="store_true",
-                    help="keep the round numbers of the live file when they differ from the lookup (by default the lookup is the authority: Rnd<number of the lookup>)")
+                    help="keep the Response, the dates and the round numbers of the live file when they differ from the lookup (by default the lookup is the authority)")
     ap.add_argument("--keep-copied-rounds", action="store_true",
                     help="do not remove the rounds that the lookup does not have and that copy another round of the "
                          "same Response and date (they are removed by default and listed in the audit)")
@@ -353,14 +353,18 @@ def main():
         else:
             print("lookup: not found (give it with --lookup): campaigns are not cross-checked", flush=True)
 
-    # the round number follows the lookup (live records of a campaign the lookup numbers differently are relabelled, nothing else changes)
+    # Response, SIA_date and round number follow the lookup (live records of a campaign the lookup writes or numbers differently are changed, no figure is touched)
     if lk is not None and not getattr(a, "no_lookup_rounds", False):
-        rl = align_rounds_to_lookup(ws, header, lk)
+        rl, rs = align_rounds_to_lookup(ws, header, lk)
         if len(rl):
-            print("round numbers aligned to the lookup: %d record(s) in %d campaign round(s) (see review/round_numbers_aligned_to_lookup.csv)" %
-                  (int(rl["Records"].sum()), len(rl)), flush=True)
+            by = rl.groupby("Field")["Records"].sum().to_dict()
+            print("aligned to the lookup: %s (see review/aligned_to_lookup.csv)" % ", ".join("%s %d record(s)" % kv for kv in by.items()), flush=True)
             os.makedirs(rev_dir, exist_ok=True)
-            rl.to_csv(os.path.join(rev_dir, "round_numbers_aligned_to_lookup.csv"), index=False, encoding="utf-8-sig")
+            rl.to_csv(os.path.join(rev_dir, "aligned_to_lookup.csv"), index=False, encoding="utf-8-sig")
+        if len(rs):
+            print("dates that differ from the lookup and were NOT moved: %d group(s) (see review/not_aligned_to_lookup.csv)" % len(rs), flush=True)
+            os.makedirs(rev_dir, exist_ok=True)
+            rs.to_csv(os.path.join(rev_dir, "not_aligned_to_lookup.csv"), index=False, encoding="utf-8-sig")
     added_log = []
     if a.add_records:
         added_log = append_records(ws, header, a.add_records)
@@ -3491,15 +3495,78 @@ def _round_offsets(pairs, lk):
     return {k: int(g["diff"].mode().iloc[0]) for k, g in m.groupby("_rk")}
 
 
+LOOKUP_DATE_DAYS = 14      # a date moves to the planned start of the lookup only when that start is the only one of the campaign within this many days
+
+
+def lookup_response_names(df, lk):
+    """The Response is written the way the lookup writes the campaign ('OBR Name'): same country, same name apart from capitals, hyphens, underscores
+    and a trailing dot (ANG-2026-08-02_nOPV-NID -> ANG-2026-08-02_nOPV_NID). Returns (new Response, log)."""
+    out = df["Response"].copy()
+    if lk is None or not len(df):
+        return out, pd.DataFrame()
+    names = lk.groupby(["_ck", "_rk"])["OBR Name"].agg(lambda x: x.iloc[0] if x.nunique() == 1 else None).dropna()
+    ck, rk = df["Country"].map(_lkc), df["Response"].map(_rk)
+    want = pd.Series([names.get((c, r)) for c, r in zip(ck, rk)], index=df.index)
+    ch = want.notna() & (want != df["Response"].map(lambda x: x if isinstance(x, str) else ""))
+    if not ch.any():
+        return out, pd.DataFrame()
+    out.loc[ch] = want[ch]
+    log = (pd.DataFrame({"Field": "Response", "Country": df.loc[ch, "Country"], "Response": want[ch], "SIA_date": df.loc[ch, "SIA_date"].map(_dkey),
+                         "Found": df.loc[ch, "Response"], "Restored": want[ch]})
+           .groupby(["Field", "Country", "Response", "SIA_date", "Found", "Restored"]).size().rename("Records").reset_index())
+    return out, log
+
+
+def lookup_dates(df, lk, max_days=LOOKUP_DATE_DAYS):
+    """A date that is not a planned start of the campaign in the lookup moves to the planned start when that start is the ONLY one of the campaign
+    within max_days (a campaign keeps its planned start also when it was conducted a few days earlier or later) and no record of that place and
+    campaign has that start yet. Everything else is left and listed. Returns (new SIA_date as 'YYYY-MM-DD' text where changed else the old value,
+    log of the changes, list of the groups not moved with the reason)."""
+    out = df["SIA_date"].copy()
+    if lk is None or not len(df):
+        return out, pd.DataFrame(), []
+    starts = lk.dropna(subset=["_d"]).groupby(["_ck", "_rk"])["_d"].agg(lambda x: sorted(set(x))).to_dict()
+    ck, rk, d = df["Country"].map(_lkc), df["Response"].map(_rk), df["SIA_date"].map(_dkey)
+    place = pd.Series(["|".join(str(df.at[i, c]) for c in ("Province", "District", "Admin_3", "Vaccine_type") if c in df.columns) for i in df.index], index=df.index)
+    have = {}
+    for i in df.index:
+        have.setdefault((ck[i], rk[i], d[i]), set()).add(place[i])
+    rows, skipped = [], []
+    g = pd.DataFrame({"ck": ck, "rk": rk, "d": d})
+    g = g[(g["rk"] != "") & (g["d"] != "")]
+    for (c, r, dd), grp in g.groupby(["ck", "rk", "d"]):
+        st = starts.get((c, r))
+        if not st or dd in st:
+            continue
+        near = [(abs((pd.Timestamp(x) - pd.Timestamp(dd)).days), x) for x in st]
+        within = [t for t in near if t[0] <= max_days]
+        if len(within) != 1:
+            skipped.append({"Country": df.at[grp.index[0], "Country"], "Response": df.at[grp.index[0], "Response"], "SIA_date": dd, "Records": len(grp),
+                            "Why": ("no planned start of the lookup within %d days (nearest: %s)" % (max_days, min(near)[1]) if not within else
+                                    "several planned starts within %d days" % max_days)})
+            continue
+        new_d = within[0][1]
+        if (have.get((c, r, new_d), set()) & set(place[grp.index])):
+            skipped.append({"Country": df.at[grp.index[0], "Country"], "Response": df.at[grp.index[0], "Response"], "SIA_date": dd, "Records": len(grp),
+                            "Why": "records of the same places already carry the planned start %s (it would make duplicates)" % new_d})
+            continue
+        out.loc[grp.index] = new_d
+        have.setdefault((c, r, new_d), set()).update(place[grp.index])
+        rows.append({"Field": "SIA_date", "Country": df.at[grp.index[0], "Country"], "Response": df.at[grp.index[0], "Response"], "SIA_date": new_d,
+                     "Found": dd, "Restored": new_d, "Records": len(grp)})
+    return out, pd.DataFrame(rows), skipped
+
+
 def lookup_round_labels(df, lk):
     """THE LOOKUP IS THE AUTHORITY FOR THE ROUND NUMBER. A record whose Response and SIA_date are one round of the lookup carries the round number
     of the lookup ('Rnd' + the number): ANG-2026-08-02_nOPV_NID started 2026-08-21 is Round 1 in the lookup, so its records are Rnd1, whatever the
     country called it in its file (Round Number 3 counted from the year's earlier campaign). Returns (new Round_Add as a Series with the same index,
-    log of the changes). Left as they are: records whose Response + date is not in the lookup (or is there with two round numbers), and a
-    Response + date that the data labels with more than one round (copies of a round: find_copied_rounds deals with them)."""
+    log of the changes). Left as they are: records whose Response + date is not in the lookup (or is there with two round numbers), a
+    Response + date that the data labels with more than one round (copies of a round: find_copied_rounds deals with them), and a round that would
+    then be carried by two different dates of the same campaign."""
     if lk is None or df is None or not len(df):
         return df["Round_Add"].copy() if df is not None else None, pd.DataFrame()
-    g = pd.DataFrame({"_rk": df["Response"].map(_rk), "_d": df["SIA_date"].map(_dkey), "rd": df["Round_Add"].map(_s)}, index=df.index)
+    g = pd.DataFrame({"_ck": df["Country"].map(_lkc), "_rk": df["Response"].map(_rk), "_d": df["SIA_date"].map(_dkey), "rd": df["Round_Add"].map(_s)}, index=df.index)
     g["rn"] = g["rd"].map(_rnum)
     one = lk[lk["_rn"].notna()].groupby(["_rk", "_d"])["_rn"].agg(["nunique", "first"]).reset_index()
     one = one[one["nunique"] == 1].rename(columns={"first": "_lrn"})[["_rk", "_d", "_lrn"]]
@@ -3512,27 +3579,83 @@ def lookup_round_labels(df, lk):
     if g.empty:
         return out, pd.DataFrame()
     out.loc[g.index] = ["Rnd%d" % int(x) for x in g["_lrn"]]
-    log = (pd.DataFrame({"Country": df.loc[g.index, "Country"], "Response": df.loc[g.index, "Response"], "SIA_date": g["_d"],
+    # a round must not end up on two dates of one campaign: the groups that would are left as they are (repeated, because leaving one group
+    # as it is can make another one clash)
+    base = pd.DataFrame({"ck": df["Country"].map(_lkc), "rk": df["Response"].map(_rk), "d": df["SIA_date"].map(_dkey)})
+    base = base[(base["rk"] != "") & (base["d"] != "")]
+    while len(g):
+        allr = base.assign(rn=out.reindex(base.index).map(_rnum))
+        allr = allr[allr["rn"].notna()]
+        clash = allr.groupby(["ck", "rk", "rn"])["d"].transform("nunique") > 1
+        bad = g.index.intersection(allr.index[clash])
+        if not len(bad):
+            break
+        out.loc[bad] = df.loc[bad, "Round_Add"]
+        g = g.drop(index=bad)
+    if g.empty:
+        return out, pd.DataFrame()
+    log = (pd.DataFrame({"Field": "Round_Add", "Country": df.loc[g.index, "Country"], "Response": df.loc[g.index, "Response"], "SIA_date": g["_d"],
                          "Found": g["rd"], "Restored": out.loc[g.index]})
-           .groupby(["Country", "Response", "SIA_date", "Found", "Restored"]).size().rename("Records").reset_index())
+           .groupby(["Field", "Country", "Response", "SIA_date", "Found", "Restored"]).size().rename("Records").reset_index())
     return out, log
 
 
+def align_to_lookup(df, lk):
+    """Response, SIA_date and Round_Add of every record follow the lookup, in that order (the name first, then the planned start, then the round of that
+    start). df needs Country, Response, SIA_date, Round_Add (and Province, District, Admin_3, Vaccine_type when it has them). Returns
+    (Response, SIA_date, Round_Add as Series, log of the changes, list of what was left and why)."""
+    work = df.copy()
+    resp, l1 = lookup_response_names(work, lk)
+    work["Response"] = resp
+    dts, l2, skipped = lookup_dates(work, lk)
+    work["SIA_date"] = dts
+    rnd, l3 = lookup_round_labels(work, lk)
+    logs = [x for x in (l1, l2, l3) if len(x)]
+    return resp, dts, rnd, (pd.concat(logs, ignore_index=True) if logs else pd.DataFrame()), skipped
+
+
+def _like(old, ts):
+    """A date written the way the cell had it (date cell, 'YYYY-MM-DD' text, or text with a time)."""
+    t = pd.Timestamp(ts)
+    if hasattr(old, "strftime"):
+        return t.to_pydatetime()
+    o = str(old)
+    return t.strftime("%Y-%m-%d %H:%M:%S") if len(o) > 10 else t.strftime("%Y-%m-%d")
+
+
+def dates_like(old, new):
+    """The aligned dates written the way each old value was written (same text format, so a column never mixes formats)."""
+    return pd.Series([o if _dkey(o) == _dkey(n) else _like(o, n) for o, n in zip(old, new)], index=old.index)
+
+
 def align_rounds_to_lookup(ws, header, lk):
-    """Writes lookup_round_labels into the live sheet (Round_Add only; no figure is touched). Returns the log (DataFrame, empty when nothing changed)."""
+    """Writes align_to_lookup into the live sheet: Response, SIA_date (with Year and SIAMTH when they hold plain values that agree with the old date)
+    and Round_Add. No figure is touched. Returns (log, not aligned) as DataFrames (empty when nothing changed)."""
     idx = {h: j + 1 for j, h in enumerate(header)}
     need = ("Country", "Response", "SIA_date", "Round_Add")
     if lk is None or any(c not in idx for c in need):
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
     last = ws.max_row
     while last > 1 and not any(c.value is not None for c in ws[last]):
         last -= 1
-    df = pd.DataFrame({c: [ws.cell(row=r, column=idx[c]).value for r in range(2, last + 1)] for c in need}, index=range(2, last + 1), dtype=object)
-    new, log = lookup_round_labels(df, lk)
-    ch = [r for r in df.index if _s(df.at[r, "Round_Add"]) != _s(new.at[r])]
-    for r in ch:
-        ws.cell(row=r, column=idx["Round_Add"]).value = new.at[r]
-    return log
+    cols = list(need) + [c for c in ("Province", "District", "Admin_3", "Vaccine_type") if c in idx]
+    df = pd.DataFrame({c: [ws.cell(row=r, column=idx[c]).value for r in range(2, last + 1)] for c in cols}, index=range(2, last + 1), dtype=object)
+    resp, dts, rnd, log, skipped = align_to_lookup(df, lk)
+    for r in df.index:
+        if _s(df.at[r, "Response"]) != _s(resp.at[r]):
+            ws.cell(row=r, column=idx["Response"]).value = resp.at[r]
+        if _dkey(df.at[r, "SIA_date"]) != _dkey(dts.at[r]):
+            old = df.at[r, "SIA_date"]
+            ws.cell(row=r, column=idx["SIA_date"]).value = _like(old, dts.at[r])
+            o, n_ = pd.Timestamp(_dkey(old)), pd.Timestamp(_dkey(dts.at[r]))
+            for col, ov, nv in (("Year", o.year, n_.year), ("SIAMTH", o.month, n_.month)):
+                if col in idx:
+                    cur = ws.cell(row=r, column=idx[col]).value
+                    if cur is not None and not str(cur).startswith("=") and str(cur).strip() == str(ov) and ov != nv:
+                        ws.cell(row=r, column=idx[col]).value = type(cur)(nv) if isinstance(cur, (int, str)) else nv
+        if _s(df.at[r, "Round_Add"]) != _s(rnd.at[r]):
+            ws.cell(row=r, column=idx["Round_Add"]).value = rnd.at[r]
+    return log, pd.DataFrame(skipped)
 
 
 def lookup_crosscheck(df, lk):

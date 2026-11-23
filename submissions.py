@@ -613,14 +613,33 @@ def round_from_hint(P, ctx, notes, hint):
 
 
 def align_round_to_lookup(P, ctx, notes):
-    """THE LOOKUP IS THE AUTHORITY FOR THE ROUND NUMBER: a record whose Response and SIA_date are one round of the lookup gets the lookup's round
-    ('Rnd' + its number), whatever number the file gives (Angola's file says Round Number 3 for the lookup's Round 1: it is Rnd1). The live file has the
-    same rule (the build relabels the live records of the campaigns the lookup numbers differently). Returns the list of texts, one per campaign round."""
+    """THE LOOKUP IS THE AUTHORITY: a record whose campaign is one of the lookup is written with the lookup's name for the Response, and with the round
+    the lookup gives to that campaign and start date ('Rnd' + its number) whatever number the file gives (Angola's file says Round Number 3 for the
+    lookup's Round 1: it is Rnd1). The start dates are standardised before (standardize_to_lookup). The live file follows the same rule (the build changes
+    its records). Returns the list of texts, one per campaign round."""
     out = []
     lk = ctx.lookup
     if lk is None or not {"Country", "Response", "SIA_date", "Round_Add"} <= set(P.columns) or not len(P):
         return out
-    new, log = ctx.builder.lookup_round_labels(P[["Country", "Response", "SIA_date", "Round_Add"]], lk)
+    b = ctx.builder
+    T = P[["Country", "Response", "SIA_date", "Round_Add"]]
+    names, nl = b.lookup_response_names(T, lk)
+    for i in P.index:
+        if not is_empty(P.at[i, "Response"]) and str(names.at[i]) != str(P.at[i, "Response"]):
+            notes.add(rowref(P, i), "Response", P.at[i, "Response"], names.at[i], "campaign name as written in the lookup")
+            P.at[i, "Response"] = names.at[i]
+    for _, r in nl.iterrows():
+        out.append("campaign name: %s -> %s (%d record(s))" % (r["Found"], r["Restored"], r["Records"]))
+    # a start date a few days from the planned start of the lookup: the planned start (same rule as the live file)
+    cols = [c for c in ("Country", "Response", "SIA_date", "Round_Add", "Province", "District", "Admin_3", "Vaccine_type") if c in P.columns]
+    dts, dl, _sk = b.lookup_dates(P[cols], lk)
+    for i in P.index:
+        if not pd.isna(P.at[i, "SIA_date"]) and b._dkey(dts.at[i]) != b._dkey(P.at[i, "SIA_date"]):
+            notes.add(rowref(P, i), "SIA_date", b._dkey(P.at[i, "SIA_date"]), b._dkey(dts.at[i]), "planned start date of the lookup (within %d days; the lookup is the authority)" % b.LOOKUP_DATE_DAYS)
+            P.at[i, "SIA_date"] = pd.Timestamp(dts.at[i])
+    for _, r in dl.iterrows():
+        out.append("%s: date %s -> planned start %s (%d record(s))" % (r["Response"], r["Found"], r["Restored"], r["Records"]))
+    new, log = b.lookup_round_labels(P[["Country", "Response", "SIA_date", "Round_Add"]], lk)
     for i in P.index:
         old = P.at[i, "Round_Add"]
         if is_empty(old) or str(new.at[i]) == str(old):
@@ -2349,11 +2368,11 @@ def compare_with_live(P, ctx, prof):
             same_c = [h for h in pl if (not is_empty(P.at[i, "Response"])) and str(h[5]).strip().lower() == str(P.at[i, "Response"]).strip().lower()
                       and str(h[6]).strip().lower() == str(P.at[i, "Round_Add"]).strip().lower()] if pl else []
             aligned = False
-            # the same place on the same date (3 days at most) with the same vaccine, and only one such live record: it is that live record under another
+            # the same place on the same date (3 days at most; as many days as the live file may have been moved to the planned start of the lookup) with the same vaccine, and only one such live record: it is that live record under another
             # campaign name or round (CAM-2025-11-01 for CAM-2026-01, NOPV2 for bOPV-nOPV2, Rnd3 for Rnd1); the live record is not changed
             if len(same_c) != 1 and pl and not pd.isna(P.at[i, "SIA_date"]):
                 fam0 = vaccine_family(b)(P.at[i, "Vaccine_type"])
-                cand = [h for h in pl if fam0 and h[2] and (fam0 & h[2]) and abs((pd.Timestamp(P.at[i, "SIA_date"]) - h[1]).days) <= 3]
+                cand = [h for h in pl if fam0 and h[2] and (fam0 & h[2]) and abs((pd.Timestamp(P.at[i, "SIA_date"]) - h[1]).days) <= max(3, getattr(b, "LOOKUP_DATE_DAYS", 3))]
                 if len(cand) == 1:
                     ro_f, ro_l = P.at[i, "Round_Add"], cand[0][6]
                     same_r = (not is_empty(ro_f)) and str(ro_f).strip().lower() == str(ro_l).strip().lower()
