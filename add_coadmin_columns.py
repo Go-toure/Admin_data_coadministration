@@ -254,6 +254,8 @@ def main():
     ap.add_argument("--add-records", action="append", default=[], metavar="FILE",
                     help="records prepared by 'admin.py submissions' (template layout): the ones whose key is not in the input are "
                          "added at the end of the data before anything else is done; may be given several times")
+    ap.add_argument("--no-template-update", action="store_true",
+                    help="do not add the columns of the V2 template (HPV, onchocerciasis, LF, schistosomiasis, trachoma, IPV by age band) to the live file")
     ap.add_argument("--corrections", metavar="FILE",
                     help="corrections a person decided (CSV: Country, Province, District, Response, Round_Add, SIA_date, Column, Found, Restored, Reason, Decided_by, Decided_on); "
                          "a cell is changed only while it still holds the value in Found")
@@ -312,6 +314,11 @@ def main():
     while header and header[-1] is None:
         header.pop()
     header = ["SIA_date" if h == "SIA-date" and "SIA_date" not in header else h for h in header]  # same fix as the portal
+    template_added = []
+    if not getattr(a, "no_template_update", False):
+        header, ncol, template_added = ensure_template_columns(ws, header)
+        if template_added:
+            print("template V2: %d column(s) added to the live file (%s ...)" % (len(template_added), ", ".join(template_added[:4])), flush=True)
     ncol = len(header)
     old_letter = {h: get_column_letter(i + 1) for i, h in enumerate(header)}
     missing_req = [need for need in ["Country", "Province", "District", "SIA_date", "Response", "Vaccine_type",
@@ -857,6 +864,8 @@ def main():
         for h in GEO_COLS:
             if h not in new_header:
                 new_header.append(h)
+    if template_added:
+        new_header = order_by_template(new_header)       # the V2 columns where the V2 template has them
     new_letter = {h: get_column_letter(i + 1) for i, h in enumerate(new_header)}
     ncol_new = len(new_header)
 
@@ -2055,6 +2064,138 @@ def apply_corrections(df, path):
     return changes, {"applied": applied, "already": already, "skipped": skipped}
 
 
+# ----------------------------------------------------------------------------------------------- template V2 columns
+# The admin template was extended (V2, Nov 2026) with HPV, onchocerciasis, lymphatic filariasis, schistosomiasis and trachoma, and with IPV doses by age band
+# (Total_IPV<=1Y, Total_IPV>1Y). The live file takes these columns at the next build: the empty columns are added in the place the V2 template gives them (after
+# the preceding column of the template), every record keeps its values, and the data dictionary describes them (definitions: the V2 data dictionary).
+# V2_ORDER is the order of the V2 template (the columns of the live file that the template does not know keep their place).
+V2_ORDER = [
+    "Ctry_Code", "Country", "Province", "District",
+    "Admin_3", "IntegPolio", "IntegMeasles", "IntegYF",
+    "IntegTetanus", "IntegMening", "IntegVitA", "IntegDeparasit",
+    "IntegAlbendazole", "IntegMII", "IntegAntMal", "IntegCholera",
+    "IntegLLIN", "IntegHPV", "IntegOncho", "IntegLF",
+    "IntegSCH", "IntegTrachoma", "IntegIPV", "IntegfIPV",
+    "IntegOther_A", "IntegOther_B", "Main_Act", "TotPop",
+    "PopPolio", "PopMeasles", "PopYF", "PopTetanus",
+    "PopMening", "PopVitA", "PopDeparasit", "PopAlbendazole",
+    "PopMII", "PopAntMal", "PopCholera", "PopLLIN",
+    "PopHPV", "PopOncho", "PopLF", "PopSCH",
+    "PopTrachoma", "PopIPV", "PopfIPV", "PopOther_A",
+    "PopOther_B", "AgeGPolio", "AgeGMeasles", "AgeGYF",
+    "AgeGTetanus", "AgeGMening", "AgeGVitA", "AgeGDeparasit",
+    "AgeGAlbendazole", "AgeGMII", "AgeGAntMal", "AgeGCholera",
+    "AgeGLLIN", "AgeGHPV", "AgeGOncho", "AgeGLF",
+    "AgeGSCH", "AgeGTrachoma", "AgeGIPV", "AgeGfIPV",
+    "AgeGOther_A", "AgeGOther_B", "Nbr0dosesVaccPolio_0_11M", "Nbr_1doses_Plus_VacPolio_0_11M",
+    "Nbr0dosesVacPolio_12_59M", "Nbr_1doses_Plus_VacPolio_12_59M", "Total_Nbr_0doseVaccPolio_0_59M", "Prop_0dosesPolio",
+    "Total_Nbr_1dose_Plus_vaccPolio_0_59M", "TotalNbrVaccPolio", "CVPolio", "Doses.UsedPolio",
+    "WastRPolio", "NbrVacMeasles", "CVMeasles", "ZeroDoseMeasles",
+    "PropZeroDoseMeasles", "UsedMeasles", "WastRMeasles", "NbrVacYF",
+    "CVYF", "ZeroDoseYF", "PropZeroDoseYF", "UsedYF",
+    "WastRYF", "ZeroDoseHPV", "NbrVacHPV", "PropZeroDoseHPV",
+    "CVHPV", "UsedHPV", "WastRHPV", "NbrVacTetanus_1st_Dose",
+    "NbrVacTetanus_2nd_Dose", "NbrVacTetanus_3rd_Dose", "TotalNbrVacTetanus", "CVTetanus",
+    "UsedTetanus", "WastRTetanus", "NbrVacMening", "CVMening",
+    "UsedMening", "WastRMening", "NbrVacVitA", "CVVitA",
+    "UsedVitA", "WastRVitA", "NbrVacDeparasit", "CVDeparasit",
+    "UsedDeparasit", "WastRDeparasit", "NbrVacAlbendazole", "CVAlbendazole",
+    "UsedAlbendazole", "WastRAlbendazole", "NbrTreatedOncho", "CVOncho",
+    "UsedOncho", "WastROncho", "NbrTreatedLF", "CVLF",
+    "UsedLF", "WastRLF", "NbrTreatedSCH", "CVSCH",
+    "UsedSCH", "WastRSCH", "NbrTreatedTrachoma", "CVTrachoma",
+    "UsedTrachoma", "WastRTrachoma", "NbrVacMII", "CVMII",
+    "UsedMII", "WastRMII", "NbrVacAntMal", "CVAntMal",
+    "UsedAntMal", "WastRAntMal", "ZeroDoseCholera", "NbrVacCholera",
+    "PropZeroDoseCholera", "CVCholera", "UsedCholera", "WastRCholera",
+    "ZeroLLIN", "NbrLLINDistributed", "PropZeroLLIN", "CVLLIN",
+    "UsedLLIN", "WastRLLIN", "Total_IPV<=1Y", "Total_IPV>1Y",
+    "TotalNbrVaccIPV", "CVIPV", "UsedIPV", "WastRIPV",
+    "Total_fIPV", "CVfIPV", "UsedfIPV", "WastRfIPV",
+    "NbrVacOther_A", "CVOther_A", "UsedOther_A", "WastROther_A",
+    "NbrVacOther_B", "CVOther_B", "UsedOther_B", "WastROther_B",
+    "AEFIMin", "AEFISerious", "Death", "NumberMonitored",
+    "NumberVaccinated_Evaluation", "Prop_Missed_Eval", "SIA_date", "Date_Report",
+    "SIA_Integrated", "TypeofActivity", "EpidNumber", "DateOfOnset",
+    "Year", "Round_Add", "Vaccine_type", "Response",
+    "Index", "SIAMTH", "check_dp", "AFRO_block",
+    "prov_candidates",
+]
+
+TEMPLATE_V2_NEW = {
+    "IntegHPV": ("Integration", "Indicates whether HPV vaccination was integrated in the campaign/activity.", "Text", "Yes / No", "HPV; typical target: girls 9–14 years; school-based + fixed posts; injectable HPV vaccine."),
+    "IntegOncho": ("Integration", "Indicates whether onchocerciasis treatment was integrated in the activity.", "Text", "Yes / No", "Community-directed treatment (CDTI); ivermectin."),
+    "IntegLF": ("Integration", "Indicates whether lymphatic filariasis mass drug administration was integrated.", "Text", "Yes / No", "Community-directed MDA; IVM + ALB, or IDA where eligible."),
+    "IntegSCH": ("Integration", "Indicates whether schistosomiasis preventive chemotherapy was integrated.", "Text", "Yes / No", "School-based + community; praziquantel."),
+    "IntegTrachoma": ("Integration", "Indicates whether trachoma mass drug administration was integrated.", "Text", "Yes / No", "Community-directed + fixed; azithromycin ± tetracycline eye ointment."),
+    "PopHPV": ("Target population", "Target population for HPV vaccination.", "Integer", "Non-negative whole number", "Typical target: girls 9–14 years; use campaign-specific target where different."),
+    "PopOncho": ("Target population", "Target population eligible for onchocerciasis treatment.", "Integer", "Non-negative whole number", "Typical target: population ≥5 years in endemic communities; apply national eligibility/exclusions."),
+    "PopLF": ("Target population", "Target population eligible for lymphatic filariasis MDA.", "Integer", "Non-negative whole number", "Typical target: population ≥5 years in endemic implementation units; apply national eligibility/exclusions."),
+    "PopSCH": ("Target population", "Target population eligible for schistosomiasis treatment.", "Integer", "Non-negative whole number", "Typically school-age children; may include adults where prevalence is high."),
+    "PopTrachoma": ("Target population", "Target population eligible for trachoma MDA.", "Integer", "Non-negative whole number", "Typical target: population ≥6 months in endemic districts; apply national eligibility/exclusions."),
+    "AgeGHPV": ("Age group", "Age group targeted for HPV vaccination.", "Text", "e.g., 9-14Y", "Record the actual campaign age group."),
+    "AgeGOncho": ("Age group", "Age/eligibility group targeted for onchocerciasis treatment.", "Text", "e.g., >=5Y", "Record actual programme eligibility."),
+    "AgeGLF": ("Age group", "Age/eligibility group targeted for lymphatic filariasis MDA.", "Text", "e.g., >=5Y", "Record actual programme eligibility."),
+    "AgeGSCH": ("Age group", "Age/eligibility group targeted for schistosomiasis treatment.", "Text", "e.g., 5-14Y / programme-defined", "Record actual campaign eligibility."),
+    "AgeGTrachoma": ("Age group", "Age/eligibility group targeted for trachoma MDA.", "Text", "e.g., >=6M", "Record actual programme eligibility."),
+    "ZeroDoseHPV": ("Vaccination statistics", "Number of targeted girls with no prior HPV dose before the activity, where assessed.", "Integer", "Non-negative whole number", "Optional/where zero-dose status is collected."),
+    "NbrVacHPV": ("Vaccination statistics", "Number of people vaccinated with HPV vaccine during the activity.", "Integer", "Non-negative whole number", "Administrative vaccinated count."),
+    "PropZeroDoseHPV": ("Vaccination statistics", "Proportion classified as HPV zero-dose, where assessed.", "Decimal / percent", "0–1 or %", "Optional; numerator typically ZeroDoseHPV."),
+    "CVHPV": ("Vaccination statistics", "Administrative HPV vaccination coverage.", "Decimal / percent", "0–1 or %", "Vaccinated / target population."),
+    "UsedHPV": ("Commodity use", "Number of HPV vaccine doses used.", "Integer", "Non-negative whole number", "Doses used during the activity."),
+    "WastRHPV": ("Commodity use", "HPV vaccine wastage rate.", "Decimal / percent", "0–1 or %", "According to programme wastage convention."),
+    "NbrTreatedOncho": ("Treatment statistics", "Number of eligible persons treated for onchocerciasis.", "Integer", "Non-negative whole number", "Persons receiving ivermectin."),
+    "CVOncho": ("Treatment statistics", "Onchocerciasis treatment coverage.", "Decimal / percent", "0–1 or %", "Treated / target population."),
+    "UsedOncho": ("Commodity use", "Quantity of ivermectin tablets/doses used for onchocerciasis.", "Integer", "Non-negative whole number", "Record commodity units consistently."),
+    "WastROncho": ("Commodity use", "Onchocerciasis commodity wastage rate.", "Decimal / percent", "0–1 or %", "If tracked."),
+    "NbrTreatedLF": ("Treatment statistics", "Number of eligible persons treated during LF MDA.", "Integer", "Non-negative whole number", "Persons receiving the full regimen."),
+    "CVLF": ("Treatment statistics", "Lymphatic filariasis treatment coverage.", "Decimal / percent", "0–1 or %", "Treated / target population."),
+    "UsedLF": ("Commodity use", "Quantity of LF MDA medicines used.", "Integer", "Non-negative whole number", "IVM + ALB, or IDA; regimen should be documented."),
+    "WastRLF": ("Commodity use", "LF MDA commodity wastage rate.", "Decimal / percent", "0–1 or %", "If tracked."),
+    "NbrTreatedSCH": ("Treatment statistics", "Number of eligible persons treated for schistosomiasis.", "Integer", "Non-negative whole number", "Persons receiving praziquantel."),
+    "CVSCH": ("Treatment statistics", "Schistosomiasis treatment coverage.", "Decimal / percent", "0–1 or %", "Treated / target population."),
+    "UsedSCH": ("Commodity use", "Quantity of praziquantel tablets/doses used.", "Integer", "Non-negative whole number", "Record commodity units consistently."),
+    "WastRSCH": ("Commodity use", "Schistosomiasis commodity wastage rate.", "Decimal / percent", "0–1 or %", "If tracked."),
+    "NbrTreatedTrachoma": ("Treatment statistics", "Number of eligible persons treated for trachoma.", "Integer", "Non-negative whole number", "Persons receiving azithromycin or approved alternative."),
+    "CVTrachoma": ("Treatment statistics", "Trachoma treatment coverage.", "Decimal / percent", "0–1 or %", "Treated / target population."),
+    "UsedTrachoma": ("Commodity use", "Quantity of trachoma medicines used.", "Integer", "Non-negative whole number", "Azithromycin doses/tablets; topical tetracycline can be documented separately."),
+    "WastRTrachoma": ("Commodity use", "Trachoma commodity wastage rate.", "Decimal / percent", "0–1 or %", "If tracked."),
+    "Total_IPV<=1Y": ("IPV results", "Children aged 1 year or less vaccinated with IPV during the campaign (age band of the V2 template).", "Integer", "Non-negative whole number", "Not described in the V2 data dictionary: the V2 template gives IPV by age band (<=1Y, >1Y) next to the dose-based columns Total_IPV1_0_6wk and Total_IPV2_6_14wk. Confirm the age-band convention with the programme."),
+    "Total_IPV>1Y": ("IPV results", "Children older than 1 year vaccinated with IPV during the campaign (age band of the V2 template).", "Integer", "Non-negative whole number", "Not described in the V2 data dictionary: see Total_IPV<=1Y. Confirm the age-band convention with the programme."),
+}
+
+
+def ensure_template_columns(ws, header):
+    """Adds to the sheet, at the end of the header row, the V2 template columns the live file does not have yet (the build then places them: order_by_template).
+    Done before the submissions are added, so that a submission in the V2 layout keeps its HPV / onchocerciasis ... figures. Returns (header, ncol, added)."""
+    from copy import copy as _copy
+    added = [c for c in V2_ORDER if c in TEMPLATE_V2_NEW and c not in header]
+    if not added:
+        return header, len(header), []
+    src = ws.cell(row=1, column=max(1, len(header)))
+    for k, c in enumerate(added, start=1):
+        cell = ws.cell(row=1, column=len(header) + k, value=c)
+        cell._style = _copy(src._style)
+    header = list(header) + added
+    return header, len(header), added
+
+
+def order_by_template(cols):
+    """The columns of the live file with the V2 columns placed where the V2 template has them: right after the nearest preceding column of the template that is
+    present. Every other column keeps its place."""
+    new = [c for c in cols if c in TEMPLATE_V2_NEW]
+    rest = [c for c in cols if c not in TEMPLATE_V2_NEW]
+    for c in V2_ORDER:
+        if c not in new:
+            continue
+        k = V2_ORDER.index(c) - 1
+        while k >= 0 and V2_ORDER[k] not in rest:
+            k -= 1
+        pos = rest.index(V2_ORDER[k]) + 1 if k >= 0 else 0
+        rest.insert(pos, c)
+    return rest
+
+
 # ----------------------------------------------------------------------------------------------- integrated campaigns
 # An SIA led by polio can carry other interventions in the same visit (measles-rubella, yellow fever, vitamin A, deworming, IPV, ...). The admin template has a block
 # of columns per intervention. The flag of a block (IntegMeasles ...) is filled by the country's data focal point and often wrong (a "No" with figures, a "Yes"
@@ -2286,7 +2427,7 @@ def append_records(ws, header, files):
         core = [c for c in DUP_CORE_COLS if c in sub.columns]
         sigs = keys.astype(str)
         for c in core:
-            sigs = sigs + "|" + pd.to_numeric(sub[c], errors="coerce").round(2).astype(str)
+            sigs = sigs + "|" + pd.to_numeric(sub[c], errors="coerce").round(2).map(str)       # (a missing figure is the text 'nan', whatever the pandas version)
         for i in range(len(sub)):
             if blank.iat[i] or keys.iat[i] in have or sigs.iat[i] in seen_sig:
                 skipped += 1
@@ -3923,6 +4064,9 @@ add("Response", "campaign", "Name of the response / campaign, e.g. GUI-2025-01-N
 add("Index", "tech", "Running record number inside the data-entry batch of a campaign (1 = first row).", "Internal; no analytical meaning.")
 add("SIAMTH", "tech", "Month of the SIA (1-12).", "Same as the month of SIA_date for 98% of records.")
 add("check_dp", "tech", "Helper key used to find duplicated records: formula joining Country, Province, District, SIA_date, TotalNbrVaccPolio and Response.", "Internal. A live formula in the admin data; it follows the columns, so keep it when columns are added.")
+for _c, (_sec, _def, _typ, _fmt, _note) in TEMPLATE_V2_NEW.items():
+    _g = "integ" if _c.startswith("Integ") else "pop" if _c.startswith("Pop") else "age" if _c.startswith("AgeG") else "other"
+    add(_c, _g, _def, ("Expected: %s. " % _fmt if _fmt else "") + (_note + " " if _note else "") + "Column added with the V2 template (Nov 2026): empty for the earlier records.")
 add("geo_code", "tech", "AFROGDB district code of the Country / Province / District (for example NGA-SOK-WAW), found with the AFRO-Geo-Reference rules (exact name, same name ignoring accents and punctuation, the one district of that name in another province, or a reviewed crosswalk decision).", "Empty when the name is not in AFROGDB, and for countries that still use legacy shapes. The names themselves are not changed by this column. Use it to join admin data to LQAS, IM and the maps.")
 add("geo_match", "tech", "How geo_code was found: exact, normalized, other province, crosswalk, crosswalk (auto); or unmatched, ambiguous, no shape.", "Rebuilt on every run; names listed as not found are in review/afrogdb_unmatched.csv of the build.")
 add("AFRO_block", "tech", "Programme block of the country: WA (West Africa), LCB (Lake Chad Basin), ESA (East and Southern Africa), DRC, CA (Central Africa).", "'LBC' appears for 25 records of the Central African Republic: it should be LCB.")

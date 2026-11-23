@@ -1430,6 +1430,13 @@ def _submissions_ctx(builder):
     path, label = resolve_source("live")
     log("Reading the live file (%s) ..." % label)
     live = load_norm(path)
+    # the live file as the next build will have it: with the columns of the V2 template (HPV, onchocerciasis ... IPV by age band), empty until then, so that a
+    # submission in the V2 layout keeps its figures in those columns
+    if hasattr(builder, "TEMPLATE_V2_NEW"):
+        for c in builder.TEMPLATE_V2_NEW:
+            if c not in live.columns:
+                live[c] = ""
+        live = live[builder.order_by_template(list(live.columns))]
     gp, lp = P(S["geo"]), P(S["lookup"])
     geo = builder.load_geo(str(gp)) if gp.is_file() else None
     lk = builder.load_lookup(str(lp), lookup_overrides_path()) if lp.is_file() else None

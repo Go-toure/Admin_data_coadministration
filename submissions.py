@@ -7,7 +7,7 @@ admin data, and the ones an operator accepts are added to the next build.
     python admin.py submissions reject NAME [--note ..]
 
 What the inspection does for each file
-  1. layout: the template (the 164 columns of the live file), the template with other spellings of the headers, a file whose headers can
+  1. layout: the template (the columns of the live file, with those of the V2 template), the template with other spellings of the headers, a file whose headers can
      be mapped by a short list of certain synonyms, or a file that cannot be used (it is rejected with the reason);
   2. normalisation (each change is listed): capitals and spaces, country and province spelling of the geography reference, vaccine and round
      spelling of the live file, dates (text, Excel serial numbers), numbers written as text, percentages, Year / SIAMTH / Ctry_Code / AFRO_block,
@@ -73,12 +73,14 @@ SYNONYMS = {"ctryname": "Country", "provname": "Province", "distname": "District
 
 
 # ----------------------------------------------------------------------------------------------- helpers
+V2_NEW = set()   # the columns of the V2 template the live file does not fill yet (set by inspect_folder): they do not count when a file is judged to follow the template
 LEARNED = {}     # headers confirmed by the operators (inputs/header_synonyms.json: {"header as written": "template column"})
 
 
 def cn(x):
     """A header for comparison: no accents, case, spaces or punctuation (SIA-date = SIA_date = sia date)."""
     t = unicodedata.normalize("NFKD", str(x)).encode("ascii", "ignore").decode().lower()
+    t = t.replace("<=", "le").replace(">=", "ge").replace("<", "lt").replace(">", "gt")      # Total_IPV<=1Y and Total_IPV>1Y are two columns
     return re.sub(r"[^a-z0-9]", "", t)
 
 
@@ -209,6 +211,9 @@ def learn_profile(live, builder, geo):
         s = live[c].replace("", np.nan).dropna().astype(str)
         if len(s) and (s == s.str.upper()).mean() >= 0.95:
             prof["upper"].append(c)
+    for c in getattr(builder, "TEMPLATE_V2_NEW", {}):          # columns of the V2 template the live file does not fill yet: figures, except the flags and the age groups
+        if c in live.columns and c not in prof["numeric"] and not c.startswith(("Integ", "AgeG")):
+            prof["numeric"].append(c)
     ck = live["Country"].map(builder._qcountry)
     for c in ("Ctry_Code", "AFRO_block"):
         if c in live.columns:
@@ -308,7 +313,7 @@ def _map_header(raw, r, tn, template_cols, assume):
         lay["notes"].append("key columns missing: " + ", ".join(lay["missing_keys"]))
     elif lay["synonym"] or lay["country_from_folder"]:
         lay["class"] = "mapped (headers differ)"
-    elif len(seen) >= 0.7 * len(template_cols):
+    elif len(seen) >= 0.7 * len([c for c in template_cols if c not in V2_NEW]):
         lay["class"] = "template"
     else:
         lay["class"] = "template columns, fewer than the template"
@@ -2608,6 +2613,8 @@ def _cache_sweep(out_root, keep_names):
 
 def inspect_folder(ctx, folder, out_root, template_cols, log=print):
     """Inspect every file of a folder. Writes out_root/Submissions_report.xlsx, out_root/prepared/<hash>.xlsx and updates the ledger."""
+    V2_NEW.clear()
+    V2_NEW.update(getattr(ctx.builder, "TEMPLATE_V2_NEW", {}))
     out_root = Path(out_root)
     (out_root / "prepared").mkdir(parents=True, exist_ok=True)
     ledger = load_ledger(out_root)
