@@ -612,6 +612,27 @@ def round_from_hint(P, ctx, notes, hint):
         notes.add(rowref(P, i), "Round_Add", "", P.at[i, "Round_Add"], "round %d of the lookup, written in the campaign name (the live file numbers this campaign %+d from the lookup)" % (n, off))
 
 
+def align_round_to_lookup(P, ctx, notes):
+    """THE LOOKUP IS THE AUTHORITY FOR THE ROUND NUMBER: a record whose Response and SIA_date are one round of the lookup gets the lookup's round
+    ('Rnd' + its number), whatever number the file gives (Angola's file says Round Number 3 for the lookup's Round 1: it is Rnd1). The live file has the
+    same rule (the build relabels the live records of the campaigns the lookup numbers differently). Returns the list of texts, one per campaign round."""
+    out = []
+    lk = ctx.lookup
+    if lk is None or not {"Country", "Response", "SIA_date", "Round_Add"} <= set(P.columns) or not len(P):
+        return out
+    new, log = ctx.builder.lookup_round_labels(P[["Country", "Response", "SIA_date", "Round_Add"]], lk)
+    for i in P.index:
+        old = P.at[i, "Round_Add"]
+        if is_empty(old) or str(new.at[i]) == str(old):
+            continue
+        P.at[i, "Round_Add"] = new.at[i]
+        notes.add(rowref(P, i), "Round_Add", old, new.at[i], "round number of the lookup (the lookup is the authority): %s started %s is %s in the lookup" %
+                  (P.at[i, "Response"], pd.Timestamp(P.at[i, "SIA_date"]).strftime("%Y-%m-%d"), new.at[i].replace("Rnd", "Round ")))
+    for _, r in log.iterrows():
+        out.append("%s %s: the file says %s, the lookup's round is %s (%d record(s))" % (r["Response"], r["SIA_date"], r["Found"], r["Restored"], r["Records"]))
+    return out
+
+
 def standardize_to_lookup(P, ctx, notes):
     """Records that name a campaign of the lookup but carry another date: the campaign keeps its PLANNED start date (the lookup's), also when it was
     conducted earlier or later. Same country and same Response as the lookup, a date that is not a planned start of that Response, one safe answer
@@ -1780,6 +1801,12 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         det["notes"] = pd.DataFrame(notes.rows)
         return s, None, det
     s["countries"] = ", ".join(sorted(P["Country"].dropna().unique()))
+    try:
+        det["round_std"] = align_round_to_lookup(P, ctx, notes)
+        for t in det["round_std"]:
+            lay["notes"].append("round number set from the lookup: " + t)
+    except Exception as e:
+        det.setdefault("warnings", []).append("Aligning the round numbers with the lookup failed: %s" % e)
     # comparison with the live file (before the defaults are filled in: only what the country reported is compared)
     det["date_check"] = date_year_check(P, notes)
     det["vaccine_check"] = vaccine_vs_lookup(P, ctx)
@@ -2518,7 +2545,7 @@ def folder_country_of(rel_path, geo, b):
 
 
 # ---- incremental inspection: the result of a file is kept while nothing it depends on changed ----------------------------------------------
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def _frame_hash(df):

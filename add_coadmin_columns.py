@@ -209,6 +209,8 @@ def main():
     ap.add_argument("--no-lookup", action="store_true", help="do not use the campaign lookup")
     ap.add_argument("--lookup-overrides", help="CSV of changes a person decided to the lookup (remove a campaign entered twice, add a round, move a start date); "
                                                "applied after the lookup is read, see apply_lookup_overrides")
+    ap.add_argument("--no-lookup-rounds", action="store_true",
+                    help="keep the round numbers of the live file when they differ from the lookup (by default the lookup is the authority: Rnd<number of the lookup>)")
     ap.add_argument("--keep-copied-rounds", action="store_true",
                     help="do not remove the rounds that the lookup does not have and that copy another round of the "
                          "same Response and date (they are removed by default and listed in the audit)")
@@ -338,6 +340,27 @@ def main():
         sys.exit("The input has no CVPolio column, which the population corrections need. "
                  "Use a file that has it, or run with --no-fix-poppolio.")
 
+    # campaign lookup (planned and implemented rounds): second reference for the repairs and the cross-check
+    lk = None
+    if not a.no_lookup:
+        lk_path = find_lookup(a.lookup, a.src)
+        if lk_path:
+            try:
+                lk = load_lookup(lk_path, getattr(a, "lookup_overrides", None))
+                print("lookup: %s (%d rounds, %d countries)" % (lk_path, len(lk), lk["_ck"].nunique()), flush=True)
+            except Exception as e:
+                print("lookup not used (%s): %s" % (lk_path, e), flush=True)
+        else:
+            print("lookup: not found (give it with --lookup): campaigns are not cross-checked", flush=True)
+
+    # the round number follows the lookup (live records of a campaign the lookup numbers differently are relabelled, nothing else changes)
+    if lk is not None and not getattr(a, "no_lookup_rounds", False):
+        rl = align_rounds_to_lookup(ws, header, lk)
+        if len(rl):
+            print("round numbers aligned to the lookup: %d record(s) in %d campaign round(s) (see review/round_numbers_aligned_to_lookup.csv)" %
+                  (int(rl["Records"].sum()), len(rl)), flush=True)
+            os.makedirs(rev_dir, exist_ok=True)
+            rl.to_csv(os.path.join(rev_dir, "round_numbers_aligned_to_lookup.csv"), index=False, encoding="utf-8-sig")
     added_log = []
     if a.add_records:
         added_log = append_records(ws, header, a.add_records)
@@ -368,19 +391,6 @@ def main():
               "for checking only, do NOT upload it to SharePoint as AFRO_admin_data.xlsx." % n_countries, flush=True)
 
     cvp_all = num(df["CVPolio"]) if "CVPolio" in df.columns else pd.Series(np.nan, index=df.index)
-
-    # campaign lookup (planned and implemented rounds): second reference for the repairs and the cross-check
-    lk = None
-    if not a.no_lookup:
-        lk_path = find_lookup(a.lookup, a.src)
-        if lk_path:
-            try:
-                lk = load_lookup(lk_path, getattr(a, "lookup_overrides", None))
-                print("lookup: %s (%d rounds, %d countries)" % (lk_path, len(lk), lk["_ck"].nunique()), flush=True)
-            except Exception as e:
-                print("lookup not used (%s): %s" % (lk_path, e), flush=True)
-        else:
-            print("lookup: not found (give it with --lookup): campaigns are not cross-checked", flush=True)
 
     # copy / drag-fill errors (Response from another country, nOPV3..nOPV15): restored from the backups
     repairs = []
@@ -3479,6 +3489,50 @@ def _round_offsets(pairs, lk):
         return {}
     m["diff"] = m["rn"] - m["_rn"]
     return {k: int(g["diff"].mode().iloc[0]) for k, g in m.groupby("_rk")}
+
+
+def lookup_round_labels(df, lk):
+    """THE LOOKUP IS THE AUTHORITY FOR THE ROUND NUMBER. A record whose Response and SIA_date are one round of the lookup carries the round number
+    of the lookup ('Rnd' + the number): ANG-2026-08-02_nOPV_NID started 2026-08-21 is Round 1 in the lookup, so its records are Rnd1, whatever the
+    country called it in its file (Round Number 3 counted from the year's earlier campaign). Returns (new Round_Add as a Series with the same index,
+    log of the changes). Left as they are: records whose Response + date is not in the lookup (or is there with two round numbers), and a
+    Response + date that the data labels with more than one round (copies of a round: find_copied_rounds deals with them)."""
+    if lk is None or df is None or not len(df):
+        return df["Round_Add"].copy() if df is not None else None, pd.DataFrame()
+    g = pd.DataFrame({"_rk": df["Response"].map(_rk), "_d": df["SIA_date"].map(_dkey), "rd": df["Round_Add"].map(_s)}, index=df.index)
+    g["rn"] = g["rd"].map(_rnum)
+    one = lk[lk["_rn"].notna()].groupby(["_rk", "_d"])["_rn"].agg(["nunique", "first"]).reset_index()
+    one = one[one["nunique"] == 1].rename(columns={"first": "_lrn"})[["_rk", "_d", "_lrn"]]
+    g = g.reset_index().merge(one, on=["_rk", "_d"], how="left").set_index("index")
+    g = g[(g["_rk"] != "") & (g["_d"] != "") & g["_lrn"].notna() & g["rn"].notna()]
+    nround = g.groupby(["_rk", "_d"])["rn"].transform("nunique")
+    g = g[nround == 1]
+    g = g[g["rn"] != g["_lrn"]]
+    out = df["Round_Add"].copy()
+    if g.empty:
+        return out, pd.DataFrame()
+    out.loc[g.index] = ["Rnd%d" % int(x) for x in g["_lrn"]]
+    log = (pd.DataFrame({"Country": df.loc[g.index, "Country"], "Response": df.loc[g.index, "Response"], "SIA_date": g["_d"],
+                         "Found": g["rd"], "Restored": out.loc[g.index]})
+           .groupby(["Country", "Response", "SIA_date", "Found", "Restored"]).size().rename("Records").reset_index())
+    return out, log
+
+
+def align_rounds_to_lookup(ws, header, lk):
+    """Writes lookup_round_labels into the live sheet (Round_Add only; no figure is touched). Returns the log (DataFrame, empty when nothing changed)."""
+    idx = {h: j + 1 for j, h in enumerate(header)}
+    need = ("Country", "Response", "SIA_date", "Round_Add")
+    if lk is None or any(c not in idx for c in need):
+        return pd.DataFrame()
+    last = ws.max_row
+    while last > 1 and not any(c.value is not None for c in ws[last]):
+        last -= 1
+    df = pd.DataFrame({c: [ws.cell(row=r, column=idx[c]).value for r in range(2, last + 1)] for c in need}, index=range(2, last + 1), dtype=object)
+    new, log = lookup_round_labels(df, lk)
+    ch = [r for r in df.index if _s(df.at[r, "Round_Add"]) != _s(new.at[r])]
+    for r in ch:
+        ws.cell(row=r, column=idx["Round_Add"]).value = new.at[r]
+    return log
 
 
 def lookup_crosscheck(df, lk):
