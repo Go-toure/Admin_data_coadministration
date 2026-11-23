@@ -16,7 +16,15 @@ What the inspection does for each file
      countries as context), values never seen in the live file, the campaigns against the lookup, duplicates inside the file;
   4. every record is compared with the live file: new / already there with the same figures / already there with other figures
      (those are only listed, they are never changed by a submission).
-Nothing is written to the live file here: the builder adds the accepted new records (add_coadmin_columns.py --add-records)."""
+Nothing is written to the live file here: the builder adds the accepted new records (add_coadmin_columns.py --add-records).
+Integrated campaigns (an SIA led by polio that also gave measles-rubella, yellow fever, vitamin A, IPV ...)
+  The interventions of a file are recognised from the FIGURES of their blocks (children vaccinated / treated / doses delivered or used above zero), not from the
+  flags, which the countries often leave wrong. The flags follow the figures and SIA_Integrated becomes Yes (normalise_integration; sheet Integrated_interventions).
+  A record that is already in the live file with its polio figures only is completed: the empty cells of the integrated blocks are filled, nothing else is changed
+  (integration_additions; sheet Integrated_additions, written in the prepared file and applied by the build: add_coadmin_columns.enrich_records). Figures both
+  have that differ are listed (Integrated_differences) and left alone. A campaign written with its round ("...-Round 2") and a round 0 that is only the template's
+  default are read from the lookup (split_round_from_response, zero_round_placeholder).
+"""
 import warnings
 import datetime as dt
 import difflib
@@ -192,8 +200,8 @@ def learn_profile(live, builder, geo):
         if c in live.columns:
             prof["values"][c] = set(v for v in live[c].astype(str).str.strip().unique() if v)
     for c in live.columns:
-        if c in TEXT_COLS or c in DATE_COLS or c in ("check_dp", "prov_candidates"):
-            continue
+        if c in TEXT_COLS or c in DATE_COLS or c in ("check_dp", "prov_candidates") or c.startswith("AgeG"):
+            continue                               # (AgeG<intervention> is an age-group label: 9M-14Y, <5Y)
         s = live[c].replace("", np.nan).dropna()
         if len(s) and pd.to_numeric(s, errors="coerce").notna().mean() >= 0.95:
             prof["numeric"].append(c)
@@ -528,6 +536,75 @@ def wire_next_round(lc, starts, ref, rn, offs):
     if pd.Timestamp(x["_d"]) > ref or int((ref - pd.Timestamp(x["_d"])).days) > WIRE_MAX_BACK:
         return None
     return {"x": x, "last": int(nums.max()), "gap": int((ref - pd.Timestamp(x["_d"])).days)}
+
+
+ROUND_SUFFIX = re.compile(r"(?i)^(.*?)[\s_\-]*[\s_\-(]\s*(?:round|rnd|rd|r)[\s_\-.]*0*(\d+)\)?\s*$")
+
+
+def split_round_from_response(P, ctx, notes):
+    """A Response that carries its round at the end ('ANG-2026-08-02_nOPV_NID-Round 2', 'NIE-2026-01_nOPV Rnd1'): when what stands before the round is a
+    campaign of the lookup for that country, the Response becomes that campaign (as the lookup writes it, in the live file's spelling) and the round is kept
+    apart. Returns {row index: round number}; the round is written to Round_Add by round_from_hint when the file gives no round."""
+    hint = {}
+    lk, b = ctx.lookup, ctx.builder
+    if lk is None or "Response" not in P.columns:
+        return hint
+    spell = live_spelling(ctx)
+    for i in P.index:
+        r_ = P.at[i, "Response"]
+        if is_empty(r_) or is_empty(P.at[i, "Country"]):
+            continue
+        m = ROUND_SUFFIX.match(str(r_).strip())
+        if not m or not m.group(1).strip():
+            continue
+        base, n = m.group(1).strip(" _-"), int(m.group(2))
+        rk = b._rk(base)
+        if not (lk[(lk["_ck"] == b._lkc(P.at[i, "Country"])) & (lk["_rk"] == rk)].shape[0]):
+            continue                                    # what remains is not a campaign of the lookup: the Response is left as written
+        if b._rk(r_) in set(lk["_rk"]):
+            continue                                    # the whole text is itself a name of the lookup
+        name = spell.get(rk) or lk[lk["_rk"] == rk].iloc[0]["OBR Name"]
+        notes.add(rowref(P, i), "Response", r_, name, "the round (%d) was written at the end of the campaign name: campaign and round separated" % n)
+        P.at[i, "Response"] = name
+        hint[i] = n
+    return hint
+
+
+def zero_round_placeholder(P, ctx, notes):
+    """The template is sent with 0 in the round (and the vaccine) when the country did not fill them. A round 0 is a real round only for a campaign whose lookup
+    has a round 0 (the R0 campaigns): for a campaign of the lookup that has none, the 0 is a placeholder, the round is left empty and found from the lookup
+    (the date of the records, or the round written in the campaign name)."""
+    if "Round_Add" not in P.columns or "Response" not in P.columns:
+        return
+    lk, b = ctx.lookup, ctx.builder
+    for i in P.index[P["Round_Add"].map(lambda v: isinstance(v, str) and re.fullmatch(r"(?i)\s*rnd\s*0+\s*", v) is not None)]:
+        r_, c_ = P.at[i, "Response"], P.at[i, "Country"]
+        if is_empty(r_) or is_empty(c_):
+            continue
+        lc = lk[(lk["_ck"] == b._lkc(c_)) & (lk["_rk"] == b._rk(r_))]
+        if lc.empty or (lc["_rn"] == 0).any():
+            continue
+        notes.add(rowref(P, i), "Round_Add", P.at[i, "Round_Add"], "", "0 is not a round of this campaign (template default): left empty, taken from the lookup")
+        P.at[i, "Round_Add"] = None
+
+
+def round_from_hint(P, ctx, notes, hint):
+    """The round number written in the campaign name, for the records whose round is still empty: the round of the lookup with that number
+    (the date of the records agrees when the lookup has it), written the way the live file numbers this campaign."""
+    if not hint or "Round_Add" not in P.columns:
+        return
+    lk, b = ctx.lookup, ctx.builder
+    offs = round_offsets(ctx)
+    for i, n in hint.items():
+        if not is_empty(P.at[i, "Round_Add"]):
+            continue
+        rk = b._rk(P.at[i, "Response"])
+        lc = lk[(lk["_ck"] == b._lkc(P.at[i, "Country"])) & (lk["_rk"] == rk) & (lk["_rn"] == n)]
+        if lc["_rn"].nunique() != 1:
+            continue
+        off = offs["by_campaign"].get(rk, offs["common"])
+        P.at[i, "Round_Add"] = "Rnd%d" % (n + off)
+        notes.add(rowref(P, i), "Round_Add", "", P.at[i, "Round_Add"], "round %d of the lookup, written in the campaign name (the live file numbers this campaign %+d from the lookup)" % (n, off))
 
 
 def standardize_to_lookup(P, ctx, notes):
@@ -1443,6 +1520,12 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             if t and t != v:
                 notes.add(rowref(P, i), "Country", v, t, "country name of the geography reference")
                 P.at[i, "Country"] = t
+    if "Admin_3" in P.columns:
+        # a sub-district is a name: a figure in that column is a number written in the wrong place (a total shifted from the neighbouring column)
+        for i, v in P["Admin_3"].items():
+            if not is_empty(v) and re.fullmatch(r"[\d.,\s]+", str(v)):
+                notes.add(rowref(P, i), "Admin_3", v, "", "a number is not a sub-district name (figure typed in the wrong column): left empty")
+                P.at[i, "Admin_3"] = None
     for c in prof["upper"]:
         for i, v in P[c].items():
             if isinstance(v, str) and v != v.upper():
@@ -1477,6 +1560,12 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             if t and t != v:
                 notes.add(rowref(P, i), "Vaccine_type", v, t, "vaccine spelling of the live file")
                 P.at[i, "Vaccine_type"] = t
+    if "AgeGPolio" in P.columns:
+        # under five years, written another way than the live file's 0-59m (the V2 template says <5Y)
+        for i, v in P["AgeGPolio"].items():
+            if isinstance(v, str) and re.fullmatch(r"(?i)\s*(<\s*5\s*(y|yr|yrs|years?|ans)?|under\s*5\s*(y|yrs?|years?)?|0\s*-\s*4\s*(y|yrs?|years?|ans)?)\s*", v):
+                notes.add(rowref(P, i), "AgeGPolio", v, "0-59m", "under five years, written the way the live file writes it")
+                P.at[i, "AgeGPolio"] = "0-59m"
     for i, v in P["Round_Add"].items():
         if v is None:
             continue
@@ -1551,6 +1640,18 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
             for i in P.index[P[col].map(lambda x: pd.isna(x) if col == "SIA_date" else is_empty(x))]:
                 P.at[i, col] = val
                 notes.add(rowref(P, i), col, "", val if col != "SIA_date" else val.strftime("%Y-%m-%d"), "given by the operator for this file (campaign_hints.json)")
+    # a Response written with its round ("ANG-2026-08-02_nOPV_NID-Round 2"): the campaign of the lookup and the round apart
+    round_hint = {}
+    if ctx.lookup is not None:
+        try:
+            round_hint = split_round_from_response(P, ctx, notes)
+        except Exception as e:
+            det.setdefault("warnings", []).append("Round written in the campaign name: %s" % e)
+    if ctx.lookup is not None:
+        try:
+            zero_round_placeholder(P, ctx, notes)
+        except Exception as e:
+            det.setdefault("warnings", []).append("Round 0 check failed: %s" % e)
     # an empty Response: the lookup (the same rules as the build), then the names of the lookup
     if ctx.lookup is not None:
         try:
@@ -1585,6 +1686,10 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
                     notes.add(rowref(P, i), "Round_Add", "", P.at[i, "Round_Add"], "round taken from the lookup (country, campaign, start date); " + how)
         except Exception as e:
             det.setdefault("warnings", []).append("Round filling from the lookup failed: %s" % e)
+        try:
+            round_from_hint(P, ctx, notes, round_hint)
+        except Exception as e:
+            det.setdefault("warnings", []).append("Round from the campaign name failed: %s" % e)
     # a named campaign of the lookup with another date than its planned start: the planned start is kept (the file's date goes in the notes)
     if ctx.lookup is not None:
         try:
@@ -1673,8 +1778,17 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     # comparison with the live file (before the defaults are filled in: only what the country reported is compared)
     det["date_check"] = date_year_check(P, notes)
     det["vaccine_check"] = vaccine_vs_lookup(P, ctx)
+    try:
+        normalise_integration(P, ctx, notes, det, s)
+    except Exception as e:
+        s["integrated"] = ""
+        det.setdefault("warnings", []).append("Integrated interventions check failed: %s" % e)
     cmp_, diffs = compare_with_live(P, ctx, prof)
     det["compare"], det["diffs"] = cmp_, diffs
+    try:
+        integration_additions(P, cmp_, ctx, det, s)
+    except Exception as e:
+        det.setdefault("warnings", []).append("Integrated data for live records failed: %s" % e)
     det["older"] = older_campaign_check(P, cmp_)
     det["_builder"] = b
     if det.get("facility"):
@@ -1826,6 +1940,13 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append("more than 25% of the records have a warning"); codes.append("warnings")
     if s["new"] == 0:
         reasons.append("no new record"); codes.append("no_new")
+    if s.get("integrated"):
+        reasons.insert(0, s["integrated"]); codes.append("integrated")
+    if s.get("integ_cells"):
+        reasons.append("INTEGRATED DATA TO ADD to %d record(s) already in the live file (%d cell(s); the polio figures are not touched): sheet Integrated_additions" % (s["integ_records"], s["integ_cells"]))
+        codes.append("integrated_to_add")
+    if len(det.get("integ_diff") if det.get("integ_diff") is not None else []):
+        infos.append("%d integrated figure(s) differ from the live record (not changed): sheet Integrated_differences" % len(det["integ_diff"]))
     s["codes"] = codes
     # the lookup as evidence: every campaign round of the file is a round of the lookup (same country, campaign, date and round)
     s["lookup_rounds"], s["lookup_ok"] = 0, 0
@@ -1838,7 +1959,7 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
     s["status"] = "ready" if not reasons else "review"
     if s.get("wrong_place"):
         s["status"] = "blocked"
-    if not s.get("wrong_place") and (reasons == ["no new record"] or (s["new"] == 0 and not s["qc_errors"] and not s["existing_different"] and not s["existing_units"] and not s.get("possible_dup"))):
+    if not s.get("wrong_place") and (reasons == ["no new record"] or (s["new"] == 0 and not s["qc_errors"] and not s["existing_different"] and not s["existing_units"] and not s.get("possible_dup") and not s.get("integ_cells"))):
         s["status"] = "nothing new"
     s["why"] = "; ".join(reasons + (["for reference: " + "; ".join(infos)] if infos else []))
     if det.get("facility"):
@@ -2082,6 +2203,101 @@ def lookup_round_at(ctx, response, country, date):
     return int(rn[0]) + offs["by_campaign"].get(e.iloc[0]["_rk"], offs["common"])
 
 
+def normalise_integration(P, ctx, notes, det, s):
+    """INTEGRATED CAMPAIGNS. Recognises, from the FIGURES, which interventions other than polio the file carries (children vaccinated / treated / doses delivered or
+    used above zero in the block of the intervention), whatever its flag says: a data focal point may leave 'No' on a block he filled, or 'Yes' on one he did not.
+    The flags are written the way the figures say (Yes where there are figures; a 'Yes' with no figure anywhere in the file is left and reported), SIA_Integrated
+    becomes Yes on the records with an intervention, and every change is listed in the notes. Returns the summary (a text for the report); det['integrated'] holds
+    the table per intervention."""
+    b = ctx.builder
+    if not len(P):
+        return ""
+    ev, fl = b.integrated_state(P)
+    rows, parts = [], []
+    for name, sp in b.INTEGRATED.items():
+        n_fig = int(ev[name].sum())
+        flag = sp["flag"]
+        n_yes = int((fl[name] == "Yes").sum())
+        n_fixed = 0
+        if flag in P.columns:
+            for i in P.index[ev[name].values]:
+                cur = P.at[i, flag]
+                if b.integ_flag_text(cur) != "Yes":
+                    notes.add(rowref(P, i), flag, "" if is_empty(cur) else cur, "Yes", "the file has %s figures on this record: the flag follows the figures" % name)
+                    P.at[i, flag] = "Yes"
+                    n_fixed += 1
+                elif cur != "Yes":
+                    notes.add(rowref(P, i), flag, cur, "Yes", "flag written the way the live file writes it")
+                    P.at[i, flag] = "Yes"
+        elsewhere = [c for c in sp["block"] if c not in ctx.live.columns and c in P.columns]
+        if n_fig or n_yes:
+            rows.append({"Intervention": name, "Records with figures": n_fig, "Flag said Yes": n_yes, "Flag corrected to Yes": n_fixed,
+                         "Flag Yes but no figures": int(((fl[name] == "Yes") & ~ev[name]).sum()),
+                         "Columns the live file does not have": ", ".join(elsewhere) if n_fig and elsewhere else ""})
+        if n_fig:
+            parts.append("%s %d%s" % (name, n_fig, (" (flag said No on %d)" % n_fixed) if n_fixed else ""))
+    if parts and "SIA_Integrated" in P.columns:
+        anyev = ev.any(axis=1)
+        for i in P.index[anyev.values]:
+            cur = P.at[i, "SIA_Integrated"]
+            if b.integ_flag_text(cur) != "Yes":
+                notes.add(rowref(P, i), "SIA_Integrated", "" if is_empty(cur) else cur, "Yes", "the record carries other interventions than polio")
+                P.at[i, "SIA_Integrated"] = "Yes"
+    det["integrated"] = pd.DataFrame(rows)
+    s["integrated_n"] = int(ev.any(axis=1).sum())
+    msg = ""
+    if parts:
+        msg = "INTEGRATED CAMPAIGN: %s (records with figures)" % "; ".join(parts)
+        lost = [r for r in rows if r["Columns the live file does not have"]]
+        if lost:
+            msg += "; figures in columns the live file does not have yet (not kept): " + "; ".join("%s: %s" % (r["Intervention"], r["Columns the live file does not have"]) for r in lost)
+    noflag = [r["Intervention"] for r in rows if r["Flag Yes but no figures"] and not r["Records with figures"]]
+    if noflag:
+        det.setdefault("warnings", []).append("flag says Yes but there is no figure for: " + ", ".join(noflag))
+    s["integrated"] = msg
+    return msg
+
+
+def integration_additions(P, cmp_, ctx, det, s):
+    """The records of the file that are already in the live file: what the file adds as integrated data (interventions with figures in the file and none in the
+    live record), cell by cell. det['integ_add'] is what the build applies (sheet Integrated_additions of the prepared file); det['integ_diff'] lists the
+    interventions that both have, with other figures (never changed). The live record is identified by its own values, so the build finds it again."""
+    b = ctx.builder
+    s["integ_cells"] = s["integ_records"] = 0
+    if "Live_index" not in cmp_.columns or not len(P):
+        return
+    ident_cols = ["Country", "Province", "District", "Admin_3", "SIA_date", "Round_Add", "Vaccine_type", "Response"]
+    lines, diffs = [], []
+    recs = set()
+    for pos in range(len(P)):
+        li = cmp_["Live_index"].iat[pos]
+        if li == "" or pd.isna(li):
+            continue
+        li = int(li)
+        if li not in ctx.live.index:
+            continue
+        lr = ctx.live.loc[li]
+        frow = P.iloc[pos].to_dict()
+        live_row = {c: lr[c] for c in ctx.live.columns}
+        ident = {c: ("" if is_empty(lr.get(c)) else (str(lr[c])[:10] if c == "SIA_date" else lr[c])) for c in ident_cols if c in ctx.live.columns}
+        ident.update({"Row_in_file": rowref(P, pos), "Live_row": li + 2})
+        l_, d_ = b.integrated_additions(frow, live_row, ident)
+        if l_:
+            recs.add(li)
+            lines += l_
+        diffs += d_
+    det["integ_add"] = pd.DataFrame(lines)
+    det["integ_diff"] = pd.DataFrame(diffs)
+    s["integ_cells"], s["integ_records"] = len(lines), len(recs)
+    if len(lines):
+        ants = sorted({a for l in lines for a in str(l["Antigen"]).split(", ") if a})
+        mark = {i: True for i in recs}
+        for pos in range(len(P)):
+            li = cmp_["Live_index"].iat[pos]
+            if li != "" and not pd.isna(li) and int(li) in mark:
+                cmp_.at[cmp_.index[pos], "Note"] = (str(cmp_["Note"].iat[pos]) + "; " if str(cmp_["Note"].iat[pos]) else "") + "integrated data to add to the live record"
+
+
 def compare_with_live(P, ctx, prof):
     b = ctx.builder
     T = to_text(P.drop(columns=["_src_row", "_sheet"]), prof["numeric"])
@@ -2187,7 +2403,11 @@ def compare_with_live(P, ctx, prof):
                     diffs.append({"Row_in_file": rowref(P, i), "Country": P.at[i, "Country"], "District": P.at[i, "District"],
                                   "SIA_date": P.at[i, "SIA_date"].strftime("%Y-%m-%d"), "Response": P.at[i, "Response"],
                                   "Column": c, "Live_value": lv, "Submitted_value": sv, "Live_row": best + 2})
-        rows.append({"Row_in_file": rowref(P, i), "Country": P.at[i, "Country"], "Province": P.at[i, "Province"],
+        live_ix = None
+        if st.startswith("already in the live file"):
+            mrow = re.search(r"live row (\d+)", note or "")
+            live_ix = int(mrow.group(1)) - 2 if mrow else None
+        rows.append({"Row_in_file": rowref(P, i), "Live_index": "" if live_ix is None else live_ix, "Country": P.at[i, "Country"], "Province": P.at[i, "Province"],
                      "District": P.at[i, "District"], "SIA_date": P.at[i, "SIA_date"].strftime("%Y-%m-%d"),
                      "Round_Add": P.at[i, "Round_Add"], "Vaccine_type": P.at[i, "Vaccine_type"], "Response": P.at[i, "Response"],
                      "Status": st, "Note": note, "Live_campaign": alias[2] if alias else "", "Live_round": alias[3] if alias else "",
@@ -2293,7 +2513,7 @@ def folder_country_of(rel_path, geo, b):
 
 
 # ---- incremental inspection: the result of a file is kept while nothing it depends on changed ----------------------------------------------
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def _frame_hash(df):
@@ -2469,7 +2689,11 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
             prepared = None
             if P is not None:
                 prepared = "prepared/%s.xlsx" % h[:12]
-                P.to_excel(out_root / prepared, sheet_name="Sheet1", index=False)
+                with pd.ExcelWriter(out_root / prepared, engine="openpyxl") as xw_:
+                    P.to_excel(xw_, sheet_name="Sheet1", index=False)
+                    ia_ = det.get("integ_add")
+                    if ia_ is not None and len(ia_):         # integrated data for records the live file already has: the build applies it (add_coadmin_columns.enrich_records)
+                        ia_.to_excel(xw_, sheet_name="Integrated_additions", index=False)
             clean_p, clean_n, held_n = None, 0, 0
             if P is not None and det.get("hold") is not None and len(det["hold"]) == len(P):
                 hold_ = pd.Series(det["hold"], index=P.index)
@@ -2557,11 +2781,11 @@ def inspect_folder(ctx, folder, out_root, template_cols, log=print):
 def write_report(path, rows, details, ctx, not_read=()):
     ov = pd.DataFrame(rows)
     cols = ["name", "path", "status", "decision", "layout", "countries", "rows_read", "rows_used", "excluded", "new", "existing_same",
-            "existing_different", "existing_units", "possible_dup", "in_file_duplicates_removed", "clean_new", "held_new", "qc_errors", "qc_warnings", "why", "hash"]
+            "existing_different", "existing_units", "possible_dup", "in_file_duplicates_removed", "clean_new", "held_new", "qc_errors", "qc_warnings", "integrated", "integ_records", "why", "hash"]
     ov = ov[[c for c in cols if c in ov.columns]].rename(columns={"name": "File", "path": "Path", "status": "Status", "decision": "Decision",
         "layout": "Layout", "countries": "Countries", "rows_read": "Rows read", "rows_used": "Rows used", "excluded": "Rows left out",
         "new": "New records", "existing_same": "Already there (same)", "existing_different": "Already there (other figures)", "existing_units": "Same names as several live records (not added)", "possible_dup": "Possible duplicates (not added)",
-        "in_file_duplicates_removed": "Exact copies removed", "clean_new": "Clean new records (go in)", "held_new": "Held back (see Held_back_records)", "qc_errors": "Records with an Error", "qc_warnings": "Records with a Warning",
+        "in_file_duplicates_removed": "Exact copies removed", "clean_new": "Clean new records (go in)", "held_new": "Held back (see Held_back_records)", "qc_errors": "Records with an Error", "integrated": "Integrated interventions (from the figures)", "integ_records": "Live records to complete with integrated data", "qc_warnings": "Records with a Warning",
         "why": "Why not ready", "hash": "Content hash"})
     sheets = {"Overview": ov}
 
@@ -2585,13 +2809,14 @@ def write_report(path, rows, details, ctx, not_read=()):
     # every header the app could not map, over all the files: the way it learns. Copy a line into header_synonyms.json to teach it.
     import difflib
     tcols = {cn(c): c for c in (ctx.live.columns if getattr(ctx, "live", None) is not None else [])}
+    known_integ = {cn(c) for sp in getattr(ctx.builder, "INTEGRATED", {}).values() for c in sp["block"]}   # columns of the V2 template the live file does not have yet: known, not to be mapped on another intervention
     cnt = {}
     for h, (s, det) in details.items():
         L = det["layout"] or {}
         if L.get("class") in ("not readable", "not usable") and not L.get("map"):
             continue                                   # a file that is not admin data teaches nothing
         for x in L.get("ignored", []):
-            if "(second column for" in str(x) or cn(x) in tcols or cn(x) in SYNONYMS or cn(x) == "checkdp":
+            if "(second column for" in str(x) or cn(x) in tcols or cn(x) in SYNONYMS or cn(x) == "checkdp" or cn(x) in known_integ:
                 continue                              # a repeated header or a column the app already knows
             x = str(x)
             c = cnt.setdefault(x, {"files": set(), "n": 0})
@@ -2607,7 +2832,7 @@ def write_report(path, rows, details, ctx, not_read=()):
     if gaps:
         sheets["Lookup_gaps"] = pd.DataFrame(gaps).drop_duplicates()
     for name, key in (("Campaign_to_set", "to_set"), ("eTally_vs_callin", "callin_check"), ("Tally_check", "tally_check"), ("Records", "compare"), ("Differences_with_live", "diffs"), ("Issues", "issues"), ("Normalised_summary", "note_counts"),
-                      ("Normalised_cells", "notes"), ("Defaults_from_live", "defaults"), ("Held_back_records", "held_all"), ("Left_out", "excluded_df"), ("Not_numbers", "bad_numbers"),
+                      ("Integrated_interventions", "integrated"), ("Integrated_additions", "integ_add"), ("Integrated_differences", "integ_diff"), ("Normalised_cells", "notes"), ("Defaults_from_live", "defaults"), ("Held_back_records", "held_all"), ("Left_out", "excluded_df"), ("Not_numbers", "bad_numbers"),
                       ("Values_not_seen", "unseen"), ("Duplicates_in_file", "dups"), ("Campaigns_vs_lookup", "campaigns")):
         if key == "excluded_df":
             parts = []
@@ -2806,7 +3031,7 @@ def auto_codes_ok(e):
 
 # Automatic rule 3, the engine learns from the people: a file with the same name pattern, in the same country folder and with the same layout as a file
 # that a PERSON accepted is accepted again, when it shows no kind of finding that the accepted one did not show and none of the HARD ones.
-AUTO_HARD = {"error", "several_units", "possible_dup", "overlap", "wrong_place", "other_country", "non_numbers", "vaccine_vs_lookup", "sheets_skipped"}
+AUTO_HARD = {"integrated", "integrated_to_add", "error", "several_units", "possible_dup", "overlap", "wrong_place", "other_country", "non_numbers", "vaccine_vs_lookup", "sheets_skipped"}
 
 
 def precedent_for(e, ledger):
@@ -2906,6 +3131,8 @@ CODE_MEANING = {
     "vaccine_vs_lookup": ("the vaccine differs from the lookup", "the country or a person"),
     "other_country": ("records of another country than the folder", "a person"),
     "wrong_place": ("a file in the wrong folder", "move or delete the file"),
+    "integrated": ("an integrated campaign: other interventions than polio recognised from the figures (flags corrected)", "a person"),
+    "integrated_to_add": ("integrated data for records the live file already has (polio only so far)", "a person"),
 }
 
 

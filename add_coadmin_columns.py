@@ -334,6 +334,14 @@ def main():
     added_log = []
     if a.add_records:
         added_log = append_records(ws, header, a.add_records)
+        try:
+            integ_done, integ_skipped = enrich_records(ws, header, a.add_records)
+        except Exception as e:
+            integ_done, integ_skipped = [], [{"Why": "integrated data could not be added: %s" % e}]
+            print("WARNING: integrated data of the submissions could not be added: %s" % e, flush=True)
+        if integ_done or integ_skipped:
+            os.makedirs(rev_dir, exist_ok=True)
+            pd.DataFrame(integ_done + integ_skipped).to_csv(os.path.join(rev_dir, "integrated_data_added_from_submissions.csv"), index=False, encoding="utf-8-sig")
         if added_log:     # where each added record came from: the Operations Center keeps it per build (Live data tab)
             os.makedirs(rev_dir, exist_ok=True)
             pd.DataFrame([{k: v for k, v in r.items() if k != "Excel row"} for r in added_log]).rename(columns={"file": "Source_file"}).to_csv(
@@ -2045,6 +2053,205 @@ def apply_corrections(df, path):
                 changes.append((i, col, v, df.at[i, col], "%s (decided by %s, %s)" % (r.get("Reason", "") or "decided correction", r.get("Decided_by", "") or "?", r.get("Decided_on", "") or "?"), line))
                 applied += 1
     return changes, {"applied": applied, "already": already, "skipped": skipped}
+
+
+# ----------------------------------------------------------------------------------------------- integrated campaigns
+# An SIA led by polio can carry other interventions in the same visit (measles-rubella, yellow fever, vitamin A, deworming, IPV, ...). The admin template has a block
+# of columns per intervention. The flag of a block (IntegMeasles ...) is filled by the country's data focal point and often wrong (a "No" with figures, a "Yes"
+# with none), so an intervention is recognised from its FIGURES: children vaccinated / treated / doses delivered or used above zero. The flag follows the figures.
+def _blk(code, doses, extra=("Pop", "AgeG", "CV", "Used", "WastR", "ZeroDose", "PropZeroDose"), flag=None, names=None):
+    return {"code": code, "flag": flag or "Integ" + code, "doses": list(doses), "used": ["Used" + code], "block": ["Integ" + code] + [e + code for e in extra] + list(doses) + (names or [])}
+
+
+INTEGRATED = {
+    "measles-rubella": _blk("Measles", ["NbrVacMeasles"]),
+    "yellow fever": _blk("YF", ["NbrVacYF"]),
+    "tetanus": _blk("Tetanus", ["NbrVacTetanus_1st_Dose", "NbrVacTetanus_2nd_Dose", "NbrVacTetanus_3rd_Dose", "TotalNbrVacTetanus"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "meningitis": _blk("Mening", ["NbrVacMening"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "vitamin A": _blk("VitA", ["NbrVacVitA"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "deworming": _blk("Deparasit", ["NbrVacDeparasit"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "albendazole": _blk("Albendazole", ["NbrVacAlbendazole"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "insecticide-treated nets (MII)": _blk("MII", ["NbrVacMII"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "anti-malarial": _blk("AntMal", ["NbrVacAntMal"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "cholera": _blk("Cholera", ["NbrVacCholera"]),
+    "LLIN": _blk("LLIN", ["NbrLLINDistributed"], extra=("Pop", "AgeG", "CV", "Used", "WastR", "PropZero"), names=["ZeroLLIN", "PropZeroLLIN"]),
+    "IPV": _blk("IPV", ["Total_IPV1_0_6wk", "Total_IPV2_6_14wk", "TotalNbrVaccIPV", "Total_IPV<=1Y", "Total_IPV>1Y"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "fractional IPV": _blk("fIPV", ["Total_fIPV"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "other intervention A": _blk("Other_A", ["NbrVacOther_A"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "other intervention B": _blk("Other_B", ["NbrVacOther_B"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "HPV": _blk("HPV", ["NbrVacHPV"]),
+    "onchocerciasis": _blk("Oncho", ["NbrTreatedOncho"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "lymphatic filariasis": _blk("LF", ["NbrTreatedLF"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "schistosomiasis": _blk("SCH", ["NbrTreatedSCH"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+    "trachoma": _blk("Trachoma", ["NbrTreatedTrachoma"], extra=("Pop", "AgeG", "CV", "Used", "WastR")),
+}
+for _k, _v in INTEGRATED.items():
+    _v["block"] = list(dict.fromkeys(c for c in _v["block"]))
+INTEG_YES = {"yes", "y", "oui", "true", "1"}
+INTEG_NO = {"no", "n", "non", "false", "0", "nan", "none", ""}
+
+
+def integ_flag_text(v):
+    """A flag as the live file writes it: Yes, No, or '' when empty."""
+    if v is None or (isinstance(v, float) and v != v):
+        return ""
+    t = str(v).strip().lower()
+    return "Yes" if t in INTEG_YES else "No" if t in INTEG_NO and t != "" else "" if t == "" else str(v).strip()
+
+
+def _pos(v):
+    x = pd.to_numeric(pd.Series([v]), errors="coerce").iat[0]
+    return bool(x == x and x > 0)
+
+
+def integrated_evidence(df):
+    """{intervention: boolean Series} for the rows of a frame (text or numbers): the intervention has figures on that row (children vaccinated / treated /
+    doses delivered, or doses used, above zero). Polio is not an integrated intervention. A column the frame does not have counts for nothing."""
+    out = {}
+    for name, sp in INTEGRATED.items():
+        cols = [c for c in sp["doses"] + sp["used"] if c in df.columns]
+        ev = pd.Series(False, index=df.index)
+        for c in cols:
+            ev |= pd.to_numeric(df[c], errors="coerce").fillna(0) > 0
+        out[name] = ev
+    return out
+
+
+def integrated_state(df):
+    """Per row: which interventions have figures. Returns (evidence frame, flag frame): flags as Yes / No / ''. Only the columns of the frame are read."""
+    ev = pd.DataFrame(integrated_evidence(df))
+    fl = pd.DataFrame({n: (df[sp["flag"]].map(integ_flag_text) if sp["flag"] in df.columns else pd.Series("", index=df.index)) for n, sp in INTEGRATED.items()})
+    return ev, fl
+
+
+def _blank_cell(col, v):
+    """A cell of the live file that holds nothing: empty, 0 for a figure, No / empty for a flag, 0 for an age group."""
+    if v is None or (isinstance(v, float) and v != v):
+        return True
+    t = str(v).strip()
+    if t == "" or t.lower() in ("nan", "none"):
+        return True
+    if col.startswith("Integ"):
+        return t.lower() in INTEG_NO
+    x = pd.to_numeric(pd.Series([t]), errors="coerce").iat[0]
+    return bool(x == x and x == 0) or t == "0"
+
+
+def _same_cell(a, b):
+    ta, tb = ("" if a is None or (isinstance(a, float) and a != a) else str(a).strip()), ("" if b is None or (isinstance(b, float) and b != b) else str(b).strip())
+    if ta == tb:
+        return True
+    xa, xb = pd.to_numeric(pd.Series([ta, tb]), errors="coerce")
+    return bool(xa == xa and xb == xb and abs(xa - xb) < 1e-9)
+
+
+def integrated_additions(file_row, live_row, ident):
+    """What the file's row can ADD to the live record it matches: for every intervention with figures in the file and none in the live record, the cells of
+    its block that the live record leaves empty and the file fills (the flag, target, age group, children vaccinated, coverage, doses used, wastage ...),
+    and SIA_Integrated = Yes. The polio figures and every cell the live record already has are never touched. A block with figures on both sides that
+    differ is not changed: it is returned as a difference. file_row / live_row: mapping column -> value. Returns (lines, differences)."""
+    lines, diffs = [], []
+    f_ev = integrated_evidence(pd.DataFrame([file_row]))
+    l_ev = integrated_evidence(pd.DataFrame([live_row]))
+    added = []
+    for name, sp in INTEGRATED.items():
+        if not f_ev[name].iat[0]:
+            continue
+        if l_ev[name].iat[0]:
+            for c in sp["doses"]:
+                if c in file_row and c in live_row and _pos(file_row.get(c)) and _pos(live_row.get(c)) and not _same_cell(file_row.get(c), live_row.get(c)):
+                    diffs.append(dict(ident, Antigen=name, Column=c, Live_value=live_row.get(c), Submitted_value=file_row.get(c)))
+            continue
+        n0 = len(lines)
+        for c in sp["block"]:
+            if c not in live_row:
+                continue                                  # a column the live file does not have: the build cannot write it
+            fv = file_row.get(c)
+            if c == sp["flag"]:
+                new = "Yes"
+            elif fv is None or (isinstance(fv, float) and fv != fv) or str(fv).strip() == "" or _blank_cell(c, fv):
+                continue
+            else:
+                new = fv
+            if _blank_cell(c, live_row.get(c)) and not _same_cell(new, live_row.get(c)):
+                lines.append(dict(ident, Antigen=name, Column=c, Found="" if live_row.get(c) is None or (isinstance(live_row.get(c), float) and live_row.get(c) != live_row.get(c)) else live_row.get(c), Restored=new))
+        if len(lines) > n0:
+            added.append(name)
+    if added and "SIA_Integrated" in live_row and integ_flag_text(live_row.get("SIA_Integrated")) != "Yes":
+        cur = live_row.get("SIA_Integrated")
+        lines.append(dict(ident, Antigen=", ".join(added), Column="SIA_Integrated", Found="" if cur is None or (isinstance(cur, float) and cur != cur) else cur, Restored="Yes"))
+    return lines, diffs
+
+
+def enrich_records(ws, header, files):
+    """INTEGRATED DATA OF A SUBMISSION for records the live file already has (a campaign first sent with its polio figures only, later sent again with the
+    integrated interventions). The prepared file of an accepted submission may carry a sheet Integrated_additions (written by the inspection: one line per
+    cell, with the identity of the live record, the value it was found with and the value to write). A line is applied only while the live cell still
+    holds the value it was found with, so the polio figures and everything a person corrected are never touched, and running the build again changes nothing.
+    Returns (done, skipped): lists of dicts for the review file."""
+    from openpyxl import load_workbook
+    done, skipped = [], []
+    lines = []
+    for f in files:
+        try:
+            wb = load_workbook(f, read_only=True)
+            ok = "Integrated_additions" in wb.sheetnames
+            wb.close()
+        except Exception:
+            continue
+        if not ok:
+            continue
+        d = pd.read_excel(f, sheet_name="Integrated_additions", dtype=object)
+        d["_file"] = Path(f).name
+        lines.append(d)
+    if not lines:
+        return done, skipped
+    AL = pd.concat(lines, ignore_index=True)
+    ncol = len(header)
+    idx = {h: j for j, h in enumerate(header)}
+    last = ws.max_row
+    while last > 1 and not any(c.value is not None for c in ws[last]):
+        last -= 1
+    kc = [c for c in ("Country", "Province", "District", "Admin_3", "SIA_date", "Round_Add", "Vaccine_type", "Response") if c in idx]
+    base = pd.DataFrame([[ws.cell(row=r, column=idx[c] + 1).value for c in kc] for r in range(2, last + 1)], columns=kc, dtype=object)
+    bkey, _ = dup_key(base)
+    rows_of = {}
+    for pos, k in enumerate(bkey.values):
+        rows_of.setdefault(k, []).append(pos + 2)
+    lk_, _ = dup_key(AL[[c for c in kc if c in AL.columns]].copy())
+    for n in range(len(AL)):
+        r = AL.iloc[n]
+        col = str(r["Column"])
+        rws = rows_of.get(lk_.iat[n], [])
+        base_info = {"Country": r.get("Country"), "Province": r.get("Province"), "District": r.get("District"), "Response": r.get("Response"),
+                     "Round_Add": r.get("Round_Add"), "SIA_date": str(r.get("SIA_date"))[:10], "Antigen": r.get("Antigen"), "Column": col,
+                     "Found": r.get("Found"), "Restored": r.get("Restored"), "Source_file": r["_file"]}
+        if col not in idx:
+            skipped.append(dict(base_info, Why="the live file has no column " + col))
+            continue
+        if len(rws) != 1:
+            skipped.append(dict(base_info, Why="the live record was not found" if not rws else "%d live records have this identity" % len(rws)))
+            continue
+        cell = ws.cell(row=rws[0], column=idx[col] + 1)
+        if _same_cell(cell.value, r.get("Restored")):
+            continue                                       # already there (the records were published with it, or the build ran before): nothing to do
+        if not _same_cell(cell.value, r.get("Found")) and not (_blank_cell(col, cell.value) and _blank_cell(col, r.get("Found"))):
+            skipped.append(dict(base_info, Why="the live cell holds %s, not %s: not changed" % (cell.value, r.get("Found"))))
+            continue
+        v = r.get("Restored")
+        if isinstance(v, str) and re.fullmatch(r"-?\d+", v.strip()):
+            v = int(v)
+        elif isinstance(v, str) and re.fullmatch(r"-?\d*\.\d+", v.strip()):
+            v = float(v)
+        elif isinstance(v, (np.integer,)):
+            v = int(v)
+        elif isinstance(v, (np.floating,)):
+            v = float(v)
+        cell.value = v
+        done.append(dict(base_info, **{"Excel row": rws[0]}))
+    print("integrated data added to live records: %d cell(s) in %d record(s) (%d line(s) skipped: record not found, or the live cell changed since the inspection)" % (
+        len(done), len({d["Excel row"] for d in done}), len(skipped)), flush=True)
+    return done, skipped
 
 
 def append_records(ws, header, files):
