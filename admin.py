@@ -1687,7 +1687,7 @@ def cmd_submissions(a):
     sm = import_submissions()
     out_root = WORK / "submissions"
     if a.action in ("list", "auto", "summary", "feedback", "pending", "accept", "reject") and not getattr(a, "no_pull", False) and not getattr(a, "local", False):
-        if a.action in ("accept", "reject"):
+        if a.action in ("accept", "reject") and not os.environ.get("OPS_LEDGER_FROM_APP"):
             die("accept and reject are made in the Operations Center (Submissions tab): the PC reads those decisions and does not make "
                 "its own, so that there is one ledger. To decide here anyway, add --local (the decision then stays on this PC only).")
         st = submissions_state_pull()

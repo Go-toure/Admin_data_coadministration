@@ -2109,12 +2109,19 @@ def date_year_check(P, notes):
     return out
 
 
+# Countries whose files routinely carry older rounds next to the new ones (confirmed by the SIA data focal point, Oct 2026):
+# the "records of an older campaign" warning is not raised for them. Every other country keeps the check.
+OLDER_ROUNDS_EXPECTED = {"DEMOCRATIC REPUBLIC OF THE CONGO"}
+
+
 def older_campaign_check(P, cmp_):
     """New records of a round dated much earlier than the rest of the file: usually an older round pasted into the workbook."""
     msgs = []
     if not {"SIA_date", "Response", "Round_Add"} <= set(P.columns) or not len(P):
         return msgs
     new = (cmp_["Status"] == "new").values
+    if "Country" in P.columns:
+        new = new & ~P["Country"].fillna("").astype(str).str.strip().str.upper().isin(OLDER_ROUNDS_EXPECTED).values
     keys = P["Response"].fillna("").astype(str) + "|" + P["Round_Add"].fillna("").astype(str)
     med = P.groupby(keys)["SIA_date"].median().dropna()
     if len(med) < 2:
