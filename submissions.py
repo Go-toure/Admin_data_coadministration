@@ -646,7 +646,7 @@ def align_round_to_lookup(P, ctx, notes):
             continue
         P.at[i, "Round_Add"] = new.at[i]
         notes.add(rowref(P, i), "Round_Add", old, new.at[i], "round number of the lookup (the lookup is the authority): %s started %s is %s in the lookup" %
-                  (P.at[i, "Response"], pd.Timestamp(P.at[i, "SIA_date"]).strftime("%Y-%m-%d"), new.at[i].replace("Rnd", "Round ")))
+                  (P.at[i, "Response"], pd.Timestamp(P.at[i, "SIA_date"]).strftime("%Y-%m-%d"), new.at[i]))
     for _, r in log.iterrows():
         out.append("%s %s: the file says %s, the lookup's round is %s (%d record(s))" % (r["Response"], r["SIA_date"], r["Found"], r["Restored"], r["Records"]))
     return out
@@ -826,7 +826,7 @@ def infer_campaign(P, ctx, prof, hints, notes):
         why = "campaign inferred: %s %s (starts %s) in the lookup, from %s%s" % (x["OBR Name"], x["Round Number"], x["Round Start Date"], src, vnote)
         rname_out = x["Round Number"]
         if nxt is not None:
-            rname_out = "Round %d" % rn
+            rname_out = "Rnd%d" % rn
             why = ("round %d of %s is not in the lookup yet (the lookup has rounds up to %d, the last starting %s): taken as the next round of "
                    "the same campaign, with the date of the records%s" % (rn, x["OBR Name"], nxt["last"], x["Round Start Date"], vnote))
             gl = getattr(ctx, "_lookup_gaps", None)
@@ -3765,7 +3765,7 @@ def propose_fixes(issues, lookup, ckey=None, rkey=None, choose=None, min_distric
         rn = pd.to_numeric(pd.Series([str(r["Round_in_live"])]).str.extract(r"(\d+)")[0], errors="coerce").iloc[0]
         near = ((hit["_dt"] - d0).abs().dt.days <= near_days).any()
         if not near and not pd.isna(rn) and rn >= 1 and not (hit["_rn"] == rn).any():
-            chg.append({"Action": "add", "Country": hit["Country"].iloc[0], "OBR Name": name, "Round Number": "Round %d" % int(rn), "Round Start Date": str(d0)[:10],
+            chg.append({"Action": "add", "Country": hit["Country"].iloc[0], "OBR Name": name, "Round Number": "Rnd%d" % int(rn), "Round Start Date": str(d0)[:10],
                         "Vaccines": hit["Vaccines"].iloc[0] if "Vaccines" in hit.columns else "", "Round Status": "Finished", "New_Round_Start_Date": "",
                         "Reason": "Live records (%d districts, all planned in %s in the scope) of a round the lookup does not list" % (nd, name), "Tier": tier, "Tier_note": tnote})
     cc = pd.DataFrame(corr)

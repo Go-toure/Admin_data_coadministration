@@ -12,6 +12,7 @@ checks: expected columns, statuses, at least 20 rows, not less than 50% of the p
 lookup_backups/ (newest 5). If nothing changed, the file is left alone.
 
 Used by admin.py (lookup, build, inspect). Exit code: 0 refreshed or unchanged, 1 failed (the old lookup stays in place)."""
+import re
 import argparse
 import hashlib
 import os
@@ -135,7 +136,7 @@ def fetch_lookup(token, emit=None):
         for rnd in d.get("rounds", []):
             st = round_status(rnd, today)
             if st and rnd.get("started_at"):
-                rows.append({"Round Number": "Round %s" % rnd.get("number"), "OBR Name": entry.get("obr_name"),
+                rows.append({"Round Number": "Rnd%s" % rnd.get("number"), "OBR Name": entry.get("obr_name"),
                              "Vaccines": clean_vaccine_names(rnd.get("vaccine_names") or ""),
                              "Country": entry.get("top_level_org_unit_name"), "Round Start Date": rnd["started_at"],
                              "Round Status": st})
@@ -157,8 +158,15 @@ def validate(df, previous):
                      % (len(df), len(previous), int(MIN_FRACTION * 100)))
 
 
+def _rnd(x):
+    """'Round 3' (the way the lookup used to write it) and 'Rnd3' are the same round: written Rnd3, like the Round_Add of the admin data."""
+    m = re.fullmatch(r"\s*(?:round|rnd)\s*(\d+)\s*", str(x), re.I)
+    return "Rnd%d" % int(m.group(1)) if m else x
+
+
 def _key(df):
     d = df.reindex(columns=COLUMNS).fillna("").astype(str)       # an empty cell is NaN once read back from Excel
+    d["Round Number"] = d["Round Number"].map(_rnd)
     d = d.apply(lambda c: c.str.strip())
     return d.sort_values(COLUMNS).reset_index(drop=True)
 

@@ -3464,6 +3464,12 @@ def apply_lookup_overrides(L, path):
     return L.drop(columns=["_x_ck", "_x_rk", "_x_d", "_x_rn"]).reset_index(drop=True), rep
 
 
+def _rnd_text(x):
+    """The round number of the lookup is written like the Round_Add of the admin data: Rnd1, Rnd2 ... ('Round 1' of an older lookup is read as Rnd1)."""
+    m = re.fullmatch(r"\s*(?:round|rnd)\s*(\d+)\s*", str(x), re.I)
+    return "Rnd%d" % int(m.group(1)) if m else x
+
+
 def load_lookup(path, overrides=None):
     L = pd.read_excel(path)
     need = ["Round Number", "OBR Name", "Country", "Round Start Date"]
@@ -3476,6 +3482,7 @@ def load_lookup(path, overrides=None):
         print("lookup overrides (%s): %d change(s) applied, %d already in the lookup%s" % (
             os.path.basename(overrides), rp["applied"], rp["already"],
             ("; NOT MATCHED: " + "; ".join("line %s: %s" % x for x in rp["not_matched"])) if rp["not_matched"] else ""), flush=True)
+    L["Round Number"] = L["Round Number"].map(_rnd_text)
     L["_ck"] = L["Country"].map(_lkc)
     L["_rk"] = L["OBR Name"].map(_rk)
     L["_d"] = pd.to_datetime(L["Round Start Date"], errors="coerce").dt.strftime("%Y-%m-%d")
