@@ -2135,10 +2135,43 @@ def older_campaign_check(P, cmp_):
     return msgs
 
 
+def _version_no(name):
+    """The version number a file name carries (V2, v3, version 2), or None."""
+    m = re.findall(r"(?<![a-z0-9])v(?:ersion)?[\s_\-]*(\d{1,2})(?![0-9a-z])", str(name).lower())
+    return max(int(x) for x in m) if m else None
+
+
+def _source_mtime(e, out_root):
+    """Modification time (to the minute) of the copy of the file read by the inspection (workspace/submissions_in), 0 when it is not there."""
+    try:
+        path = str(e.get("path") or e.get("name") or "")
+        i = path.lower().find(".zip/")
+        f = Path(out_root).parent / "submissions_in" / (path[:i + 4] if i >= 0 else path)
+        return int(f.stat().st_mtime // 60) if f.is_file() else 0
+    except Exception:
+        return 0
+
+
+def _recency_cmp(a, b, out_root):
+    """Negative when file entry a is more recent than b (the version number of the name when both have one, then the modification time of the file,
+    then the day it was first seen); 0 when nothing tells them apart (the order of the inspection stays)."""
+    va, vb = _version_no(a.get("name", "")), _version_no(b.get("name", ""))
+    if va is not None and vb is not None and va != vb:
+        return -1 if va > vb else 1
+    ma, mb = _source_mtime(a, out_root), _source_mtime(b, out_root)
+    if ma != mb:
+        return -1 if ma > mb else 1
+    fa, fb = str(a.get("first_seen", "")), str(b.get("first_seen", ""))
+    if fa != fb:
+        return -1 if fa > fb else 1
+    return 0
+
+
 def overlap_between_files(details, out_root, rows, ledger, log=print):
-    """The new records that two files both carry: the build keeps the first accepted file's copy, so the report says which files repeat each other."""
+    """The new records that two files both carry: the build keeps the copy of the MORE RECENT file (see recency_order), so the report says which
+    files repeat each other, how many records differ between them and which copy is kept."""
     import itertools
-    seen, parts = {}, []
+    seen, parts, pairs, processed = {}, [], [], []
     order = [(h, sd) for h, sd in details.items() if sd[0].get("new")]
     for h, (s, det) in order:
         pth = Path(out_root) / ("prepared/%s.xlsx" % h[:12])
@@ -2166,29 +2199,42 @@ def overlap_between_files(details, out_root, rows, ledger, log=print):
                 c[1] += int(o[1] == f)
         for k, f in zip(keys[~blank], figs[~blank]):
             seen.setdefault(k, (h, f))
-        tot = sum(v[0] for v in cnt.values())
-        same_tot = sum(v[1] for v in cnt.values())
-        s["overlap"] = tot - same_tot          # a copy with the same figures is a duplicate: the build keeps one, nobody needs to look
-        s["overlap_same"] = same_tot
+        processed.append(h)
         for h2, (n, same) in cnt.items():
-            parts.append({"File": s["name"], "Also_in_earlier_file": details[h2][0]["name"], "New_records_in_both": n, "Same_figures": same, "Other_figures": n - same})
-        if tot:
-            msg = "%d of its %d new record(s) are also new in %s (the build keeps the first accepted copy)" % (
-                tot, s["new"], "; ".join("%s (%d)" % (details[h2][0]["name"], v[0]) for h2, v in sorted(cnt.items(), key=lambda kv: -kv[1][0])[:3]))
-            if s["overlap"] == 0:
-                msg = "for reference: " + msg.replace("(the build keeps the first accepted copy)", "(same figures: duplicates, the build keeps one)")
-            s["why"] = (s["why"] + "; " if s["why"] else "") + msg
-            if s["status"] == "ready" and s["overlap"]:
-                s["status"] = "review"
-            for r in rows:
-                if r.get("hash") == h:
-                    r["why"], r["status"] = s["why"], s["status"]
-            if h in ledger["files"]:
-                ledger["files"][h]["why"], ledger["files"][h]["status"] = s["why"], s["status"]
-                ledger["files"][h]["overlap"] = s["overlap"]
-                if s["overlap"]:
-                    ledger["files"][h]["codes"] = list(ledger["files"][h].get("codes") or []) + ["overlap"]
-            det["_overlap_msg"] = msg
+            pairs.append((h, h2, n, same))
+    # for every pair the more recent file keeps its copy; the file with the older copy is the one that carries the overlap
+    per = {}
+    for h, h2, n, same in pairs:
+        newer_is_h = _recency_cmp(ledger["files"].get(h, {}), ledger["files"].get(h2, {}), out_root) < 0
+        newer, older = (h, h2) if newer_is_h else (h2, h)
+        parts.append({"File": details[h][0]["name"], "Also_in_earlier_file": details[h2][0]["name"], "New_records_in_both": n,
+                      "Same_figures": same, "Other_figures": n - same, "Copy_kept_from": details[newer][0]["name"]})
+        d = per.setdefault(older, {"tot": 0, "same": 0, "by": {}})
+        d["tot"] += n
+        d["same"] += same
+        d["by"][newer] = d["by"].get(newer, 0) + n
+    for h in processed:
+        details[h][0]["overlap"], details[h][0]["overlap_same"] = 0, 0
+    for h, d in per.items():
+        s = details[h][0]
+        s["overlap"] = d["tot"] - d["same"]          # a copy with the same figures is a duplicate: the build keeps one, nobody needs to look
+        s["overlap_same"] = d["same"]
+        msg = "%d of its %d new record(s) are also new in %s, a more recent file: the build uses the copy of the more recent file" % (
+            d["tot"], s["new"], "; ".join("%s (%d)" % (details[h2][0]["name"], v) for h2, v in sorted(d["by"].items(), key=lambda kv: -kv[1])[:3]))
+        if s["overlap"] == 0:
+            msg = "for reference: " + msg.replace("the build uses the copy of the more recent file", "same figures: duplicates, the build keeps one")
+        s["why"] = (s["why"] + "; " if s["why"] else "") + msg
+        if s["status"] == "ready" and s["overlap"]:
+            s["status"] = "review"
+        for r in rows:
+            if r.get("hash") == h:
+                r["why"], r["status"] = s["why"], s["status"]
+        if h in ledger["files"]:
+            ledger["files"][h]["why"], ledger["files"][h]["status"] = s["why"], s["status"]
+            ledger["files"][h]["overlap"] = s["overlap"]
+            if s["overlap"]:
+                ledger["files"][h]["codes"] = list(ledger["files"][h].get("codes") or []) + ["overlap"]
+        details[h][1]["_overlap_msg"] = msg
     return pd.DataFrame(parts)
 
 
@@ -4065,6 +4111,7 @@ def feedback_files(out_root, folder, ledger=None):
 def accepted_files(out_root, auto=False):
     """Prepared record files of the accepted files: [(name, path)]. With auto=True the files of automatic rule 1 are added
     (never a file a person rejected or accepted otherwise: they are already decided)."""
+    import functools
     ledger = load_ledger(out_root)
     out = []
     for h, e in ledger["files"].items():
@@ -4074,4 +4121,7 @@ def accepted_files(out_root, auto=False):
                 out.append((e["name"], str(p)))
     if auto:
         out += [(n, p) for n, p, _ in auto_candidates(out_root, ledger)]
-    return out
+    # The builder keeps the FIRST copy of a record that two files both carry, so the most recent file goes first: when a country sends a
+    # corrected version of its data, the corrected figures are the ones added (see overlap_between_files, sheet Overlap_between_files).
+    by_name = {e.get("name"): e for e in ledger["files"].values()}
+    return sorted(out, key=functools.cmp_to_key(lambda x, y: _recency_cmp(by_name.get(x[0], {}), by_name.get(y[0], {}), out_root)))
