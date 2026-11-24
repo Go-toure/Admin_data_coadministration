@@ -1433,9 +1433,10 @@ def _submissions_ctx(builder):
     # the live file as the next build will have it: with the columns of the V2 template (HPV, onchocerciasis ... IPV by age band), empty until then, so that a
     # submission in the V2 layout keeps its figures in those columns
     if hasattr(builder, "TEMPLATE_V2_NEW"):
-        for c in builder.TEMPLATE_V2_NEW:
-            if c not in live.columns:
-                live[c] = ""
+        import pandas as pd
+        missing = [c for c in builder.TEMPLATE_V2_NEW if c not in live.columns]
+        if missing:                       # all at once: one column at a time makes pandas warn that the frame is fragmented
+            live = pd.concat([live, pd.DataFrame("", index=live.index, columns=missing)], axis=1)
         live = live[builder.order_by_template(list(live.columns))]
     gp, lp = P(S["geo"]), P(S["lookup"])
     geo = builder.load_geo(str(gp)) if gp.is_file() else None

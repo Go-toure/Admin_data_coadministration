@@ -2537,9 +2537,12 @@ def typed(live_text, prof):
     for c in prof["numeric"]:
         if c in t.columns:
             t[c] = pd.to_numeric(t[c], errors="coerce")
-    for c in DATE_COLS:
-        if c in t.columns:
-            t[c] = pd.to_datetime(t[c], errors="coerce")
+    import warnings
+    with warnings.catch_warnings():       # mixed date formats are read one by one on purpose: no need to warn for each column
+        warnings.simplefilter("ignore", UserWarning)
+        for c in DATE_COLS:
+            if c in t.columns:
+                t[c] = pd.to_datetime(t[c], errors="coerce")
     return t
 
 
