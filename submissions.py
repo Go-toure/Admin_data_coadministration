@@ -1828,6 +1828,10 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         det.setdefault("warnings", []).append("Aligning the round numbers with the lookup failed: %s" % e)
     # comparison with the live file (before the defaults are filled in: only what the country reported is compared)
     det["date_check"] = date_year_check(P, notes)
+    try:
+        det["vaccine_std"] = correct_mopv2(P, ctx, notes)      # a typo is corrected before the vaccine is checked against the lookup
+    except Exception as e:
+        det.setdefault("warnings", []).append("Correcting mOPV2 failed: %s" % e)
     det["vaccine_check"] = vaccine_vs_lookup(P, ctx)
     try:
         normalise_integration(P, ctx, notes, det, s)
@@ -1938,6 +1942,8 @@ def prepare_file(path, ctx, prof, template_cols, folder_country=None):
         reasons.append(m_ + ": check"); codes.append("date_far")
     for m_ in det.get("older", []):
         reasons.append(m_); codes.append("older_campaign")
+    for m_ in det.get("vaccine_std", []) or []:
+        reasons.append("vaccine corrected (please confirm): " + m_); codes.append("vaccine_corrected")
     for m_ in det.get("vaccine_check", []):
         reasons.append("vaccine against the lookup: " + m_); codes.append("vaccine_vs_lookup")
     if lay["class"] != "template":
@@ -2236,6 +2242,50 @@ def overlap_between_files(details, out_root, rows, ledger, log=print):
                 ledger["files"][h]["codes"] = list(ledger["files"][h].get("codes") or []) + ["overlap"]
         details[h][1]["_overlap_msg"] = msg
     return pd.DataFrame(parts)
+
+
+MOPV2_LAST_YEAR = 2021   # the live file has no mOPV2 after 2021 (checked 25 Nov 2026): a later mOPV2 is a typo for nOPV2
+
+
+def correct_mopv2(P, ctx, notes):
+    """mOPV2 written for a campaign (author: Gorgui Ba Toure). Two cases, both corrected to nOPV2 and listed (code vaccine_corrected):
+      1. the lookup has the campaign with nOPV2 and without mOPV2: the lookup is the authority;
+      2. the campaign is not in the lookup (or it has no vaccine): no mOPV2 has been used after MOPV2_LAST_YEAR, so a record dated later is a typo.
+    Only a vaccine that is exactly mOPV2 is touched ('nOPV2 & mOPV2' is left to vaccine_vs_lookup). Returns the messages, one per campaign and rule."""
+    if "Vaccine_type" not in P.columns:
+        return []
+    b = ctx.builder
+    lk = getattr(ctx, "lookup", None)
+    have_lk = lk is not None and "_vs" in getattr(lk, "columns", []) and {"Country", "Response"} <= set(P.columns)
+    dts = pd.to_datetime(P["SIA_date"], errors="coerce") if "SIA_date" in P.columns else pd.Series(pd.NaT, index=P.index)
+    allowed_of = {}
+    done = Counter()
+    for i in np.where(P["Vaccine_type"].notna())[0]:
+        v = P["Vaccine_type"].iat[i]
+        if b._vset(v) != {"mopv2"} and vaccine_alias(v) != "mOPV2":      # mOPV2 or its French spelling mVPO2
+            continue
+        c = P["Country"].iat[i] if "Country" in P.columns else ""
+        resp = P["Response"].iat[i] if "Response" in P.columns else ""
+        c = "" if pd.isna(c) else c
+        resp = "" if pd.isna(resp) else resp
+        key = (c, resp)
+        if key not in allowed_of:
+            allowed = set()
+            if have_lk and c and resp:
+                e = lk[(lk["_ck"] == b._lkc(c)) & (lk["_rk"] == b._rk(resp))]
+                allowed = set().union(*e["_vs"]) if len(e) else set()
+            allowed_of[key] = allowed
+        allowed = allowed_of[key]
+        if allowed and "mopv2" not in allowed and "nopv2" in allowed:
+            how = "the lookup has nOPV2 for this campaign"
+        elif not allowed and not pd.isna(dts.iat[i]) and int(dts.iat[i].year) > MOPV2_LAST_YEAR:
+            how = "no mOPV2 has been used since %d and the campaign is not in the lookup" % MOPV2_LAST_YEAR
+        else:
+            continue
+        notes.add(rowref(P, i), "Vaccine_type", v, "nOPV2", "mOPV2 read as nOPV2: " + how)
+        P.iat[i, P.columns.get_loc("Vaccine_type")] = "nOPV2"
+        done[(resp, how)] += 1
+    return ["%s: %d record(s) written mOPV2 read as nOPV2 (%s)" % (resp or "no campaign name", n, how) for (resp, how), n in sorted(done.items())]
 
 
 def vaccine_vs_lookup(P, ctx):
@@ -3123,7 +3173,7 @@ def auto_reasons_ok(why):
 # round of the lookup (same country, campaign, date and round) and the vaccine agrees with the lookup, a campaign that the file did not
 # write but the lookup gave, a year typed wrongly that the lookup's date confirms, and an eTally export added up by LGA are harmless too.
 AUTO_CODES = {"left_out", "other_figures", "layout_mapped", "warnings"}
-AUTO_CODES_LOOKUP = {"campaign_inferred", "year_fixed", "etally", "date_standardized"}
+AUTO_CODES_LOOKUP = {"campaign_inferred", "year_fixed", "etally", "date_standardized", "vaccine_corrected"}
 
 
 def auto_codes_ok(e):
@@ -3221,6 +3271,7 @@ CODE_MEANING = {
     "overlap": ("the new records are also new in another file", "engine: a copy with the same figures is harmless; other figures need a person"),
     "coverage_ceiling": ("records with more vaccinated than the target allows (reference only, no longer stops a file)", "nobody: the live file has its own coverage columns"),
     "date_standardized": ("records given the planned start date of the lookup for their campaign", "the engine when the lookup confirms it"),
+    "vaccine_corrected": ("records written mOPV2 and read as nOPV2 (the lookup has nOPV2, or no mOPV2 since 2021)", "the engine when the lookup confirms it"),
     "possible_dup": ("records that look like live records under another campaign name, round or date", "a person"),
     "unseen": ("names or values never seen in the live file", "a person (new spelling or new area)"),
     "campaign_from_live": ("campaign details taken from the live file, not written in the file", "a person, once (remembered)"),
